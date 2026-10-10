@@ -4189,6 +4189,23 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.calls().contains { $0.hasPrefix("defaults write") || $0.hasPrefix("defaults delete") }, "\(fx.calls())")
     }
 
+    /// Round 36 (independent35 R35-6): a `defaults read` that exits 0 but
+    /// whose output was not read whole (here a NUL byte after "0") is
+    /// reported as unread, not counted as clear from the "0" before it.
+    func testUninstallReportsADefaultsReadItCouldNotReadWhole() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.writeConfig(#"{"agentList":["com.example.Partial"]}"#)
+        fx.setMode("defaults", "nul:com.example.Partial")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        XCTAssertTrue(r.stdout.contains("could not read the whole answer of defaults read for com.example.Partial; check it yourself with: defaults read com.example.Partial NSAppSleepDisabled"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("1 could not be read"), r.stdout)
+        XCTAssertFalse(r.stdout.contains("none of the"), r.stdout)
+    }
+
     /// A `defaults read` that never answers (cfprefsd stuck) is stopped
     /// after the call limit, reported with the command to check it by hand,
     /// and ends the check, since every later read would wait the same way.
@@ -4868,6 +4885,11 @@ final class RecoveryScriptTests: XCTestCase {
             ("0", "1", "Low Power Mode is on for battery (pmset -g custom reports lowpowermode 1 under Battery Power)"),
             ("0", "fail", "'pmset -g custom' exited 1, so whether Low Power Mode is on for battery is unknown"),
             ("0", "2", "pmset -g custom reports lowpowermode 2 under Battery Power, neither 0 nor 1, so whether Low Power Mode is on is unknown"),
+            // Round 36 (R35-6): a NUL byte ends bash's read before the
+            // value. The prefix has no SleepDisabled (or lowpowermode)
+            // line, which used to count as nothing owed.
+            ("nul", "0", "the output of 'pmset -g' could not be read whole, so whether sleep is off is unknown"),
+            ("0", "nul", "the output of 'pmset -g custom' could not be read whole, so whether Low Power Mode is on for battery is unknown"),
         ]
         var fixtures: [ScriptFixture] = []
         defer { fixtures.forEach { $0.destroy() } }
@@ -4987,7 +5009,11 @@ final class RecoveryScriptTests: XCTestCase {
             ("only a nested path line", 0, printed([], extra: nested), "unknown", "", noPath, nil),
             ("two path lines", 0, printed(["\(mine)/\(label).plist", "\(other)/\(label).plist"]), "unknown", "", noPath, nil),
             ("a relative path", 0, printed(["LaunchAgents/\(label).plist"]), "unknown", "", noPath, nil),
+            // Round 36 (R35-6): this folder's plist, but the output was
+            // not read whole (bounded() leaves BOUNDED_WHOLE 0).
+            ("a listing not read whole", 0, printed(["\(mine)/\(label).plist"]), "unknown", "", "the output of \(asked) could not be read whole", nil),
         ]
+        let partial: Set<String> = ["a listing not read whole"]
         // The same folder from the root, without the links on its way (on
         // macOS /var is a link to /private/var), when that spelling differs.
         let real = try XCTUnwrap(realpath(mine, nil).map { p in defer { free(p) }; return String(cString: p) })
@@ -5001,6 +5027,7 @@ final class RecoveryScriptTests: XCTestCase {
             try "\(c.rc)\n".write(toFile: base + ".rc", atomically: true, encoding: .utf8)
             try c.output.write(toFile: base + ".out", atomically: true, encoding: .utf8)
             if let stall = c.stall { try stall.write(toFile: base + ".stall", atomically: true, encoding: .utf8) }
+            if partial.contains(c.name) { try "".write(toFile: base + ".partial", atomically: true, encoding: .utf8) }
             bases.append(base)
         }
         let harness = fx.root.appendingPathComponent("whose-agent.sh")
@@ -5015,20 +5042,23 @@ final class RecoveryScriptTests: XCTestCase {
         shift
         # bounded() as the uninstall has it, without the process: for the
         # print, the case's status, and its output without the last
-        # newline; for a stat, the real one, or 124 for the path in the
-        # case's .stall file.
+        # newline, read whole unless the case has a .partial file; for a
+        # stat, the real one, or 124 for the path in the case's .stall file.
         bounded() {
           local rc=0
+          BOUNDED_WHOLE=0
           if [[ "$1" == "$STAT" ]]; then
             [[ $# == 5 && "$2 $3 $4" == "-L -f %d:%i" ]] || { echo "unexpected call: $*" >&2; exit 3; }
             if [[ -f "$CASE.stall" && "${*: -1}" == "$(< "$CASE.stall")" ]]; then BOUNDED_OUTPUT=""; return 124; fi
             BOUNDED_OUTPUT="$("$@" 2>&1)" || rc=$?
+            BOUNDED_WHOLE=1
             return "$rc"
           fi
           [[ "$*" == "$LAUNCHCTL print gui/$UID_NUM/$LABEL" ]] || { echo "unexpected call: $*" >&2; exit 3; }
           read -r rc < "$CASE.rc"
           IFS= read -r -d '' BOUNDED_OUTPUT < "$CASE.out" || true
           BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\\n'}"
+          [[ -f "$CASE.partial" ]] || BOUNDED_WHOLE=1
           return "$rc"
         }
         \(try function("pmset_failed"))
@@ -5065,7 +5095,10 @@ final class RecoveryScriptTests: XCTestCase {
     /// reasons. With nothing loaded there is no bootout and everything
     /// goes. This folder's agent, loaded from a staging candidate, is
     /// booted out. A print that names no file stops the run before the
-    /// bootout with nothing removed.
+    /// bootout with nothing removed. Round 36 (independent35 R35-6): so
+    /// does a print whose output has a NUL byte after a path line for this
+    /// folder's plist; bash's read stops at the NUL, and before round 36
+    /// that prefix read as this folder's agent and was booted out.
     func testUninstallLeavesAnotherFoldersLoadedAgentAndWhatItRuns() throws {
         let label = "com.insomnia.backstop"
         let cases: [(name: String, sleep: String, answers: [String]?)] = [
@@ -5074,6 +5107,7 @@ final class RecoveryScriptTests: XCTestCase {
             ("none", "0", nil),
             ("this folder's, from a candidate", "0", ["path CANDIDATE", "path CANDIDATE", "113"]),
             ("no file named", "0", ["nopath"]),
+            ("this folder's, in output not read whole", "0", ["nulpath PLIST"]),
         ]
         var fixtures: [ScriptFixture] = []
         defer { fixtures.forEach { $0.destroy() } }
@@ -5090,7 +5124,7 @@ final class RecoveryScriptTests: XCTestCase {
             try "other plist".write(to: other, atomically: true, encoding: .utf8)
             let candidate = f.plist.deletingLastPathComponent().appendingPathComponent(".\(label).staging/\(label).candidate-\(UUID().uuidString).plist").path
             if let answers = c.answers {
-                try f.setPrintAnswers(answers.map { $0.replacingOccurrences(of: "OTHER", with: other.path).replacingOccurrences(of: "CANDIDATE", with: candidate) })
+                try f.setPrintAnswers(answers.map { $0.replacingOccurrences(of: "OTHER", with: other.path).replacingOccurrences(of: "CANDIDATE", with: candidate).replacingOccurrences(of: "PLIST", with: f.plist.path) })
             }
             rows.append((ScriptRow(c.name, f, f.uninstall), c.sleep, other.path, candidate, try Data(contentsOf: f.state)))
         }
@@ -5141,7 +5175,10 @@ final class RecoveryScriptTests: XCTestCase {
                 for gone in [f.sudoers, f.plist, f.app, f.state] { XCTAssertFalse(f.exists(gone), "\(label0): \(gone.path)") }
                 XCTAssertFalse(FileManager.default.fileExists(atPath: f.receipts), label0)
             default:
-                try assertUninstallRemovedNothing(r, saying: "'launchctl print gui/\(f.uid)/\(label)' lists the job but not one absolute path it was loaded from, so whether the recovery agent loaded as \(label) is this folder's or another Insomnia folder's is unknown", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease, in: f)
+                let why = label0 == "no file named"
+                    ? "'launchctl print gui/\(f.uid)/\(label)' lists the job but not one absolute path it was loaded from"
+                    : "the output of 'launchctl print gui/\(f.uid)/\(label)' could not be read whole"
+                try assertUninstallRemovedNothing(r, saying: "\(why), so whether the recovery agent loaded as \(label) is this folder's or another Insomnia folder's is unknown", journal: journal, receipt: SleepOffReceipts.initialContent, release: SleepOffReceipts.initialRelease, in: f)
                 XCTAssertEqual(f.printLockStates(), ["launchctl print held"], label0)
             }
         }
@@ -5868,6 +5905,54 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try helper("install.sh"), try helper("uninstall.sh"))
     }
 
+    /// Round 36 (independent35 R35-6): bounded() says whether it read the
+    /// call's output whole (BOUNDED_WHOLE), apart from the call's exit
+    /// status. Output with a NUL byte, or a file the call removed so it
+    /// cannot be opened, is not whole, even after exit 0: the prefix read
+    /// before the NUL could look like a complete answer. Empty output, and
+    /// bytes that are not ASCII in a UTF-8 locale, are whole; the byte
+    /// count is in bytes, not characters. Before round 36 the read's
+    /// failure was dropped (`|| true`), and callers parsed the prefix.
+    func testBoundedSaysWhetherItReadTheWholeOutput() throws {
+        let calls: [(name: String, command: String, line: String)] = [
+            ("two lines", #"/usr/bin/printf 'one\ntwo\n'"#, "0|1|7"),
+            ("a NUL after a plausible line", #"/usr/bin/printf '\tpath = /a\n\000\tpath = /b\n'"#, "0|0|10"),
+            ("no output", "/usr/bin/true", "0|1|0"),
+            ("bytes that are not ASCII, then exit 3", #"/bin/sh -c 'printf "caf\303\251 \001\177"; exit 3'"#, "3|1|8"),
+            ("an output file removed by the call", #"/bin/sh -c '/bin/rm -f "$1"/call.*.out; echo gone' _ "$WORK""#, "0|0|0"),
+        ]
+        for script in ["install.sh", "uninstall.sh"] {
+            let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
+            let start = try XCTUnwrap(text.range(of: "\nbounded() {"), script)
+            let supervise = try XCTUnwrap(text.range(of: "\nsupervise() {", range: start.upperBound..<text.endIndex), script)
+            let end = try XCTUnwrap(text.range(of: "\n}\n", range: supervise.upperBound..<text.endIndex), script)
+            let dir = fx.root.appendingPathComponent("whole-\(script)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir.appendingPathComponent("work"), withIntermediateDirectories: true)
+            let main = dir.appendingPathComponent("main.sh")
+            try """
+            set -euo pipefail
+            LC_ALL=en_US.UTF-8
+            H="\(dir.path)"
+            MKTEMP=/usr/bin/mktemp
+            SUDO="$H/no-sudo"
+            WORK="$H/work"
+            STAT=/usr/bin/stat
+            CALL_TIMEOUT_SECONDS=5
+            \(text[start.lowerBound..<end.upperBound])
+            show() { local rc=0; bounded "$@" || rc=$?; bounded_bytes; printf '%s|%s|%s\\n' "$rc" "$BOUNDED_WHOLE" "$BOUNDED_BYTES"; }
+            \(calls.map { "show \($0.command)" }.joined(separator: "\n"))
+
+            """.write(to: main, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(main)
+
+            XCTAssertEqual(r.status, 0, "\(script): \(r.stderr)")
+            let lines = r.stdout.split(separator: "\n").map(String.init)
+            XCTAssertEqual(lines.count, calls.count, "\(script): \(r.stdout)")
+            for (c, line) in zip(calls, lines) { XCTAssertEqual(line, c.line, "\(script): \(c.name)") }
+        }
+    }
+
     // MARK: Round 28 (finding 7): the bounded-call supervisor
 
     /// A private run of the exact bounded() and supervise() text of
@@ -5933,6 +6018,7 @@ final class RecoveryScriptTests: XCTestCase {
             MKTEMP="$H/mktemp"
             SUDO="$H/sudo"
             WORK="$H/work"
+            STAT=/usr/bin/stat
             CALL_TIMEOUT_SECONDS=\#(callTimeout)
             \#(helper)
             exec 9<>"$H/lock"
@@ -13060,6 +13146,7 @@ private final class ScriptFixture {
           case "$m" in
             fail) echo "pmset: could not read the settings" >&2; exit 1 ;;
             none) printf 'Battery Power:\\n lidwake              1\\nAC Power:\\n lowpowermode         1\\n' ;;
+            nul) printf 'Battery Power:\\n lidwake              1\\n\\0 lowpowermode         1\\n' ;;
             *) printf 'Battery Power:\\n lidwake              1\\n lowpowermode         %s\\nAC Power:\\n lowpowermode         1\\n' "$m" ;;
           esac
           exit 0
@@ -13070,6 +13157,7 @@ private final class ScriptFixture {
           case "$m" in
             fail) echo "pmset: could not read the settings" >&2; exit 1 ;;
             none) printf 'System-wide power settings:\\n' ;;
+            nul) printf 'System-wide power settings:\\n\\0 SleepDisabled\\t\\t1\\n' ;;
             1) printf 'System-wide power settings:\\n SleepDisabled\\t\\t1\\n' ;;
             *) printf 'System-wide power settings:\\n SleepDisabled\\t\\t0\\n' ;;
           esac
@@ -13348,6 +13436,8 @@ private final class ScriptFixture {
         if [[ "$mode" == unreachable || "$mode" == "unreachable:$domain" ]]; then
           echo "fake defaults: cfprefsd did not answer for $domain" >&2; exit 1
         fi
+        # nul:<domain>: a read answers 0, then a NUL byte and a 1.
+        if [[ "$cmd" == read && "$mode" == "nul:$domain" ]]; then printf '0\\n\\0 1\\n'; exit 0; fi
         case "$cmd" in
           read)
             v="$(lookup)" || { echo "The domain/default pair of ($domain, $key) does not exist" >&2; exit 1; }
@@ -13433,7 +13523,8 @@ private final class ScriptFixture {
         // instead of the mode: the Nth print answers its line N (its last
         // line once past the end): "113" (not loaded), "error" (exits 1),
         // "path <file>" (loaded from <file>), "nopath" (loaded, no path
-        // line) or "twopaths <file>" (two path lines).
+        // line), "twopaths <file>" (two path lines) or "nulpath <file>"
+        // (a path line for <file>, then a NUL byte and a second path line).
         // foreign-start.at holding "print" or "bootout": the first such call
         // starts a start of another Insomnia folder, in the background and
         // without any of the script's descriptors. It waits up to 20 s for
@@ -13524,6 +13615,7 @@ private final class ScriptFixture {
               nopath) print_loaded ;;
               "path "*) print_loaded "${answer#path }" ;;
               "twopaths "*) print_loaded "${answer#twopaths }" "${answer#twopaths }" ;;
+              "nulpath "*) printf 'gui/%s/com.insomnia.backstop = {\\n\\tpath = %s\\n\\0\\tpath = /elsewhere/com.insomnia.backstop.plist\\n}\\n' "\(uid)" "${answer#nulpath }"; exit 0 ;;
               *) echo "fake: unknown print answer $answer" >&2; exit 98 ;;
             esac
           fi

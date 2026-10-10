@@ -1991,7 +1991,7 @@ settle_attempt() {
 # left by an earlier run that ended without leave is removed first, unless
 # this run shares its caller's lock. Without one (a full disk), the copies
 # are kept in memory and read with the same checks.
-if (( ! lock_shared )); then "$RM" -rf "$APP_SUPPORT"/.backstop-read.* 2>/dev/null || true; fi
+if (( ! lock_shared )); then "$RM" -rf "$APP_SUPPORT"/.backstop-read.* "$APP_SUPPORT"/.backstop-defaults.* 2>/dev/null || true; fi
 if ! READS="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-read.XXXXXX" 2>/dev/null)"; then
   READS=""
   log warn "could not create a private folder in $APP_SUPPORT for this run's copies of session.json and state.json; this run keeps its copies in memory" || true
@@ -2603,13 +2603,22 @@ if (( app_nap_count > 0 )); then
         changed=1
       else
         if (( command_alive )); then stop_transaction "defaults delete $bundle NSAppSleepDisabled"; fi
-        probe="$APP_SUPPORT/.backstop.$$.read"
-        bounded_output="$probe"
+        # The read's output goes to a new file of this run's own (mktemp),
+        # so nothing an earlier run left under a name can answer for it.
+        # Without one, whether the key is still set is unknown.
         read_rc=0
-        run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled || read_rc=$?
-        bounded_output=""
-        if (( command_alive )); then "$RM" -f "$probe"; stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
-        if (( read_rc == 0 )); then
+        probe="$("$MKTEMP" "${READS:-$APP_SUPPORT}/.backstop-defaults.XXXXXX" 2>/dev/null)" || probe=""
+        if [[ -n "$probe" ]]; then
+          bounded_output="$probe"
+          run_bounded "$DEFAULTS" read "$bundle" NSAppSleepDisabled || read_rc=$?
+          bounded_output=""
+          if (( command_alive )); then "$RM" -f "$probe"; stop_transaction "defaults read $bundle NSAppSleepDisabled"; fi
+        fi
+        if [[ -z "$probe" ]]; then
+          log error "defaults delete $bundle NSAppSleepDisabled failed, and no file could be made for the output of defaults read; keeping journal entry for retry"
+          failures+=("App Nap may still be off for $bundle: defaults delete failed and the key could not be read")
+          keep_app_nap_entry "$i"
+        elif (( read_rc == 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
@@ -2621,7 +2630,7 @@ if (( app_nap_count > 0 )); then
           failures+=("App Nap may still be off for $bundle: defaults delete failed and the key could not be read")
           keep_app_nap_entry "$i"
         fi
-        "$RM" -f "$probe"
+        [[ -z "$probe" ]] || "$RM" -f "$probe"
       fi
     fi
     i=$((i + 1))

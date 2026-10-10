@@ -230,23 +230,21 @@ trap on_exit EXIT
 # Run one external call with a time limit. Its combined output is left in
 # BOUNDED_OUTPUT (trailing newline removed) and its exit status returned, or
 # 124 when it did not finish within CALL_TIMEOUT_SECONDS and was stopped, or
-# 125 when it is sudo and still running. The same helper as install.sh's,
-# which says more.
+# 125 when it is sudo and still running. BOUNDED_WHOLE is 1 only when that
+# output was read whole; a caller that decides from the output treats 0 as
+# unknown. The same helper as install.sh's, which says more.
 # supervise() enforces the limit itself, even if this run is killed while it
 # waits or its process group gets SIGTERM or SIGHUP: SIGTERM once the limit has passed on bash's SECONDS clock, SIGKILL
 # one to two seconds later, never SIGKILL for sudo. The supervisor and the call keep fd 9 (the recovery lock) until the
 # call has exited, so a launchctl bootout made under the lock cannot unload
 # an agent the app confirms after this run is gone.
-# root_running is 1 from just before a sudo call starts until its status
-# is in, which its supervisor writes once the call has been reaped; it
-# stays 1 after a 125. restore_agent waits for it.
 BOUNDED_OUTPUT=""
-root_running=0
+BOUNDED_WHOLE=0
 bounded() { # command args...
-  local base supervisor rc deadline
+  local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
-  if [[ "$1" == "$SUDO" ]]; then root_running=1; fi
+  BOUNDED_WHOLE=0
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -263,13 +261,23 @@ bounded() { # command args...
   # Any other call gets SIGKILL at most two seconds after its SIGTERM, so
   # this wait ends.
   wait "$supervisor" 2>/dev/null || true
-  [[ "$1" != "$SUDO" ]] || root_running=0
   rc=124
-  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
-  IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc" || rc=124; fi
+  [[ "$rc" =~ ^[0-9]{1,3}$ ]] && (( 10#$rc <= 255 )) || rc=124
+  file="$("$STAT" -f '%d:%i %z' "$base.out" 2>/dev/null)" || file=""
+  { opened=1; IFS= read -r -d '' BOUNDED_OUTPUT || read_rc=$?; } 2>/dev/null < "$base.out" || true
+  if (( opened && read_rc == 1 )) && [[ "$file" =~ ^[0-9]+:[0-9]+\ ([0-9]+)$ ]]; then
+    size="${BASH_REMATCH[1]}"
+    bounded_bytes
+    if [[ "$("$STAT" -f '%d:%i %z' "$base.out" 2>/dev/null)" == "$file" ]] && (( BOUNDED_BYTES == 10#$size )); then
+      BOUNDED_WHOLE=1
+    fi
+  fi
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
 }
+# BOUNDED_BYTES: the bytes in BOUNDED_OUTPUT, not its characters.
+bounded_bytes() { local LC_ALL=C; BOUNDED_BYTES=${#BOUNDED_OUTPUT}; }
 # The supervising process of one bounded() call; it runs in the background.
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. The
@@ -1211,6 +1219,13 @@ list_unrecorded_app_nap() {
     rc=0
     bounded "$DEFAULTS" read "$id" NSAppSleepDisabled || rc=$?
     value="$BOUNDED_OUTPUT"
+    # Output not read whole is only a prefix: neither its value nor its
+    # "does not exist" can be trusted.
+    if (( rc != 124 && ! BOUNDED_WHOLE )); then
+      unreadable=$((unreadable + 1))
+      printf 'could not read the whole answer of defaults read for %s; check it yourself with: defaults read %q NSAppSleepDisabled\n' "$id" "$id"
+      continue
+    fi
     if (( rc == 124 )); then
       stuck="$id"
       unreadable=$((unreadable + 1))
@@ -2466,6 +2481,9 @@ read_owed_power() {
   if (( rc != 0 )); then
     owed_why="$(pmset_failed "pmset -g" "$rc"), so whether sleep is off is unknown"
     return 0
+  elif (( ! BOUNDED_WHOLE )); then
+    owed_why="the output of 'pmset -g' could not be read whole, so whether sleep is off is unknown"
+    return 0
   fi
   pmset_field "$BOUNDED_OUTPUT" "" SleepDisabled
   if (( pmset_found )) && [[ "$pmset_value" == 1 ]]; then
@@ -2479,6 +2497,9 @@ read_owed_power() {
   bounded "$PMSET" -g custom || rc=$?
   if (( rc != 0 )); then
     owed_why="$(pmset_failed "pmset -g custom" "$rc"), so whether Low Power Mode is on for battery is unknown"
+    return 0
+  elif (( ! BOUNDED_WHOLE )); then
+    owed_why="the output of 'pmset -g custom' could not be read whole, so whether Low Power Mode is on for battery is unknown"
     return 0
   fi
   pmset_field "$BOUNDED_OUTPUT" "Battery Power:" lowpowermode
@@ -2497,13 +2518,17 @@ path_identity() { # path
   local rc=0
   path_id=""
   bounded "$STAT" -L -f '%d:%i' "$1" || rc=$?
-  if (( rc == 0 )) && [[ "$BOUNDED_OUTPUT" =~ ^[0-9]+:[0-9]+$ ]]; then
+  if (( rc == 0 && BOUNDED_WHOLE )) && [[ "$BOUNDED_OUTPUT" =~ ^[0-9]+:[0-9]+$ ]]; then
     path_id="$BOUNDED_OUTPUT"
     return 0
   fi
   own_why="$(pmset_failed "stat -L $1" "$rc")"
   if (( rc == 1 )); then return 1; fi
-  (( rc != 0 )) || own_why="$own_why without a device and inode"
+  if (( rc == 0 && ! BOUNDED_WHOLE )); then
+    own_why="the output of 'stat -L $1' could not be read whole"
+  elif (( rc == 0 )); then
+    own_why="$own_why without a device and inode"
+  fi
   return 2
 }
 # Whether $1, the file launchd says the agent was loaded from, is this
@@ -2566,6 +2591,10 @@ loaded_agent() {
     124) agent_why="'launchctl print gui/$UID_NUM/$LABEL' did not answer within ${CALL_TIMEOUT_SECONDS}s"; return 0 ;;
     *) agent_why="'launchctl print gui/$UID_NUM/$LABEL' exited $rc"; return 0 ;;
   esac
+  if (( ! BOUNDED_WHOLE )); then
+    agent_why="the output of 'launchctl print gui/$UID_NUM/$LABEL' could not be read whole"
+    return 0
+  fi
   rest="$BOUNDED_OUTPUT"$'\n'
   while [[ -n "$rest" ]]; do
     line="${rest%%$'\n'*}"; rest="${rest#*$'\n'}"
@@ -2678,10 +2707,16 @@ esac
 # and fd 9, so the standard lock, the receipt's lock and the recovery lock
 # stay held until it has exited and been reaped, after this run is gone.
 # Loading the LaunchAgent again after a stop waits for it (restore_agent).
+# root_running is 1 from just before the call starts until bounded()
+# returns its status, which its supervisor writes once the call has been
+# reaped; it stays 1 after a 125.
+root_running=0
 as_root() { # command args...
   local rc=0
   root_why=""
+  root_running=1
   bounded "$SUDO" -n "$@" || rc=$?
+  (( rc == 125 )) || root_running=0
   case "$rc" in
     0) return 0 ;;
     124) root_why="'sudo -n $*' did not answer within ${CALL_TIMEOUT_SECONDS}s and stopped on SIGTERM, so what it did is unknown" ;;

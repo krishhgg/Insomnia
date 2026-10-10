@@ -170,11 +170,22 @@ command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }
 # lock until it ends, as backstop.sh does with sudo pmset.
 # Each call's files get a name from mktemp, so a call made inside $(...)
 # cannot reuse another's.
+# BOUNDED_WHOLE is 1 only when the output was read whole: the read ran to
+# the end of the file, not to a NUL byte or an error, and its byte count
+# equals the size stat gave just before, with the same device, inode and
+# size just after. Otherwise it is 0, and the output is only a prefix that
+# looks plausible, so a caller that decides anything from the output must
+# treat it as unknown even after an exit status of 0. The file is this run's
+# own, in its private 0700 $WORK, written by a call that has been reaped (or,
+# for 124, stopped and reaped). A status file that cannot be read, or that
+# holds no number from 0 to 255, gives 124.
 BOUNDED_OUTPUT=""
+BOUNDED_WHOLE=0
 bounded() { # command args...
-  local base supervisor rc deadline
+  local base supervisor rc deadline file="" size opened=0 read_rc=0
   base="$("$MKTEMP" "$WORK/call.XXXXXX")"
   BOUNDED_OUTPUT=""
+  BOUNDED_WHOLE=0
   supervise "$base" "$@" </dev/null >/dev/null 2>&1 &
   supervisor=$!
   if [[ "$1" == "$SUDO" ]]; then
@@ -192,11 +203,22 @@ bounded() { # command args...
   # this wait ends.
   wait "$supervisor" 2>/dev/null || true
   rc=124
-  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc"; fi
-  IFS= read -r -d '' BOUNDED_OUTPUT < "$base.out" || true
+  if [[ -s "$base.rc" ]]; then read -r rc < "$base.rc" || rc=124; fi
+  [[ "$rc" =~ ^[0-9]{1,3}$ ]] && (( 10#$rc <= 255 )) || rc=124
+  file="$("$STAT" -f '%d:%i %z' "$base.out" 2>/dev/null)" || file=""
+  { opened=1; IFS= read -r -d '' BOUNDED_OUTPUT || read_rc=$?; } 2>/dev/null < "$base.out" || true
+  if (( opened && read_rc == 1 )) && [[ "$file" =~ ^[0-9]+:[0-9]+\ ([0-9]+)$ ]]; then
+    size="${BASH_REMATCH[1]}"
+    bounded_bytes
+    if [[ "$("$STAT" -f '%d:%i %z' "$base.out" 2>/dev/null)" == "$file" ]] && (( BOUNDED_BYTES == 10#$size )); then
+      BOUNDED_WHOLE=1
+    fi
+  fi
   BOUNDED_OUTPUT="${BOUNDED_OUTPUT%$'\n'}"
   return "$rc"
 }
+# BOUNDED_BYTES: the bytes in BOUNDED_OUTPUT, not its characters.
+bounded_bytes() { local LC_ALL=C; BOUNDED_BYTES=${#BOUNDED_OUTPUT}; }
 # The supervising process of one bounded() call; it runs in the background.
 # The call is its only job, so `kill %1` signals the call, and the shell
 # skips a job it has already reaped: a reused pid is never signalled. The
