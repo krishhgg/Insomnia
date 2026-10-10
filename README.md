@@ -39,8 +39,9 @@
 
 ## Install
 
-Requires **macOS 26 or later** and **Xcode with Swift 6.2 or later**. Installation
-currently means building from source:
+Requires **macOS 26 or later**. Building from source also needs **Xcode with
+Swift 6.2 or later**; the [0.1.0 release zip](#from-the-010-release-zip) does
+not:
 
 ```bash
 git clone https://github.com/kgarg2468/Insomnia.git
@@ -81,6 +82,28 @@ recovery prevents replacing the existing recovery agent; follow the reported
 instructions before retrying.
 
 </details>
+
+### From the 0.1.0 release zip
+
+The [0.1.0 release](https://github.com/krishhgg/Insomnia/releases/tag/v0.1.0)
+has this app prebuilt for Apple Silicon Macs with macOS 26 or later. Download
+`Insomnia-0.1.0-macos-arm64.zip` and `SHA256SUMS` into one folder, then:
+
+```bash
+shasum -a 256 -c SHA256SUMS
+unzip -q Insomnia-0.1.0-macos-arm64.zip
+cd Insomnia-0.1.0-macos-arm64
+./scripts/install.sh --app ./Insomnia.app
+open "$HOME/Applications/Insomnia.app"
+```
+
+With `--app`, the installer runs `codesign --verify --strict --deep` on that
+bundle before the password prompt, then copies it as it is: no build and no
+re-signing. It installs the `backstop.sh` from the zip's `scripts` folder, and
+everything else matches a source install. The app is ad-hoc signed and not
+notarized; if macOS will not open it, choose Open Anyway in System Settings >
+Privacy & Security. Keep the unpacked folder: its `scripts/uninstall.sh`
+removes Insomnia again.
 
 ## Using it
 
@@ -252,7 +275,7 @@ app bundle and sudoers rule. The installer refuses a relocated home. See
 
 ## Uninstall
 
-From your checkout:
+From your checkout, or from the unpacked 0.1.0 release folder:
 
 ```bash
 ./scripts/uninstall.sh

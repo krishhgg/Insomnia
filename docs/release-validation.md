@@ -126,6 +126,8 @@ is performed. Do not replace "not run" with "passed" based on source review.
 | Headed-browser throttling with the lid closed | Not run |
 | Battery/thermal event behavior on supported hardware | Not run |
 | Install/upgrade/uninstall with recoverable failure conditions | Not run |
+| Install from the 0.1.0 release zip with `scripts/install.sh --app ./Insomnia.app` on a working Mac, including its `codesign --verify --strict --deep` of the prebuilt bundle and first launch under Gatekeeper | Not run |
+| `scripts/uninstall.sh` run from the unpacked 0.1.0 release folder | Not run |
 
 Hardware tests must be supervised and must not endanger active user work. Use
 a stable, ventilated surface, not an enclosure. Do not intentionally overheat a
@@ -141,6 +143,21 @@ been exercised as an end-to-end installation on a working Mac.
 ## Distribution boundary
 
 Local source builds use ad-hoc signing. Developer ID signing, notarization,
-download packaging, and a consumer installation/recovery walkthrough have not
-been completed. Open-source availability and a passing PR are not equivalent
-to readiness for a signed public binary release.
+and a consumer installation/recovery walkthrough have not been completed.
+Open-source availability and a passing PR are not equivalent to readiness for
+a signed public binary release.
+
+## 0.1.0 release snapshot
+
+The 0.1.0 release zip holds the Insomnia.app (version 0.1.0, build 1) that was
+installed on the maintainer's Mac, copied file for file and not re-signed. No
+GitHub workflow built or attested it. Its executable matches the local release
+build in a checkout that was clean at `b05652c`, apart from two Mach-O size
+fields and the code signature that ad-hoc signing writes. That comparison does
+not prove which commit the build came from.
+
+The `v0.1.0` tag adds `install.sh --app`, its tests in RecoveryScriptTests and
+this documentation on top of `b05652c`. App sources are unchanged. The zip
+also carries `scripts/install.sh`, `scripts/uninstall.sh` and
+`scripts/backstop.sh` from that tag. Those tests use fake tools only, and the
+release rows in the table above are not run.

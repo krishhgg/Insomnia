@@ -1379,6 +1379,164 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("not touched"), "says what was not: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
+
+    // MARK: - install.sh --app (prebuilt release bundle)
+
+    /// --app installs the bundle it is given as it is: no swift build, no
+    /// re-signing, every file byte for byte with its mode. backstop.sh comes
+    /// from the scripts folder beside install.sh (the release zip's own), and
+    /// the signature is checked before the password prompt. The fixture repo
+    /// has no Resources folder here, like the release zip.
+    func testInstallAppInstallsThePrebuiltBundleAsItIsWithoutBuildingOrSigning() throws {
+        let prebuilt = try fx.preparePrebuilt()
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("swift") }, "nothing is built: \(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("codesign") }, [
+            "codesign --verify --strict --deep \(fx.physicalPath(prebuilt))",
+            "codesign --verify --strict --deep \(fx.app.path)",
+        ], "verified, never re-signed")
+        let verify = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("codesign --verify") })
+        let password = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("sudo visudo") })
+        XCTAssertLessThan(verify, password, "the bundle is checked before the password prompt: \(calls)")
+        let source = try fx.files(under: prebuilt)
+        let installed = try fx.files(under: fx.app)
+        XCTAssertEqual(Set(installed.keys), Set(source.keys), "exactly the prebuilt files")
+        for (rel, file) in source {
+            XCTAssertEqual(installed[rel]?.data, file.data, "\(rel) bytes")
+            XCTAssertEqual(installed[rel]?.mode, file.mode, "\(rel) mode")
+        }
+        XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), try Data(contentsOf: fx.backstop),
+                       "backstop.sh comes from the scripts folder beside install.sh")
+        XCTAssertTrue(try String(contentsOf: fx.plist, encoding: .utf8).contains(fx.installedBackstop.path))
+        XCTAssertTrue(try String(contentsOf: fx.sudoers, encoding: .utf8).contains("NOPASSWD: /usr/bin/pmset"))
+        XCTAssertTrue(r.stdout.contains("not rebuilt or re-signed"), r.stdout)
+        XCTAssertTrue(r.stdout.contains("Installed"), r.stdout)
+    }
+
+    /// Every --app refusal comes before the password prompt: no sudo, no
+    /// quit request, no launchctl, and the previous install stays as it was.
+    func testInstallAppRefusesBeforeThePasswordPrompt() throws {
+        try fx.installMachinery()
+        let backstopBefore = try Data(contentsOf: fx.installedBackstop)
+        let missing = fx.root.appendingPathComponent("download/missing.app").path
+        let cases: [(name: String, setup: () throws -> String, expect: String)] = [
+            ("intel", { self.fx.setMode("arm64", "0"); return try self.fx.preparePrebuilt("intel.app").path },
+             "Apple Silicon Macs only"),
+            ("no arm64 name", { self.fx.setMode("arm64", "unknown"); return try self.fx.preparePrebuilt("oid.app").path },
+             "gave no value"),
+            ("missing", { missing }, "\(missing) is not a directory"),
+            ("installed app itself", { self.fx.app.path }, "names the installed app"),
+            ("no seal", {
+                let app = try self.fx.preparePrebuilt("noseal.app")
+                try FileManager.default.removeItem(at: app.appendingPathComponent("Contents/_CodeSignature/CodeResources"))
+                return app.path
+            }, "has no Contents/_CodeSignature/CodeResources"),
+            ("not executable", {
+                let app = try self.fx.preparePrebuilt("noexec.app")
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: app.appendingPathComponent("Contents/MacOS/Insomnia").path)
+                return app.path
+            }, "is not executable"),
+            ("other bundle", {
+                let app = try self.fx.preparePrebuilt("other.app")
+                try #"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>"#
+                    .write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
+                return app.path
+            }, "bundle identifier 'com.example.other'"),
+            ("newer build", {
+                let app = try self.fx.preparePrebuilt("newer.app")
+                try "sealed".write(to: app.appendingPathComponent("Contents/Resources/backstop.sh"), atomically: true, encoding: .utf8)
+                return app.path
+            }, "carries its own backstop.sh"),
+            ("damaged", { self.fx.setMode("codesign", "verify-fails"); return try self.fx.preparePrebuilt("damaged.app").path },
+             "fails 'codesign --verify --strict --deep'"),
+            ("no backstop beside the script", {
+                try FileManager.default.moveItem(at: self.fx.backstop, to: self.fx.root.appendingPathComponent("backstop.moved"))
+                return try self.fx.preparePrebuilt("nobackstop.app").path
+            }, "backstop.sh is missing"),
+        ]
+
+        for c in cases {
+            fx.setMode("arm64", "1")
+            fx.setMode("codesign", "ok")
+            fx.clearCalls()
+            let target = try c.setup()
+
+            let r = try fx.run(fx.installRedirected, ["--app", target], extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(c.name): \(r.stderr + r.stdout)")
+            XCTAssertTrue(r.stderr.contains(c.expect), "\(c.name): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(c.name): \(r.stderr)")
+            let calls = fx.calls()
+            XCTAssertTrue(calls.allSatisfy { $0.hasPrefix("codesign --verify --strict --deep ") }, "\(c.name): \(calls)")
+            XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary", c.name)
+            XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), backstopBefore, c.name)
+            XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist", c.name)
+            XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule", c.name)
+        }
+    }
+
+    /// The installed copy is verified too. When it fails, the message says
+    /// what was already replaced: the sudoers rule, and the old app is gone.
+    func testInstallAppStopsWhenTheInstalledCopyFailsVerification() throws {
+        let prebuilt = try fx.preparePrebuilt()
+        try fx.installMachinery()
+        try "old helper".write(to: fx.installedBackstop, atomically: true, encoding: .utf8)
+        fx.setMode("codesign", "copy-verify-fails")
+
+        let r = try fx.run(fx.installRedirected, ["--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("swift") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --force") }, "\(calls)")
+        XCTAssertTrue(r.stderr.contains("The copy at \(fx.app.path)"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("already removed"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("Nothing was changed"), r.stderr)
+        XCTAssertEqual(try String(contentsOf: fx.installedBackstop, encoding: .utf8), "old helper")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "plist")
+    }
+
+    func testInstallRejectsUnexpectedArgumentsBeforeDoingAnything() throws {
+        for args in [["--bogus"], ["--app"], ["--app", ""], ["--app=x"], ["x", "--app"], ["--app", "a", "b"]] {
+            fx.clearCalls()
+
+            let r = try fx.run(fx.installRedirected, args, extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 2, "\(args): \(r.stderr + r.stdout)")
+            XCTAssertTrue(r.stderr.contains("usage:"), "\(args): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Nothing was changed"), "\(args): \(r.stderr)")
+            XCTAssertEqual(fx.calls(), [], "\(args)")
+            XCTAssertFalse(r.stdout.contains("==>"), "\(args): no step ran: \(r.stdout)")
+        }
+    }
+
+    /// Without --app the installer still builds from the checkout and
+    /// ad-hoc signs the bundle it assembled, as before --app existed.
+    func testInstallWithoutAppStillBuildsAndSigns() throws {
+        try fx.prepareInstall()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("launchctl", "loaded")
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains("swift build -c release"), "\(calls)")
+        XCTAssertTrue(calls.contains("codesign --force --sign - --deep \(fx.app.path)"), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("codesign --verify") }, "\(calls)")
+        XCTAssertEqual(try Data(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia")),
+                       try Data(contentsOf: fx.root.appendingPathComponent("binroot/Insomnia")))
+        XCTAssertEqual(try Data(contentsOf: fx.installedBackstop), try Data(contentsOf: fx.backstop))
+    }
 }
 
 // MARK: - Fixture
@@ -1393,6 +1551,7 @@ private struct FixtureError: Error, CustomStringConvertible {
 ///   root/bin               recording fakes
 ///   root/repo/scripts      patched copies of backstop.sh and uninstall.sh
 ///   root/Applications      fake Insomnia.app bundle
+///   root/download          prebuilt bundles for install.sh --app
 ///   root/etc/sudoers.d     fake sudoers rule
 /// The child gets no HOME at all: every $HOME-derived constant is patched in
 /// the copy, and a stray $HOME would fail under `set -u` instead of reaching
@@ -1488,6 +1647,52 @@ private final class ScriptFixture {
         try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
     }
 
+    /// A complete prebuilt bundle, the shape of the one in the 0.1.0 release
+    /// zip, at root/download/<name>. Its bytes differ from everything
+    /// prepareInstall writes, so a test can tell which one was installed.
+    @discardableResult
+    func preparePrebuilt(_ name: String = "Insomnia.app") throws -> URL {
+        let bundle = root.appendingPathComponent("download", isDirectory: true).appendingPathComponent(name, isDirectory: true)
+        let contents = bundle.appendingPathComponent("Contents", isDirectory: true)
+        for dir in ["MacOS", "Resources", "_CodeSignature"] {
+            try fm.createDirectory(at: contents.appendingPathComponent(dir, isDirectory: true), withIntermediateDirectories: true)
+        }
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kgarg.insomnia</string><key>CFBundleShortVersionString</key><string>0.1.0</string></dict></plist>
+        """.write(to: contents.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
+        let binary = contents.appendingPathComponent("MacOS/Insomnia")
+        try "#!/bin/bash\n# prebuilt binary\nexit 0\n".write(to: binary, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        try "prebuilt icns".write(to: contents.appendingPathComponent("Resources/AppIcon.icns"), atomically: true, encoding: .utf8)
+        try "prebuilt seal".write(to: contents.appendingPathComponent("_CodeSignature/CodeResources"), atomically: true, encoding: .utf8)
+        return bundle
+    }
+
+    /// Relative path and bytes of every regular file below `dir`, with its
+    /// permission bits.
+    func files(under dir: URL) throws -> [String: (data: Data, mode: Int)] {
+        var out: [String: (data: Data, mode: Int)] = [:]
+        guard let walker = fm.enumerator(atPath: dir.path) else { throw FixtureError("cannot list \(dir.path)") }
+        for case let rel as String in walker {
+            let path = dir.appendingPathComponent(rel).path
+            let attrs = try fm.attributesOfItem(atPath: path)
+            guard attrs[.type] as? FileAttributeType == .typeRegular else { continue }
+            let mode = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? -1
+            out[rel] = (try Data(contentsOf: URL(fileURLWithPath: path)), mode)
+        }
+        return out
+    }
+
+    /// The path with every symlink resolved, the way `pwd -P` reports it
+    /// (temporary directories live below /var, a link to /private/var).
+    func physicalPath(_ url: URL) -> String {
+        guard let resolved = realpath(url.path, nil) else { return url.path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
     func exists(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
 
     func contents(of dir: URL) throws -> [String] {
@@ -1545,6 +1750,7 @@ private final class ScriptFixture {
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "SWIFT": bin.appendingPathComponent("swift").path,
+            "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "LOCK_TIMEOUT_SECONDS": "1",
         ])
         try patchedInstall.write(to: install, atomically: true, encoding: .utf8)
@@ -1659,8 +1865,20 @@ private final class ScriptFixture {
         for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(r)/binroot"; exit 0; }; done
         exit 0
         """)
+        // codesign modes: "verify-fails" fails every --verify, like a
+        // damaged download; "copy-verify-fails" fails --verify only for a
+        // bundle inside the fixture's Applications folder (the installed copy).
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
+        mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
+        if [[ "${1:-}" == --verify ]]; then
+          target=""; for a in "$@"; do target="$a"; done
+          case "$mode" in
+            verify-fails) echo "$target: invalid signature (code or signature have been modified)" >&2; exit 1 ;;
+            copy-verify-fails)
+              case "$target" in "\(appsDir.path)"/*) echo "$target: invalid signature (code or signature have been modified)" >&2; exit 1 ;; esac ;;
+          esac
+        fi
         exit 0
         """)
         // ps: answers from ps.table. Modes: "fail" (exit 2 with an error
@@ -1683,7 +1901,17 @@ private final class ScriptFixture {
         for f in $fail; do [[ "$f" == "${2:-}" ]] && exit 1; done
         exit 0
         """)
+        // sysctl: install.sh --app asks hw.optional.arm64 (arm64.mode, default
+        // 1; "unknown" fails like an Intel Mac without that name); every
+        // other query gets the boot session UUID.
         try writeFake("sysctl", """
+        for a in "$@"; do
+          if [[ "$a" == hw.optional.arm64 ]]; then
+            mode="$(cat "\(r)/arm64.mode" 2>/dev/null || echo 1)"
+            if [[ "$mode" == unknown ]]; then echo "sysctl: unknown oid 'hw.optional.arm64'" >&2; exit 1; fi
+            echo "$mode"; exit 0
+          fi
+        done
         cat "\(r)/boot.uuid"
         """)
         // pgrep: pgrep.mode holds one exit status per line, consumed in

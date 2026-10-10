@@ -4,6 +4,13 @@
 # once (for /etc/sudoers.d/insomnia), before anything of a previous install
 # is touched. Not atomic: a failure after the sudoers step says exactly what
 # was replaced so far.
+#
+#   ./scripts/install.sh                         build from this source checkout
+#   ./scripts/install.sh --app ./Insomnia.app    install a prebuilt bundle (the
+#                                                0.1.0 release zip) as it is:
+#                                                no build and no re-signing.
+#                                                backstop.sh still comes from
+#                                                this script's scripts folder.
 set -euo pipefail
 
 # Installation always uses the standard per-user layout. A relocated
@@ -13,6 +20,14 @@ if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   echo "INSOMNIA_HOME is set ($INSOMNIA_HOME). install.sh only supports the standard layout under ~/Library;" >&2
   echo "unset INSOMNIA_HOME and rerun. Nothing was changed." >&2
   exit 1
+fi
+
+PREBUILT=""
+if (( $# == 2 )) && [[ "$1" == --app && -n "$2" ]]; then
+  PREBUILT="$2"
+elif (( $# != 0 )); then
+  echo "usage: $0 [--app /path/to/Insomnia.app]. Nothing was changed." >&2
+  exit 2
 fi
 
 # How long to wait for the app to exit after asking it to quit.
@@ -27,6 +42,7 @@ SUDO=/usr/bin/sudo
 PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 SWIFT=/usr/bin/swift
+SYSCTL=/usr/sbin/sysctl
 LOCKF=/usr/bin/lockf
 LOCK_TIMEOUT_SECONDS=10
 
@@ -43,12 +59,72 @@ UID_NUM="$(id -u)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
-# 1. Build -------------------------------------------------------------------
-step "Building (release)"
-cd "$ROOT"
-"$SWIFT" build -c release
-BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
-[[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
+# 1. Build, or check the prebuilt app ----------------------------------------
+#    Every --app check comes before the password prompt, so a bundle that
+#    fails one leaves the machine exactly as it was.
+if [[ -n "$PREBUILT" ]]; then
+  step "Checking the prebuilt app $PREBUILT"
+  # The release bundle is built for arm64 only. hw.optional.arm64 describes
+  # the hardware, so a Terminal running under Rosetta still reads 1.
+  arm64="$("$SYSCTL" -n hw.optional.arm64 2>/dev/null || true)"
+  if [[ "$arm64" != 1 ]]; then
+    echo "This Insomnia.app runs on Apple Silicon Macs only, and this Mac is not one ('sysctl -n hw.optional.arm64' gave ${arm64:-no value})." >&2
+    echo "Build from a source checkout instead (run this script without --app). Nothing was changed." >&2
+    exit 1
+  fi
+  if [[ ! -d "$PREBUILT" ]]; then
+    echo "--app: $PREBUILT is not a directory. Nothing was changed." >&2
+    exit 1
+  fi
+  # Physical path: cp -R would copy a symlink given on the command line as
+  # a link, not the bundle it points to.
+  PREBUILT="$(cd "$PREBUILT" && pwd -P)"
+  # Step 3 deletes $APP before copying, which would delete the source too.
+  if [[ -e "$APP" && "$PREBUILT" -ef "$APP" ]]; then
+    echo "--app names the installed app $APP itself; pass the Insomnia.app from the release zip. Nothing was changed." >&2
+    exit 1
+  fi
+  for f in Contents/Info.plist Contents/MacOS/Insomnia Contents/_CodeSignature/CodeResources; do
+    if [[ ! -f "$PREBUILT/$f" ]]; then
+      echo "$PREBUILT has no $f, so it is not a complete signed Insomnia.app. Nothing was changed." >&2
+      exit 1
+    fi
+  done
+  if [[ ! -x "$PREBUILT/Contents/MacOS/Insomnia" ]]; then
+    echo "$PREBUILT/Contents/MacOS/Insomnia is not executable; unzip the release with unzip, ditto or Finder, which keep file modes. Nothing was changed." >&2
+    exit 1
+  fi
+  bundle_id="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$PREBUILT/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "$bundle_id" != com.kgarg.insomnia ]]; then
+    echo "$PREBUILT has bundle identifier '${bundle_id:-none}', not com.kgarg.insomnia. Nothing was changed." >&2
+    exit 1
+  fi
+  # Newer builds seal their own backstop.sh into the bundle and need the
+  # install.sh that came with them; this script would pair them with the
+  # older backstop.sh beside it.
+  if [[ -e "$PREBUILT/Contents/Resources/backstop.sh" ]]; then
+    echo "$PREBUILT carries its own backstop.sh, so it is a newer Insomnia build than this installer. Install it with the install.sh from its own release. Nothing was changed." >&2
+    exit 1
+  fi
+  if [[ ! -f "$ROOT/scripts/backstop.sh" ]]; then
+    echo "$ROOT/scripts/backstop.sh is missing; run the install.sh in the unpacked release folder. Nothing was changed." >&2
+    exit 1
+  fi
+  # The bundle is installed with the signature it came with, so that
+  # signature has to be intact. --strict rejects what newer codesign would,
+  # --deep covers every nested item.
+  if ! "$CODESIGN" --verify --strict --deep "$PREBUILT"; then
+    echo "$PREBUILT fails 'codesign --verify --strict --deep': the download is damaged or was modified. Nothing was changed." >&2
+    exit 1
+  fi
+  echo "prebuilt app checked; it is installed as it is (not rebuilt or re-signed)"
+else
+  step "Building (release)"
+  cd "$ROOT"
+  "$SWIFT" build -c release
+  BIN="$("$SWIFT" build -c release --show-bin-path)/Insomnia"
+  [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
+fi
 
 # 2. sudoers -----------------------------------------------------------------
 #    The password prompt comes first: until the rule is installed and proven
@@ -98,14 +174,27 @@ if "$PGREP" -x Insomnia >/dev/null 2>&1; then
   fi
 fi
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
-cp "$BIN" "$APP/Contents/MacOS/Insomnia"
-cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
-mkdir -p "$APP/Contents/Resources"
-cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-"$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
-"$CODESIGN" --force --sign - --deep "$APP"
-echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
+if [[ -n "$PREBUILT" ]]; then
+  # A plain copy: the bundle's own signature covers these exact bytes, so
+  # nothing is rebuilt, edited or re-signed.
+  mkdir -p "$APP_DIR"
+  cp -R "$PREBUILT" "$APP"
+  if ! "$CODESIGN" --verify --strict --deep "$APP"; then
+    echo "The copy at $APP fails 'codesign --verify --strict --deep' (the previous app there was already removed)." >&2
+    echo "$SUDOERS is installed; backstop.sh and the LaunchAgent were not touched. Rerun this script." >&2
+    exit 1
+  fi
+  echo "installed $PREBUILT as $APP; signature unchanged and verified"
+else
+  mkdir -p "$APP/Contents/MacOS"
+  cp "$BIN" "$APP/Contents/MacOS/Insomnia"
+  cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+  mkdir -p "$APP/Contents/Resources"
+  cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+  "$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
+  "$CODESIGN" --force --sign - --deep "$APP"
+  echo "signed $("$CODESIGN" -dv "$APP" 2>&1 | grep -i identifier || true)"
+fi
 
 # 4. Backstop script + dirs --------------------------------------------------
 step "Installing backstop.sh to $APP_SUPPORT"
