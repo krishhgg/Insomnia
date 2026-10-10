@@ -19,6 +19,7 @@ import XCTest
 final class LogEndRecordTests: XCTestCase {
     var h: Harness!
     var agent: PatchedBackstop!
+    let acls = OwnedACLs()
 
     override func setUp() async throws {
         h = Harness()
@@ -28,8 +29,7 @@ final class LogEndRecordTests: XCTestCase {
 
     override func tearDown() async throws {
         Store.lockRecordWriteLimitForTesting = nil
-        try? TestACL.removeAll(h.home.paths.appSupport)
-        try? TestACL.removeAll(h.home.paths.logs)
+        acls.removeGiven()
         unpinAll()
         for url in [logFile, rotatedLog, h.home.paths.sessionFile] {
             try? setImmutable(url, false)
@@ -111,14 +111,14 @@ final class LogEndRecordTests: XCTestCase {
     /// The app can record the end nowhere but the log: neither folder
     /// takes a new file and the lock file takes no record.
     private func refuseAllButTheLogForTheApp() throws {
-        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
-        try TestACL.denyNewFiles(in: h.home.paths.logs)
+        try acls.denyNewFiles(in: h.home.paths.appSupport)
+        try acls.denyNewFiles(in: h.home.paths.logs)
         Store.lockRecordWriteLimitForTesting = 0
     }
 
     private func repairAll() throws {
-        try TestACL.removeAll(h.home.paths.appSupport)
-        try TestACL.removeAll(h.home.paths.logs)
+        try acls.removeAll(h.home.paths.appSupport)
+        try acls.removeAll(h.home.paths.logs)
         Store.lockRecordWriteLimitForTesting = nil
         unpinAll()
     }
@@ -486,11 +486,12 @@ final class LogEndRecordTests: XCTestCase {
         // The journal takes the new cutoffs first; then it, both folders
         // and the lock file refuse everything.
         let paths = h.home.paths
+        let acls = self.acls
         m.beforeRecordedCutoffsPutBack = {
             do {
                 try setImmutable(paths.stateFile, true)
-                try TestACL.denyNewFiles(in: paths.appSupport)
-                try TestACL.denyNewFiles(in: paths.logs)
+                try acls.denyNewFiles(in: paths.appSupport)
+                try acls.denyNewFiles(in: paths.logs)
             } catch { XCTFail("not refused: \(error)") }
         }
 

@@ -748,15 +748,16 @@ the app's decoder reads it (`record_text_problems`), not through `plutil`,
 which keeps the last of two copies of a key where the app keeps the first
 and reads numbers through a `Double`. Where `plutil` would read the file
 otherwise than the app (a key the app reads written twice or with an
-escape, a whole number written with a fraction or an exponent, UTF-16 or
-UTF-32), the backstop reads and edits a copy of the journal as the app
+escape, a whole number written with a fraction or an exponent, a `Float`
+`plutil` would write back as another `Float`, UTF-16 or UTF-32, a NUL byte
+in text the app skips, `\u0000` in a string the app reads), the backstop
+reads and edits a copy of the journal as the app
 reads it (the view) and leaves the file as it is until it publishes a
 journal. The view holds the keys the app reads, the first copy of each,
 without escapes, with whole numbers as digits, and nothing the app skips.
 So a journal the backstop publishes from it drops what the app's own save
-drops: keys the app does not read, later copies of a key, a
-`sessionCutoffs` the app reads as no record, and an `endedSession` that
-holds `\u0000`, which is no session the app wrote. The check accepts a
+drops: keys the app does not read, later copies of a key, and a
+`sessionCutoffs` the app reads as no record. The check accepts a
 whole number written with a fraction or an exponent when the app reads it
 as a whole number the field's type holds (`5105.0`, `1e3`, and `1e-400` as
 0; not `0.5`, and not `2147483648` for an Int32), a number where the app
@@ -765,18 +766,39 @@ reads a `Float` that does not round to infinity, or to 0 unless it is 0
 skips, UTF-16 with or without a byte order mark, and UTF-32 without one or
 big-endian with one. A `sessionCutoffs` written twice counts by its first
 copy, and one the app reads as no record leaves the journal loadable and
-counts as a record the app does not write. It refuses some text the app's
-decoder reads, none of which the app writes: a NUL byte anywhere, a
-string the app reads that holds `\u0000`, which `plutil` cannot read, and
-text the check does not finish reading within 30 s (an object with very
-many keys or a very long array can take that long). It refuses an Int64
-on which Foundation stops the app (a precondition in its `Decimal` parse)
-and UTF-32LE with a byte order mark, which the app does not load either.
-`plutil` writes every number of a journal it edits through a `Double`; an
-edited copy whose text the check finds the app would read otherwise is
-not published, and the run keeps the old journal and exits 1. While a
-refused journal stays, a valid session keeps sleep held unless the app ends
-it, and nothing is undone, until the file is fixed.
+counts as a record the app does not write. A NUL byte in text the app
+skips, which `plutil` does not read, is left out of the view; one in a
+string the app reads or between values is refused, as the app refuses it.
+A string the app reads that holds `\u0000`, which `plutil` cannot hold, is
+held in the view with U+E000 for each `\u0000`, and each journal published
+from the view has them written back as `\u0000`. The check refuses some
+text the app's decoder reads, none of which the app writes: such a string
+longer than 1024 bytes, `\u0000` in a journal that also holds U+E000 (raw
+or as an escape), which the view could not tell from a mark, and text the
+check does not finish reading within 30 s (an object with very many keys or
+a very long array can take that long). It cannot tell what the app makes of
+an Int64 on which Foundation stops the app (a precondition in its `Decimal`
+parse): the app neither loads nor rejects that journal, it stops, and the
+check refuses it as not known. It refuses UTF-32LE with a byte order mark,
+which the app does not load either.
+
+Loading is not the whole test for a journal the backstop publishes.
+`plutil` writes every number of a journal it edits back through a `Double`
+or a `Decimal`, which can turn the text of a `Float` into text the app reads
+as another `Float`, and writes -0 as text it reads back as the whole number
+0. The view holds each such `Float` as the same `Float` in 9 digits, which
+`plutil` writes back unchanged, and -0 as -0.0; a copy that holds -0.0 is
+read into a view again before each edit after the first (`publish_edit`).
+Before an edited copy is renamed over `state.json`
+(`journal_candidate_ok`), the check reads it as it reads the journal: it
+must load as the app loads it, hold every `Float` the app decodes, where it
+is and bit for bit, as the journal it was copied from, and, where the view
+wrote U+E000 for `\u0000`, hold `\u0000` there and no U+E000. Strings,
+whole numbers and bools `plutil` writes back as they were. A copy that
+fails is not published: the run keeps the old journal, with every entry it
+still has to undo, and exits 1. While a refused journal stays, a valid
+session keeps sleep held unless the app ends it, and nothing is undone,
+until the file is fixed.
 
 When the binary cannot answer for `config.json` (missing or not
 executable, or another declared version: the agent runs only the script
@@ -800,15 +822,17 @@ null), the values the binary prints for it. A file the decoder rejects
 a number the type does not hold, a string it does not read, a
 `lidCloseDefaultsNotice` without one of its keys) counts as rejected, as
 the binary answers for it. The backstop cannot tell what the app makes of
-a file over 8 MiB, one with an Int64 on which Foundation stops the app, or
-one the reader does not finish within 30 s (very many keys or a very long
-array), and it does not use one of those. So a hand edit reaches the
+a file over 8 MiB, one with an Int64 on which Foundation stops the app (it
+stops there, neither loading nor rejecting the file), or one the reader does
+not finish within 30 s (very many keys or a very long array), and it does
+not use one of those: they count as read neither way, not as rejected. So a hand edit reaches the
 backstop on this path only in a form this reader can read; one it cannot
 read leaves the cases below. The binary is not run again on the journal then:
 the backstop reads `sessionCutoffs` from the journal it checked itself
 (`journal_cutoffs`), a string of exactly the form the app writes, a floor
 of 0 to 95 with no leading zero and `true` or `false`, which `plutil` reads
-from the one copy of the key the check allows. It enforces that record and
+from the journal as the app reads it, the first copy of the key (from the
+view where the text holds it twice). It enforces that record and
 logs that it read it.
 
 Where no record says which cutoffs apply, the outcome depends on

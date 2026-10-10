@@ -1047,6 +1047,32 @@ final class FIFOWatch: @unchecked Sendable {
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
 }
 
+/// The ACL entries one test gives (TestACL.denyNewFiles), so that its
+/// cleanup takes off exactly those. No ACL is read to find them, and a test
+/// that gives none makes no ACL call at all, in its body or its tearDown.
+final class OwnedACLs {
+    private var given: [URL] = []
+
+    /// TestACL.denyNewFiles, kept for removeGiven once chmod added it.
+    func denyNewFiles(in dir: URL) throws {
+        try TestACL.denyNewFiles(in: dir)
+        given.append(dir)
+    }
+
+    /// TestACL.removeAll on `dir`, which this test gave an entry.
+    func removeAll(_ dir: URL) throws {
+        try TestACL.removeAll(dir)
+        given.removeAll { $0 == dir }
+    }
+
+    /// Takes off the entries still given, for a tearDown; runs nothing
+    /// when there are none.
+    func removeGiven() {
+        for dir in given { try? TestACL.removeAll(dir) }
+        given = []
+    }
+}
+
 /// Access control lists for the tests that check Insomnia leaves them alone.
 enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
@@ -1063,10 +1089,9 @@ enum TestACL {
         try chmod(["+a", "user:\(owner) deny add_file", dir.path])
     }
 
-    /// Removes every ACL entry from `url`. A file that holds none (or
-    /// cannot be read for its ACL) is left alone: no chmod runs.
+    /// Removes every ACL entry from `url`, which the caller gave one
+    /// (OwnedACLs keeps which): no ACL is read first.
     static func removeAll(_ url: URL) throws {
-        guard entries(url) > 0 else { return }
         try chmod(["-N", url.path])
     }
 
@@ -1082,7 +1107,8 @@ enum TestACL {
         guard chmod.terminationStatus == 0 else { throw POSIXError(.EPERM) }
     }
 
-    /// How many ACL entries `url` has, without following a symlink.
+    /// How many ACL entries `url` has, without following a symlink. Only
+    /// for a test that checks the entries it gave.
     static func entries(_ url: URL) -> Int {
         guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }

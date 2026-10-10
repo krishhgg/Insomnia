@@ -372,15 +372,21 @@ them before a session starts or resumes and before a change to either takes
 effect; when it cannot, it refuses the change or ends the session. A journal
 without them (a session an older build started) gives the app's defaults (10%,
 on). When the binary cannot answer (it was removed or replaced by an older or
-newer build after the agent checked the bundle's signature, it gives no usable
-answer within 30 seconds, or `config.json` is over 8 MiB), the agent reads
-`config.json` itself and logs that it did. It uses the file only where it can
-tell exactly what the app's decoder makes of it: at most 64 KiB, parsed by
-`plutil`, every setting the app reads of a type the app takes, and no key the
-app reads written twice, with an escape JSON does not have, or as a number the
-app rounds or cannot hold. A file with a setting of the wrong type counts as
-rejected. For any other file the agent reads the recorded values from
-`state.json` itself. On either path, a recorded value the app does not write
+newer build after the agent checked the bundle's signature, it gives no answer
+in its form within 30 seconds, or `config.json` is over 8 MiB), the agent reads
+`config.json` itself and logs that it did. It copies the file once, at most
+8 MiB, and reads the copy's text with its own reader, without `plutil`, as the
+app's decoder reads it: the first copy of a key, keys after their escapes,
+numbers as the setting's type reads them (`1e-400` as an end floor of 0), and
+what the decoder skips skipped. A file the decoder rejects (text that is not
+JSON it reads, a setting of a type it does not take, a number the type does
+not hold) counts as rejected. A file over 8 MiB, one the reader does not
+finish within 30 seconds, and one with an Int64 on which Foundation stops the
+app (the app stops there; it neither loads nor rejects the file) are not
+used: what the app makes of them is not known here, and they count as read
+neither way, below. For a rejected file, and one the agent does not use, it
+reads the recorded values from `state.json` itself. On either path, a
+recorded value the app does not write
 counts as none, as the app reads it, and so does a `state.json` that is a
 symlink to nothing, which the app reads as no journal. With `config.json`
 missing or rejected, none gives the app's defaults (10%, on). With
@@ -392,15 +398,23 @@ rule off, that the app would keep. A running app that answers writes its record
 within a second, so these cases need an app that has stopped answering. The
 defaults and the 95% values here are stopgaps no one has approved; spec section
 6 lists them as open. Before it reads them, or ends a session, the agent checks
-the parts of `state.json` the app decodes. When they do not load as the app
-loads them, the agent keeps the session, changes nothing and logs why, until
-the app or a person fixes the file; the first run after the fix ends the
-session if it is over. The check also refuses some text the app loads but never
-writes (a key it reads written twice, a number a `Double` rounds, UTF-32LE with
-a byte order mark; spec section 6 lists them). A running app rewrites the
-journal in its own form the next time it writes it, but with the app crashed or
-hung, such a journal keeps the session and its sleep hold, past the deadline
-too, until someone fixes the file. Each
+the parts of `state.json` the app decodes. It reads the file's text as the
+app's decoder reads it: a key written twice counts by its first copy, and a
+number `plutil` would read otherwise is read as the app reads it. When the
+parts do not load as the app loads them, or the check cannot tell what the app
+makes of them (an Int64 on which Foundation stops the app, text it does not
+finish reading within 30 seconds), the agent keeps the session, changes
+nothing and logs why, until the app or a person fixes the file; the first run
+after the fix ends the session if it is over. The check also refuses two kinds
+of text the app loads but never writes: a string the app reads that holds
+`\u0000` and is longer than 1024 bytes, and `\u0000` in a journal that also
+holds U+E000 (spec section 6). A running app rewrites the journal in its own
+form the next time it writes it, but with the app crashed or hung, such a
+journal keeps the session and its sleep hold, past the deadline too, until
+someone fixes the file. A journal the agent edits is published only when the
+edited copy loads as the app loads it and holds every `Float` the app decodes
+bit for bit as before, with each `\u0000` written back; otherwise the agent
+keeps the old journal, with what it still has to undo, and exits 1. Each
 early end is logged with its reason, and the saved session is deleted before
 the restore starts. A restore that cannot finish leaves entries in the journal
 for the next run and the app. If the saved session cannot be deleted, its end

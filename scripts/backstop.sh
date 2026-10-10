@@ -258,6 +258,7 @@ BASE64=/usr/bin/base64
 STAT=/usr/bin/stat
 CAT=/bin/cat
 GREP=/usr/bin/grep
+SED=/usr/bin/sed
 HEAD=/usr/bin/head
 TAIL=/usr/bin/tail
 TR=/usr/bin/tr
@@ -381,7 +382,8 @@ fd_names() { # fd path
 # opened again, up to three times. A line that gets no lock, or no file
 # the path still names, goes to standard error instead.
 log() { # level message
-  "$MKDIR" -p "$LOG_DIR"
+  # mkdir -p of a directory that is there does nothing.
+  [[ -d "$LOG_DIR" ]] || "$MKDIR" -p "$LOG_DIR"
   # Append only to a regular file, or create one. open(2) on a FIFO with no
   # reader blocks, and most lines are written while this run holds the
   # recovery lock. A line with nowhere to go is dropped.
@@ -479,6 +481,112 @@ extract_whole() { # file keypath
 # "(any)" for null); empty if the key is absent.
 type_of() { # file keypath
   "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+}
+# The types journal_shape_problems checks, read from one conversion of the
+# file rather than one plutil -type a keypath. With -r plutil writes JSON
+# one value to a line, two spaces deeper a level, a key and its value as
+# "key" : value, and an empty array or object over three lines, the middle
+# one empty. A value starts with what it is: { a dictionary, [ an array,
+# " a string, true or false a bool, null what plutil -type calls "(any)",
+# and anything else a number. plutil writes the Float 5.0 as 5, so a
+# number is "number" here, as in the checks, and shape_name asks plutil
+# -type for the name a line about a problem gives. shape_types_text holds,
+# for each value at the top level and, in frozenProcesses, frozenPids,
+# savedAudioOutputs and appNapOverrides where each is an array, for each
+# entry and each value directly in an entry, a line of its keypath, a tab
+# and its type. A key with anything but letters and digits in it names no
+# keypath asked about (plutil splits a keypath at each dot and writes such
+# a key with an escape where these have none), so it and what is under it
+# are left out. Returns 1 when plutil does not read the file as a JSON
+# object. On a line in no form named here shape_types_read stays 0, and
+# shape_type asks plutil -type for each keypath, as before.
+shape_types_text=""
+shape_types_read=0
+shape_types() { # file
+  local line rest key t top="" n=0 entry="" first=1 last=0
+  local member='^"(([^"\]|\\.)*)" : (.*)$' plain='^[A-Za-z0-9]+$'
+  shape_types_text=$'\n'
+  shape_types_read=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( first == 1 )); then
+      first=0
+      [[ "$line" == "{" ]] || return 1
+      continue
+    fi
+    (( last == 0 )) || return 0
+    case "$line" in
+      ""|"        "*) ;;
+      "      "[!\ ]*)
+        rest="${line#      }"
+        if [[ -n "$entry" && "$rest" != [\]\}]* ]]; then
+          [[ "$rest" =~ $member ]] || return 0
+          key="${BASH_REMATCH[1]}"
+          shape_value_type "${BASH_REMATCH[3]}" || return 0
+          [[ ! "$key" =~ $plain ]] || shape_types_text+="$entry.$key"$'\t'"$t"$'\n'
+        fi
+        ;;
+      "    "[!\ ]*)
+        rest="${line#    }"
+        if [[ -n "$top" && "$rest" != [\]\}]* ]]; then
+          shape_value_type "$rest" || return 0
+          shape_types_text+="$top.$n"$'\t'"$t"$'\n'
+          entry=""
+          [[ "$t" != dictionary ]] || entry="$top.$n"
+          n=$((n + 1))
+        fi
+        ;;
+      "  "[!\ ]*)
+        rest="${line#  }"
+        top=""
+        entry=""
+        if [[ "$rest" != [\]\}]* ]]; then
+          [[ "$rest" =~ $member ]] || return 0
+          key="${BASH_REMATCH[1]}"
+          shape_value_type "${BASH_REMATCH[3]}" || return 0
+          if [[ "$key" =~ $plain ]]; then
+            shape_types_text+="$key"$'\t'"$t"$'\n'
+            case "$key" in
+              frozenProcesses|frozenPids|savedAudioOutputs|appNapOverrides) [[ "$t" != array ]] || { top="$key"; n=0; } ;;
+            esac
+          fi
+        fi
+        ;;
+      "}") last=1 ;;
+      *) return 0 ;;
+    esac
+  done < <("$PLUTIL" -convert json -r -o - "$1" 2>/dev/null)
+  (( first == 0 )) || return 1
+  (( last == 0 )) || shape_types_read=1
+  return 0
+}
+shape_value_type() { # value as plutil -r writes it; sets t
+  case "$1" in
+    "{") t=dictionary ;;
+    "[") t=array ;;
+    \"*) t=string ;;
+    true|true,|false|false,) t=bool ;;
+    null|null,) t="(any)" ;;
+    -[0-9]*|[0-9]*) t=number ;;
+    *) return 1 ;;
+  esac
+}
+# Sets t to the type of keypath $2 in file $1 (shape_types), "number" for
+# an integer or a float, empty when the keypath is absent.
+shape_type() { # file keypath
+  local re
+  t=""
+  if (( shape_types_read == 1 )); then
+    re=$'\n'"${2//./[.]}"$'\t''([^'$'\n'']*)'
+    if [[ "$shape_types_text" =~ $re ]]; then t="${BASH_REMATCH[1]}"; fi
+  else
+    t="$(type_of "$1" "$2")"
+    if [[ "$t" == integer || "$t" == float ]]; then t=number; fi
+  fi
+  return 0
+}
+# The name plutil -type gives the type $3 of keypath $2, for a line.
+shape_name() { # file keypath type
+  if [[ "$3" == number ]]; then type_of "$1" "$2"; else printf '%s\n' "$3"; fi
 }
 is_true() { # file key
   [[ "$(extract "$1" "$2" || true)" == "true" ]]
@@ -1039,13 +1147,170 @@ json_range() { # number float|double
   return 0
 }
 
-# For json_range: whether 0.$1 times 10^$2 is above 0.$3 times 10^$4, each
-# digit string without leading or trailing zeros, so comparing them as text
-# compares their values.
+# For json_range and json_float: whether 0.$1 times 10^$2 is above 0.$3
+# times 10^$4, each digit string without leading or trailing zeros, so
+# comparing them as text compares their values.
 json_magnitude_above() { # digits exponent digits exponent
   local LC_ALL=C
   (( $2 == $4 )) || { (( $2 > $4 )); return; }
   [[ "$1" > "$3" ]]
+}
+
+# For json_float: sets product to the decimal digits of $1 times $2, a
+# whole number below 2^31.
+json_digits_times() { # digits factor
+  local s="$1" c p carry=0 out=""
+  while [[ -n "$s" ]]; do
+    if (( ${#s} > 9 )); then
+      c="${s:${#s}-9}"
+      s="${s:0:${#s}-9}"
+    else
+      c="$s"
+      s=""
+    fi
+    p=$(( 10#$c * $2 + carry ))
+    carry=$(( p / 1000000000 ))
+    printf -v c '%09d' $(( p % 1000000000 ))
+    out="$c$out"
+  done
+  (( carry == 0 )) || out="$carry$out"
+  [[ "$out" =~ ^0* ]]
+  product="${out:${#BASH_REMATCH[0]}}"
+  return 0
+}
+
+# What the app's JSONDecoder reads as a Float for the JSON number $1, which
+# json_range has found the Float holds. Sets float_bits to that Float's bit
+# pattern; float_text to the same Float in 9 significant digits, which
+# plutil writes back as text the app reads as that Float; and float_kept to
+# 1 when plutil, which edits the journal, writes $1 itself back that way, 0
+# when it may not. plutil reads up to 17 significant digits through a
+# Double, which it writes back in 17, so a number whose Double is halfway
+# between two Floats, or within 16 Double steps of that, may come back on
+# the other side of it; it reads more digits through a Decimal that keeps
+# 38, so a number with more may come back as another Float; and it reads
+# -0 as the whole number 0, which the app reads as +0. The Float is worked
+# out exactly: printf reads the number into a long double (a Double on
+# Apple silicon), whose bits past the Float's settle the rounding unless
+# they are exactly halfway; then the number's digits are compared with the
+# halfway point's, worked out here in decimal (json_digits_times). A number
+# with more than 120 significant digits is read as its first 120 and a 1
+# after them, which lies on the same side of every halfway point, as none
+# has more than 113. Non-zero for anything else, which json_range does not
+# pass.
+json_float() { # number
+  local LC_ALL=C number sign ip frac esign edig exp e10 sig m a lead bits B X u k N R p q c
+  float_bits=""
+  float_text=""
+  float_kept=1
+  number='^(-?)(0|[1-9][0-9]*)(\.([0-9]+))?([eE]([-+]?)([0-9]+))?$'
+  [[ "$1" =~ $number ]] || return 1
+  sign="${BASH_REMATCH[1]}"
+  ip="${BASH_REMATCH[2]}"
+  frac="${BASH_REMATCH[4]}"
+  esign="${BASH_REMATCH[6]}"
+  edig="${BASH_REMATCH[7]}"
+  sig="$ip$frac"
+  [[ "$sig" =~ ^0* ]]
+  sig="${sig:${#BASH_REMATCH[0]}}"
+  if [[ -z "$sig" ]]; then
+    if [[ -n "$sign" ]]; then
+      float_bits=2147483648
+      float_text=-0.0
+      [[ "$1" != -0 ]] || float_kept=0
+    else
+      float_bits=0
+      float_text=0
+    fi
+    return 0
+  fi
+  [[ "$edig" =~ ^0* ]]
+  exp="${edig:${#BASH_REMATCH[0]}}"
+  if (( ${#exp} > 9 )); then e10=1000000000; else e10=$((10#0$exp)); fi
+  [[ "$esign" != - ]] || e10=$((-e10))
+  # The value is 0.sig times ten to the power m.
+  m=$(( ${#ip} + e10 - (${#ip} + ${#frac} - ${#sig}) ))
+  [[ "$sig" =~ 0*$ ]]
+  sig="${sig:0:${#sig}-${#BASH_REMATCH[0]}}"
+  (( ${#sig} <= 38 )) || float_kept=0
+  (( ${#sig} <= 120 )) || sig="${sig:0:120}1"
+  printf -v a '%a' "0.${sig}e$m" 2>/dev/null || return 1
+  [[ "$a" =~ ^0x([0-9a-f])(\.([0-9a-f]+))?p([-+][0-9]+)$ ]] || return 1
+  lead=$((16#${BASH_REMATCH[1]}))
+  bits="${BASH_REMATCH[3]}"
+  X=$(( 10#${BASH_REMATCH[4]#[-+]} ))
+  [[ "${BASH_REMATCH[4]}" != -* ]] || X=$((-X))
+  # B holds the bits of the long double, the first a 1, and it is 0.B
+  # times 2 to the power X.
+  B=""
+  while (( lead > 0 )); do B="$((lead % 2))$B"; lead=$((lead / 2)); X=$((X + 1)); done
+  while [[ -n "$bits" ]]; do
+    c=$((16#${bits:0:1}))
+    B+="$((c / 8))$((c / 4 % 2))$((c / 2 % 2))$((c % 2))"
+    bits="${bits:1}"
+  done
+  B+="0000000000000000000000000000000000000000000000000000000000000000"
+  # The Float is N times 2 to the power u: its step, 2^u, and k bits of B.
+  u=$((X - 24))
+  (( u >= -149 )) || u=-149
+  k=$((X - u))
+  (( k >= 0 && k <= 24 )) || return 1
+  N=0
+  (( k == 0 )) || N=$((2#${B:0:k}))
+  R="${B:k}"
+  # Within 16 Double steps of halfway: plutil may write it back as halfway.
+  p="${R:0:49-k}"
+  [[ ! "$p" =~ ^(10*|01*)$ ]] || float_kept=0
+  if [[ "${R:0:1}" == 1 ]]; then
+    if [[ "${R:1}" == *1* ]]; then
+      N=$((N + 1))
+    else
+      # Exactly halfway in the long double: the halfway point (2N + 1)
+      # times 2^(u - 1) in decimal digits, 0.q times 10^c, against the
+      # number's.
+      q=$((2 * N + 1))
+      c=$((u - 1))
+      if (( c >= 0 )); then
+        while (( c > 0 )); do
+          p=$(( c > 30 ? 30 : c ))
+          json_digits_times "$q" $((1 << p))
+          q="$product"
+          c=$((c - p))
+        done
+        c=${#q}
+      else
+        p=$((-c))
+        while (( p > 0 )); do
+          if (( p >= 13 )); then
+            json_digits_times "$q" 1220703125
+            p=$((p - 13))
+          else
+            json_digits_times "$q" $((5 ** p))
+            p=0
+          fi
+          q="$product"
+        done
+        c=$(( ${#q} + c ))
+      fi
+      [[ "$q" =~ 0*$ ]]
+      q="${q:0:${#q}-${#BASH_REMATCH[0]}}"
+      if json_magnitude_above "$sig" "$m" "$q" "$c"; then
+        N=$((N + 1))
+      elif ! json_magnitude_above "$q" "$c" "$sig" "$m" && (( N % 2 == 1 )); then
+        N=$((N + 1))
+      fi
+    fi
+  fi
+  if (( N == 16777216 )); then
+    N=8388608
+    u=$((u + 1))
+  fi
+  (( u + 149 < 255 )) || return 1
+  float_bits=$(( ((u + 149) << 23) + N ))
+  [[ -z "$sign" ]] || float_bits=$((float_bits + 2147483648))
+  printf -v q '%x' "$N"
+  printf -v float_text '%.9g' "${sign}0x${q}p$u" 2>/dev/null || return 1
+  return 0
 }
 
 # What the app's JSONDecoder makes of the text of a string or key it
@@ -1069,6 +1334,26 @@ json_string_check() { # text between the quotes
   # \001 is tested on its own: bash 3.2 drops it from a bracket range.
   [[ "$1" != *$'\001'* && ! "$1" =~ $ctl && "$1" =~ $utf8 && "$1" =~ $ok ]] || return 2
   [[ ! "$1" =~ $nul ]] || return 1
+  return 0
+}
+
+# For record_text_problems: the text $1 of a string the app reads that
+# holds \u0000 (json_string_check), which plutil cannot hold, as the view
+# writes it, in marked: each \u0000 as \uE000, U+E000, a character of
+# Unicode's private use area, which every journal published from the view
+# writes back as \u0000 (journal_candidate_ok in backstop.sh). A journal
+# that also holds U+E000 itself is not read (record_text_problems).
+# Non-zero without a view, and for a string longer than 1024 bytes, as a
+# pattern substitution in bash takes time that grows with the square of
+# the length.
+json_nul_mark() { # text between the quotes
+  local t c=$'\002'
+  [[ -n "$view" ]] && (( ${#1} <= 1024 )) || return 1
+  # Each \\ first, so that no \u0000 is read across one; the text holds no
+  # control character.
+  t="${1//\\\\/$c}"
+  t="${t//\\u0000/\\uE000}"
+  marked="${t//$c/\\\\}"
   return 0
 }
 
@@ -1142,10 +1427,15 @@ json_window_trim() {
 #   - "view: " (state.json with $3 only): what plutil would read otherwise
 #     than the app, and how the view (below) holds it: a key the app reads
 #     there twice, or written with an escape; a whole number written with a
-#     fraction or an exponent; UTF-16 or UTF-32; an endedSession that holds
-#     \u0000, which is no session the app wrote, left out as no record; a
-#     bootSession the app does not read that plutil would not read either,
-#     left out.
+#     fraction or an exponent; UTF-16 or UTF-32; a bootSession the app
+#     does not read that plutil would not read either, left out; a number where the app reads a Float that plutil would
+#     write back as text the app reads as another Float (json_float); a NUL
+#     byte in text the app skips, which plutil does not read, left out; a
+#     string the app reads that holds \u0000, which plutil cannot hold,
+#     written with U+E000 for it (json_nul_mark).
+#   - "float: " (state.json with floats as $4): each Float the app decodes,
+#     where it is and its bit pattern, which journal_candidate_ok in
+#     backstop.sh compares with those of the journal it edited.
 #   - "record: " (state.json): sessionCutoffs is a value the app reads as no
 #     record (RuntimeState.decodeSessionCutoffs): an object, an array, a
 #     number, a bool, or a string its decoder does not read. The journal
@@ -1165,9 +1455,12 @@ json_window_trim() {
 #     where it decodes the journal: the faults of "rejected: " but a value
 #     of a type it does not take and a key an entry lacks, which
 #     journal_shape_problems checks in the view; a string that holds
-#     \u0000 where the app reads it, which plutil refuses; and a NUL byte
-#     anywhere: the app reads one only inside a string it skips, and the
-#     shell cannot hold one.
+#     \u0000 where the app reads it, which plutil refuses, when there is no
+#     view, when it is longer than 1024 bytes, or when the journal holds
+#     U+E000 as well (json_nul_mark); and a Float that json_float does not
+#     work out. A NUL byte, which the shell cannot
+#     hold, is read as \001, another control character: the app takes one
+#     only inside text it skips, in a string or a key.
 # With $3, for state.json, and only when no other line than "view: " and
 # "record: " lines is printed, the journal as the app reads it is written to
 # the file $3, the view, which plutil reads the way the app reads the text:
@@ -1175,21 +1468,23 @@ json_window_trim() {
 # copy) and without escapes, in the order of the text; for what it does not
 # decode under such a key, an empty object or array of the same kind, or
 # the value as written; whole numbers as digits; a number where the app
-# reads a Float, when it is 0, as 0, and when it is longer than 40 bytes or
+# reads a Float, when it is 0, as 0 (-0.0 when negative, which plutil
+# keeps), when plutil would write it back as another Float, as the same
+# Float in 9 digits (json_float), and when it is longer than 40 bytes or
 # has an exponent of three digits or more, which plutil may not read, as
-# the same value in a form it reads; a frozen process's bootSession also
+# the same value in a form it reads; a string that holds \u0000 with
+# U+E000 for it (json_nul_mark); a frozen process's bootSession also
 # where the app does not read it, as a string the scripts can read; nothing
 # else the app skips. The view drops what the app's own save drops (keys it
-# does not read, later copies, a sessionCutoffs it reads as no record), and
-# an endedSession that holds \u0000.
+# does not read, later copies, a sessionCutoffs it reads as no record).
 # The text is read in pieces of 4096 bytes, and long strings and numbers
 # with regular expressions only, as a pattern cut in bash takes time that
 # grows with the square of the length.
-record_text_problems() { # file [state|config] [view]
+record_text_problems() { # file [state|config] [view] [floats]
   local LC_ALL=C
   local doc rj broken slow piece from bom unit size big=0 large c rest raw name token want d vpath vshown kind rel cls allowed
   local str scalar number lax esc kelvin hex nul nl ws blank problem deadline next count nuls held emit refused view steps n
-  local ip frac esign edig sign
+  local ip frac esign edig sign floats marks pua mark markesc marked nulview
   local -a lead pieces kinds paths shown keys names counts rels knowns begun timed mdecoded bdecoded
   local -a bufs members puts pairs mbufs bbufs bheld
   str='^"([^"\\]|\\[^u]|\\u[^"][^"][^"][^"])*"'
@@ -1207,11 +1502,20 @@ record_text_problems() { # file [state|config] [view]
   doc=state.json
   rj=""
   view="${3:-}"
+  floats="${4:-}"
   if [[ "${2:-}" == config ]]; then
     doc=config.json
     rj="rejected: "
     view=""
+    floats=""
   fi
+  # A string the app reads that holds \u0000 (marks), and U+E000 in any
+  # string, raw or as an escape (pua): see json_nul_mark.
+  marks=0
+  pua=0
+  mark=$'\xee\x80\x80'
+  markesc='\\u[eE]000'
+  nulview="holds \\u0000, which plutil cannot hold; written in the view as U+E000 (\\uE000), which each journal published from it writes back as \\u0000"
   broken="${rj}the text of $doc is not JSON the app's decoder reads"
   slow="reading $doc here did not finish within ${TEXT_READ_SECONDS}s, so what the app makes of it is not known here"
   deadline=$((SECONDS + TEXT_READ_SECONDS))
@@ -1330,11 +1634,6 @@ record_text_problems() { # file [state|config] [view]
   fi
   if [[ -n "$view" && "$from" != UTF-8 ]]; then
     echo "view: $doc is $from, read here as UTF-8"
-  fi
-  if (( nuls == 1 )) && [[ "$doc" == state.json ]]; then
-    # The app reads one inside a string it skips; never in a journal.
-    echo "$doc holds a NUL byte, which is not read here"
-    return 0
   fi
   rest=""
   next=0
@@ -1496,6 +1795,10 @@ record_text_problems() { # file [state|config] [view]
             if (( begun[d] == 1 && timed[d] == 1 )); then
               printf '%s' "${bdecoded[d]}"
               [[ -z "${bdecoded[d]}" ]] || refused=1
+              if [[ "${bheld[d]}" == 1 && -z "${bdecoded[d]}" ]]; then
+                echo "view: ${shown[d]}.bootSession $nulview"
+                marks=1
+              fi
             else
               if [[ -n "${bbufs[d]}" && "${bheld[d]}" != 0 ]]; then
                 [[ -z "${bheld[d]}" ]] || echo "view: ${shown[d]}.bootSession, which the app does not read there, is a string the app would not read; left out"
@@ -1557,6 +1860,7 @@ record_text_problems() { # file [state|config] [view]
         rest="${rest:${#raw}}"
         json_window_trim
         raw="${raw:1:${#raw}-2}"
+        if [[ -n "$view" ]] && (( pua == 0 )) && [[ "$raw" == *"$mark"* || "$raw" =~ $markesc ]]; then pua=1; fi
         if [[ "$want" == key ]]; then
           # The key as a log names it: its first 64 bytes, with ? for each
           # one that is not a letter, a digit or _.
@@ -1635,17 +1939,23 @@ record_text_problems() { # file [state|config] [view]
                 echo "record: sessionCutoffs is a string the app does not read as a record"
                 emit=""
                 ;;
-              state.json:endedSession:1)
-                [[ -z "$view" ]] || echo "view: endedSession holds \\u0000, so it is no session the app wrote; read here as no record"
-                emit=""
-                ;;
               'state.json:frozenProcesses[].bootSession:'*)
                 bheld[d]="$held"
                 (( held != 2 )) || problem="$vshown is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)"
-                (( held != 1 )) || problem="$vshown holds \\u0000, which the app reads and plutil does not; not read here"
+                if (( held == 1 )); then
+                  if json_nul_mark "$raw"; then emit="\"$marked\""; else problem="$vshown holds \\u0000, which the app reads and plutil does not; not read here"; fi
+                fi
                 ;;
               *:2) problem="${rj}$vshown is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)" ;;
-              state.json:*:1) problem="$vshown holds \\u0000, which the app reads and plutil does not; not read here" ;;
+              state.json:*:1)
+                if json_nul_mark "$raw"; then
+                  emit="\"$marked\""
+                  echo "view: $vshown $nulview"
+                  marks=1
+                else
+                  problem="$vshown holds \\u0000, which the app reads and plutil does not; not read here"
+                fi
+                ;;
             esac
             case "$doc:$vpath" in
               'state.json:frozenProcesses[].startedAtMicros') mdecoded[d]+="${problem}${problem:+$nl}" ;;
@@ -1723,25 +2033,37 @@ record_text_problems() { # file [state|config] [view]
             large) problem="${rj}$vshown is ${token:0:40}, too large a number for the app's ${kind/f/F}" ;;
             zero) problem="${rj}$vshown is ${token:0:40}, a 0 written in a way the app's decoder does not read" ;;
           esac
-          if [[ -n "$view" && -z "$range_problem" ]]; then
+          if [[ "$kind" == float && -z "$range_problem" ]]; then
+            if ! json_float "$token"; then
+              problem="$vshown is ${token:0:40}, a number whose Float is not worked out here, so what the app reads is not known here"
+            elif [[ -n "$floats" ]]; then
+              echo "float: $vshown $float_bits"
+            fi
+          fi
+          if [[ "$kind" == float && -n "$view" && -z "$range_problem" && -z "$problem" ]]; then
             [[ "$token" =~ $number ]]
             # In a form plutil reads, of the same value: plutil gives up on
             # a 0 with a long exponent, and on more than 17 digits where
             # the exponent its Decimal holds would leave -128...127. A
             # number longer than 40 bytes or with an exponent of three
             # digits or more is passed on as 0.digits times a power of ten
-            # from -45 to 39, which it reads.
+            # from -45 to 39, which it reads. One plutil would write back
+            # as text the app reads as another Float is passed on as the
+            # same Float in 9 digits (json_float).
             ip="${BASH_REMATCH[1]}"
             frac="${BASH_REMATCH[3]}"
             esign="${BASH_REMATCH[5]}"
             edig="${BASH_REMATCH[6]}"
-            sign=""
-            [[ "$token" != -* ]] || sign=-
             raw="$ip$frac"
             [[ "$raw" =~ ^0* ]]
             raw="${raw:${#BASH_REMATCH[0]}}"
-            if [[ -z "$raw" ]]; then
-              emit="${sign}0"
+            sign=""
+            [[ "$token" != -* ]] || sign=-
+            if (( float_kept == 0 )); then
+              echo "view: $vshown is written as ${token:0:40}, which plutil would write back as text the app reads as another Float; read here as $float_text"
+              emit="$float_text"
+            elif [[ -z "$raw" ]]; then
+              emit="$float_text"
             elif (( ${#token} > 40 || ${#edig} > 2 )); then
               [[ "$edig" =~ ^0* ]]
               n="${edig:${#BASH_REMATCH[0]}}"
@@ -1792,7 +2114,12 @@ record_text_problems() { # file [state|config] [view]
       echo "${rj}$vshown is $cls, which the app's decoder does not take there"
     fi
   done
+  if [[ -n "$view" ]] && (( marks == 1 && pua == 1 )); then
+    echo "$doc holds \\u0000 where the app reads it, which the view writes as U+E000, and U+E000 as well, so what the app reads is not known here"
+    refused=1
+  fi
   if [[ -n "$view" ]] && (( refused == 0 )); then
+    (( nuls == 0 )) || echo "view: $doc holds a NUL byte in text the app skips, which plutil does not read; left out"
     printf '%s\n' "$emit" > "$view"
   fi
   return 0
@@ -1803,20 +2130,20 @@ record_text_problems() { # file [state|config] [view]
 # the same as an absent optional (Swift decodeIfPresent).
 journal_shape_problems() { # file
   local f="$1" key t i n
-  if [[ "$("$PLUTIL" -convert json -o - "$f" 2>/dev/null | "$HEAD" -c 1)" != "{" ]]; then
+  if ! shape_types "$f"; then
     echo "state.json is not a JSON object"
     return 0
   fi
   for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
-    t="$(type_of "$f" "$key")"
-    [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
+    shape_type "$f" "$key"
+    [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $(shape_name "$f" "$key" "$t"), not a bool"
   done
   for key in savedOutputVolume savedDisplayBrightness savedKeyboardBrightness displayRestoredUnderLowPower; do
-    t="$(type_of "$f" "$key")"
-    [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
+    shape_type "$f" "$key"
+    [[ -z "$t" || "$t" == number || "$t" == "(any)" ]] || echo "$key is a $(shape_name "$f" "$key" "$t"), not a number"
   done
-  t="$(type_of "$f" endedSession)"
-  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "endedSession is a $t, not a string"
+  shape_type "$f" endedSession
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "endedSession is a $(shape_name "$f" endedSession "$t"), not a string"
   # sessionCutoffs is a record and not checked here: the app reads a value
   # it does not write as none and records its own over it, so it never
   # makes the journal unusable. read_cutoffs reads it strictly where it is
@@ -1825,19 +2152,19 @@ journal_shape_problems() { # file
   # read for an undo here. Each must still decode, or the app cannot read
   # the journal at all.
   for key in keptDisplayUnderLowPower keptDisplayReadLit; do
-    t="$(type_of "$f" "$key")"
-    [[ -z "$t" || "$t" == float || "$t" == integer || "$t" == "(any)" ]] || echo "$key is a $t, not a number"
+    shape_type "$f" "$key"
+    [[ -z "$t" || "$t" == number || "$t" == "(any)" ]] || echo "$key is a $(shape_name "$f" "$key" "$t"), not a number"
   done
-  t="$(type_of "$f" keptDisplayUnderLowPowerBoot)"
-  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $t, not a string"
-  t="$(type_of "$f" frozenProcesses)"
+  shape_type "$f" keptDisplayUnderLowPowerBoot
+  [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "keptDisplayUnderLowPowerBoot is a $(shape_name "$f" keptDisplayUnderLowPowerBoot "$t"), not a string"
+  shape_type "$f" frozenProcesses
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
-      echo "frozenProcesses is a $t, not an array"
+      echo "frozenProcesses is a $(shape_name "$f" frozenProcesses "$t"), not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenProcesses.$i")" ]]; do
-        if [[ "$(type_of "$f" "frozenProcesses.$i")" != dictionary ]]; then
+      while shape_type "$f" "frozenProcesses.$i"; [[ -n "$t" ]]; do
+        if [[ "$t" != dictionary ]]; then
           echo "frozenProcesses[$i] is not an object"
         else
           # record_text_problems has read each whole number here as the
@@ -1846,15 +2173,15 @@ journal_shape_problems() { # file
           # only after a startedAt that is there and not null, and
           # bootSession only after both; an entry without them has no
           # identity, and the app does not read what follows.
-          t="$(type_of "$f" "frozenProcesses.$i.pid")"
-          [[ "$t" == integer || "$t" == float ]] || echo "frozenProcesses[$i].pid is not an integer"
+          shape_type "$f" "frozenProcesses.$i.pid"
+          [[ "$t" == number ]] || echo "frozenProcesses[$i].pid is not an integer"
           for n in startedAt startedAtMicros bootSession; do
-            t="$(type_of "$f" "frozenProcesses.$i.$n")"
+            shape_type "$f" "frozenProcesses.$i.$n"
             [[ -n "$t" && "$t" != "(any)" ]] || break
             if [[ "$n" == bootSession ]]; then
-              [[ "$t" == string ]] || echo "frozenProcesses[$i].bootSession is a $t, not a string"
+              [[ "$t" == string ]] || echo "frozenProcesses[$i].bootSession is a $(shape_name "$f" "frozenProcesses.$i.$n" "$t"), not a string"
             else
-              [[ "$t" == integer || "$t" == float ]] || echo "frozenProcesses[$i].$n is a $t, not an integer"
+              [[ "$t" == number ]] || echo "frozenProcesses[$i].$n is a $(shape_name "$f" "frozenProcesses.$i.$n" "$t"), not an integer"
             fi
           done
         fi
@@ -1862,55 +2189,57 @@ journal_shape_problems() { # file
       done
     fi
   fi
-  t="$(type_of "$f" frozenPids)"
+  shape_type "$f" frozenPids
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
-      echo "frozenPids is a $t, not an array"
+      echo "frozenPids is a $(shape_name "$f" frozenPids "$t"), not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "frozenPids.$i")" ]]; do
-        t="$(type_of "$f" "frozenPids.$i")"
-        [[ "$t" == integer || "$t" == float ]] || echo "frozenPids[$i] is not an integer"
+      while shape_type "$f" "frozenPids.$i"; [[ -n "$t" ]]; do
+        [[ "$t" == number ]] || echo "frozenPids[$i] is not an integer"
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" savedAudioOutputs)"
+  shape_type "$f" savedAudioOutputs
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
-      echo "savedAudioOutputs is a $t, not an array"
+      echo "savedAudioOutputs is a $(shape_name "$f" savedAudioOutputs "$t"), not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "savedAudioOutputs.$i")" ]]; do
-        if [[ "$(type_of "$f" "savedAudioOutputs.$i")" != dictionary ]]; then
+      while shape_type "$f" "savedAudioOutputs.$i"; [[ -n "$t" ]]; do
+        if [[ "$t" != dictionary ]]; then
           echo "savedAudioOutputs[$i] is not an object"
         else
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
-          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
-          [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
-          t="$(type_of "$f" "savedAudioOutputs.$i.name")"
-          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"
-          t="$(type_of "$f" "savedAudioOutputs.$i.saveID")"
-          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $t, not a string"
+          shape_type "$f" "savedAudioOutputs.$i.deviceUID"
+          [[ "$t" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
+          shape_type "$f" "savedAudioOutputs.$i.volume"
+          [[ "$t" == number ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          shape_type "$f" "savedAudioOutputs.$i.muted"
+          [[ "$t" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
+          shape_type "$f" "savedAudioOutputs.$i.name"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $(shape_name "$f" "savedAudioOutputs.$i.name" "$t"), not a string"
+          shape_type "$f" "savedAudioOutputs.$i.saveID"
+          [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].saveID is a $(shape_name "$f" "savedAudioOutputs.$i.saveID" "$t"), not a string"
         fi
         i=$((i + 1))
       done
     fi
   fi
-  t="$(type_of "$f" appNapOverrides)"
+  shape_type "$f" appNapOverrides
   if [[ -n "$t" && "$t" != "(any)" ]]; then
     if [[ "$t" != array ]]; then
-      echo "appNapOverrides is a $t, not an array"
+      echo "appNapOverrides is a $(shape_name "$f" appNapOverrides "$t"), not an array"
     else
       i=0
-      while [[ -n "$(type_of "$f" "appNapOverrides.$i")" ]]; do
-        if [[ "$(type_of "$f" "appNapOverrides.$i")" != dictionary ]]; then
+      while shape_type "$f" "appNapOverrides.$i"; [[ -n "$t" ]]; do
+        if [[ "$t" != dictionary ]]; then
           echo "appNapOverrides[$i] is not an object"
         else
-          [[ "$(type_of "$f" "appNapOverrides.$i.bundleId")" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
-          t="$(type_of "$f" "appNapOverrides.$i.previous")"
-          [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $t, not a bool"
+          shape_type "$f" "appNapOverrides.$i.bundleId"
+          [[ "$t" == string ]] || echo "appNapOverrides[$i].bundleId is not a string"
+          shape_type "$f" "appNapOverrides.$i.previous"
+          [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "appNapOverrides[$i].previous is a $(shape_name "$f" "appNapOverrides.$i.previous" "$t"), not a bool"
         fi
         i=$((i + 1))
       done
@@ -1924,10 +2253,15 @@ journal_shape_problems() { # file
 # per version of the file: each write here (record_end_in_journal,
 # prepare_low_power_off) has it run again.
 # record_text_problems reads the text first, as the app's decoder reads
-# it. A line from it other than "view: " and "record: " makes the journal
-# malformed: a value the app does not decode, or text whose meaning to the
-# app is not known here (a NUL byte, a read that did not finish). The
-# journal every read below then uses, JOURNAL, is state.json itself, or,
+# it. A line from it other than "view: ", "record: " and "float: " makes
+# the journal malformed: a value the app does not decode, or text whose
+# meaning to the app is not known here (a read that did not finish, say).
+# journal_floats keeps the "float: " lines, each Float the app decodes,
+# which every edited copy published below must keep (journal_candidate_ok).
+# journal_marks is 1 when the view writes a string the app reads that holds
+# \u0000 with U+E000 for it (json_nul_mark), which journal_candidate_ok
+# writes back. The journal every read below then uses, JOURNAL, is
+# state.json itself, or,
 # when plutil would read the text otherwise than the app ("view: " lines)
 # or cannot parse it at all (text under a key the app does not read, such
 # as a leading zero), the view record_text_problems wrote: the journal as
@@ -1940,6 +2274,8 @@ journal_shape_problems() { # file
 JOURNAL="$STATE"
 JOURNAL_VIEW="$APP_SUPPORT/.state.json.backstop-view.$$"
 journal_text=""
+journal_floats=""
+journal_marks=0
 journal_checked=0
 journal_state=""
 shape_problems=""
@@ -1949,11 +2285,17 @@ check_journal() {
   journal_checked=1
   shape_problems=""
   journal_text=""
+  journal_floats=""
+  journal_marks=0
   JOURNAL="$STATE"
-  # A view left by an earlier run that was killed; one under a shared lock
-  # may belong to a run that has not ended, as in remove_stale_run_files.
-  if (( ! lock_shared )); then "$RM" -f "$APP_SUPPORT"/.state.json.backstop-view.* 2>/dev/null || true; fi
-  "$RM" -f "$JOURNAL_VIEW" 2>/dev/null || true
+  # A view left by an earlier run that was killed, this run's own among
+  # them; one under a shared lock may belong to a run that has not ended,
+  # as in remove_stale_run_files.
+  if (( ! lock_shared )); then
+    "$RM" -f "$APP_SUPPORT"/.state.json.backstop-view.* 2>/dev/null || true
+  else
+    "$RM" -f "$JOURNAL_VIEW" 2>/dev/null || true
+  fi
   if [[ ! -e "$STATE" ]]; then
     journal_state=missing
     return 0
@@ -1963,9 +2305,14 @@ check_journal() {
     shape_problems="not a regular file"
     return 0
   fi
-  journal_text="$(record_text_problems "$STATE" state "$JOURNAL_VIEW")"
+  journal_text="$(record_text_problems "$STATE" state "$JOURNAL_VIEW" floats)"
   while IFS= read -r line; do
-    [[ -z "$line" || "$line" == "view: "* || "$line" == "record: "* ]] || problems+="$line"$'\n'
+    case "$line" in
+      "view: "*"written in the view as U+E000"*) journal_marks=1 ;;
+      ""|"view: "*|"record: "*) ;;
+      "float: "*) journal_floats+="${line#float: }"$'\n' ;;
+      *) problems+="$line"$'\n' ;;
+    esac
   done <<< "$journal_text"
   if [[ -n "$problems" ]]; then
     "$RM" -f "$JOURNAL_VIEW" 2>/dev/null || true
@@ -1978,10 +2325,11 @@ check_journal() {
   else
     "$RM" -f "$JOURNAL_VIEW" 2>/dev/null || true
   fi
+  # plutil has read state.json just above where JOURNAL is state.json.
   if [[ ! -f "$JOURNAL" ]]; then
     journal_state=malformed
     shape_problems="the journal as the app reads it could not be written to $JOURNAL_VIEW"
-  elif ! "$PLUTIL" -convert json -o /dev/null "$JOURNAL" >/dev/null 2>&1; then
+  elif [[ "$JOURNAL" != "$STATE" ]] && ! "$PLUTIL" -convert json -o /dev/null "$JOURNAL" >/dev/null 2>&1; then
     journal_state=malformed
     shape_problems="not valid JSON"
   else
@@ -1993,20 +2341,60 @@ trap '"$RM" -f "$JOURNAL_VIEW" "$JOURNAL_VIEW.candidate" 2>/dev/null || true' EX
 
 # Whether the file $1, a copy of JOURNAL that plutil edited, may be renamed
 # over state.json: a JSON object, not a property list, that the app loads
-# (journal_shape_problems) and whose text plutil reads as the app reads it.
-# plutil writes each number through a Double, so a level the app reads as a
-# Float could come back as one it reads otherwise or not at all; such a
-# copy is not published.
-journal_candidate_ok() { # file
-  local line ok=1
+# (record_text_problems finds no problem in it, journal_shape_problems none
+# in it as the app reads it), with every Float the app decodes the same,
+# where it is and bit for bit, as in the journal it was copied from ($2,
+# that journal's "float: " lines, journal_floats). plutil writes every
+# number back through a Double or a Decimal, which can turn the text of a
+# level the app reads as one Float into text it reads as another
+# (json_float); such a copy is not published, and the run keeps the
+# journal it has. A copy of a view that writes \u0000 as U+E000
+# (journal_marks) first has each U+E000, which plutil writes as such, put
+# back as \u0000; the journal held no U+E000 of its own (json_nul_mark),
+# and the copy must then hold none, raw or as an escape.
+journal_candidate_ok() { # file floats
+  local line ok=1 floats="" view="$JOURNAL_VIEW.candidate" rc=0
   [[ "$("$PLUTIL" -convert json -o - "$1" 2>/dev/null | "$HEAD" -c 1)" == "{" ]] || return 1
   [[ "$("$HEAD" -c 1 "$1")" == "{" ]] || return 1
-  "$RM" -f "$JOURNAL_VIEW.candidate" 2>/dev/null || true
+  "$RM" -f "$view" 2>/dev/null || true
+  if (( journal_marks == 1 )); then
+    if ! { "$SED" "s/"$'\xee\x80\x80'"/\\\\u0000/g" "$1" > "$view" 2>/dev/null && "$MV" -f "$view" "$1" 2>/dev/null; }; then
+      "$RM" -f "$view" 2>/dev/null || true
+      return 1
+    fi
+    "$GREP" -q -e $'\xee\x80\x80' -e '\\u[eE]000' "$1" 2>/dev/null || rc=$?
+    (( rc == 1 )) || return 1
+  fi
   while IFS= read -r line; do
-    [[ -z "$line" || "$line" == "record: "* ]] || ok=0
-  done < <(record_text_problems "$1" state "$JOURNAL_VIEW.candidate")
-  "$RM" -f "$JOURNAL_VIEW.candidate" 2>/dev/null || true
-  (( ok == 1 )) && [[ -z "$(journal_shape_problems "$1")" ]]
+    case "$line" in
+      ""|"view: "*|"record: "*) ;;
+      "float: "*) floats+="${line#float: }"$'\n' ;;
+      *) ok=0 ;;
+    esac
+  done < <(record_text_problems "$1" state "$view" floats)
+  if (( ok == 1 )) && ! same_floats "$floats" "${2:-}"; then
+    log error "the edited copy of $STATE holds a level the app would read as another Float than the journal's; not published"
+    ok=0
+  fi
+  (( ok == 1 )) && [[ -f "$view" && -z "$(journal_shape_problems "$view")" ]] || ok=0
+  "$RM" -f "$view" 2>/dev/null || true
+  (( ok == 1 ))
+}
+
+# Whether $1 and $2, each the "float: " lines of record_text_problems
+# without the tag, one to a line and each ending in a newline, name the
+# same Floats in any order: plutil writes keys in an order of its own.
+same_floats() { # floats floats
+  local line n=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    [[ $'\n'"$2" == *$'\n'"$line"$'\n'* ]] || return 1
+    n=$((n + 1))
+  done <<< "$1"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] || n=$((n - 1))
+  done <<< "$2"
+  (( n == 0 ))
 }
 
 # Stops the run at a journal the app does not load (journal_state
@@ -3028,7 +3416,7 @@ record_end() {
 # as an old-style plist and will not edit, is written whole. True only when
 # the journal then records the end.
 record_end_in_journal() {
-  local tmp="$APP_SUPPORT/.state.json.backstop.$$" encoded json=""
+  local tmp="$APP_SUPPORT/.state.json.backstop.$$" encoded json="" floats=""
   if journal_records_end; then return 0; fi
   encoded="$(session_base64)" || return 1
   [[ -n "$encoded" ]] || return 1
@@ -3036,6 +3424,7 @@ record_end_in_journal() {
     check_journal
     [[ "$journal_state" == clean ]] || return 1
     json="$("$PLUTIL" -convert json -o - "$JOURNAL" 2>/dev/null)" || return 1
+    floats="$journal_floats"
   fi
   # As in record_end: a leftover at this PID's name goes unopened first.
   "$RM" -f "$tmp" 2>/dev/null || true
@@ -3046,7 +3435,7 @@ record_end_in_journal() {
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
-  if ! journal_candidate_ok "$tmp" || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
+  if ! journal_candidate_ok "$tmp" "$floats" || ! "$MV" -f "$tmp" "$STATE" 2>/dev/null; then
     "$RM" -f "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -3344,6 +3733,9 @@ prepare_low_power_off() {
   t="$(type_of "$JOURNAL" keptDisplayUnderLowPower)"
   [[ "$t" == float || "$t" == integer ]] || return 0
   boot="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+  # A boot that holds U+E000 would be written back as \u0000 with the
+  # view's (journal_candidate_ok).
+  if (( journal_marks == 1 )) && [[ "$boot" == *$'\xee\x80\x80'* ]]; then return 1; fi
   recorded="$(extract "$JOURNAL" keptDisplayUnderLowPowerBoot || true)"
   [[ "$recorded" == "$boot" ]] && return 0
   tmp="$APP_SUPPORT/.state.json.backstop-boot.$$"
@@ -3352,7 +3744,7 @@ prepare_low_power_off() {
     "$PLUTIL" -replace keptDisplayUnderLowPowerBoot -string "$boot" "$tmp" >/dev/null 2>&1 || ok=0
   fi
   if (( ok == 1 )); then
-    journal_candidate_ok "$tmp" || ok=0
+    journal_candidate_ok "$tmp" "$journal_floats" || ok=0
   fi
   if (( ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || ok=0
@@ -3361,10 +3753,13 @@ prepare_low_power_off() {
     "$RM" -f "$tmp"
     return 1
   fi
-  # state.json now holds the journal as the app reads it, which plutil
-  # reads the same way (journal_candidate_ok); every read below uses it.
-  JOURNAL="$STATE"
-  "$RM" -f "$JOURNAL_VIEW" 2>/dev/null || true
+  # state.json now holds the journal with this boot and the same Floats
+  # (journal_candidate_ok); every read below uses it as the app reads it,
+  # read again (check_journal), since plutil writes some of what the app
+  # reads in a way it would itself read otherwise, such as -0.
+  journal_checked=0
+  check_journal
+  [[ "$journal_state" == clean ]] || return 1
   log info "kept display entry's record given this boot (${boot:-unreadable, written empty}) before Low Power Mode is switched off"
 }
 
@@ -3525,6 +3920,10 @@ resume_via_app() {
 }
 if (( frozen_count > 0 )); then
   boot_now="$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null || true)"
+  # The view writes a bootSession that holds \u0000 with U+E000 for it
+  # (journal_marks); a boot that holds U+E000 could match it here where it
+  # does not in the app, so it counts as unread.
+  if (( journal_marks == 1 )) && [[ "$boot_now" == *$'\xee\x80\x80'* ]]; then boot_now=""; fi
   uid_now="$("$ID" -u)"
   i=0
   while (( i < frozen_count )); do
@@ -3645,6 +4044,12 @@ if (( app_nap_count > 0 )); then
       log error "App Nap entry $i has no usable bundle id (${bundle:-?}); kept, nothing written"
       failures+=("App Nap entry $i has no usable bundle id")
       keep_app_nap_entry "$i"
+    elif (( journal_marks == 1 )) && [[ "$bundle" == *$'\xee\x80\x80'* ]]; then
+      # The view writes \u0000 as U+E000 (json_nul_mark): the app's bundle
+      # id holds \u0000, which no command here can name.
+      log error "App Nap entry $i has a bundle id that holds \\u0000; kept, nothing written"
+      failures+=("App Nap entry $i has a bundle id that holds \\u0000")
+      keep_app_nap_entry "$i"
     elif [[ "$previous" == true || "$previous" == false ]]; then
       if run_bounded "$DEFAULTS" write "$bundle" NSAppSleepDisabled -bool "$previous"; then
         log info "defaults write $bundle NSAppSleepDisabled -bool $previous ok"
@@ -3710,31 +4115,49 @@ fi
 # only ever see a complete journal. The copy is of the journal as the app
 # reads it (check_journal): state.json itself, whose keys we do not own
 # survive untouched, or the view, which keeps what the app's own save keeps.
+# plutil writes a Float the app reads as -0.0 as -0, which plutil itself
+# reads back as the whole number 0, so a second edit would write it as 0,
+# which the app reads as 0.0. Every other Float it writes it reads back as
+# the same. A copy of a journal that holds a -0.0 (journal_floats, bit
+# pattern 2147483648) is therefore written again as the app reads it, the
+# view record_text_problems writes, which has -0.0, before each edit after
+# the first.
+publish_edits=0
+publish_edit() { # plutil edit arguments, before the file
+  local line view="$JOURNAL_VIEW.candidate"
+  (( publish_ok == 1 )) || return 0
+  if (( publish_edits > 0 )) && [[ $'\n'"$journal_floats" == *" 2147483648"$'\n'* ]]; then
+    "$RM" -f "$view" 2>/dev/null || true
+    while IFS= read -r line; do
+      case "$line" in
+        ""|"view: "*|"record: "*|"float: "*) ;;
+        *) publish_ok=0 ;;
+      esac
+    done < <(record_text_problems "$tmp" state "$view" floats)
+    if (( publish_ok == 0 )) || [[ ! -f "$view" ]] || ! "$MV" -f "$view" "$tmp" 2>/dev/null; then
+      publish_ok=0
+      "$RM" -f "$view" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  "$PLUTIL" "$@" "$tmp" >/dev/null 2>&1 || publish_ok=0
+  publish_edits=$((publish_edits + 1))
+}
 if (( changed == 1 )); then
   tmp="$APP_SUPPORT/.state.json.backstop.$$"
   publish_ok=1
   # As in record_end: a leftover at this PID's name goes unopened first.
   "$RM" -f "$tmp" 2>/dev/null || true
   "$CP" "$JOURNAL" "$tmp" || publish_ok=0
-  if (( publish_ok == 1 )) && [[ "$new_sleep" != "$sleep_held" ]]; then
-    "$PLUTIL" -replace sleepDisabledByUs -bool "$new_sleep" "$tmp" >/dev/null 2>&1 || publish_ok=0
-  fi
-  if (( publish_ok == 1 )) && [[ "$new_low" != "$low_power" ]]; then
-    "$PLUTIL" -replace lowPowerSetByUs -bool "$new_low" "$tmp" >/dev/null 2>&1 || publish_ok=0
-  fi
-  if (( publish_ok == 1 )) && [[ "$new_docker" != "$docker_frozen" ]]; then
-    "$PLUTIL" -replace dockerFrozen -bool "$new_docker" "$tmp" >/dev/null 2>&1 || publish_ok=0
-  fi
-  if (( publish_ok == 1 && frozen_count > 0 )); then
-    "$PLUTIL" -replace frozenProcesses -json "[$kept_frozen]" "$tmp" >/dev/null 2>&1 || publish_ok=0
-  fi
-  if (( publish_ok == 1 && app_nap_count > 0 )); then
-    "$PLUTIL" -replace appNapOverrides -json "[$kept_app_nap]" "$tmp" >/dev/null 2>&1 || publish_ok=0
-  fi
+  [[ "$new_sleep" == "$sleep_held" ]] || publish_edit -replace sleepDisabledByUs -bool "$new_sleep"
+  [[ "$new_low" == "$low_power" ]] || publish_edit -replace lowPowerSetByUs -bool "$new_low"
+  [[ "$new_docker" == "$docker_frozen" ]] || publish_edit -replace dockerFrozen -bool "$new_docker"
+  (( frozen_count == 0 )) || publish_edit -replace frozenProcesses -json "[$kept_frozen]"
+  (( app_nap_count == 0 )) || publish_edit -replace appNapOverrides -json "[$kept_app_nap]"
   if (( publish_ok == 1 )); then
     # plutil keeps JSON files as JSON; make sure the result is still one,
     # and one the app loads as plutil reads it.
-    journal_candidate_ok "$tmp" || publish_ok=0
+    journal_candidate_ok "$tmp" "$journal_floats" || publish_ok=0
   fi
   if (( publish_ok == 1 )); then
     "$MV" -f "$tmp" "$STATE" || publish_ok=0

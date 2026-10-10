@@ -24,7 +24,7 @@ binary (`Insomnia --agent-cutoffs`), the one in the bundle whose signature the
 agent checks before each run, and while that file is missing or rejected, the
 values the app recorded for the session in `state.json`
 (`Insomnia --agent-session-cutoffs`). When that binary is gone or replaced by
-another version during the run, or gives no usable answer in time, the
+another version during the run, or gives no answer in its form in time, the
 backstop reads `config.json` itself where its own reader can tell what the
 app's decoder makes of it (not for a file over 8 MiB, one the reader does
 not finish within 30 s, or one on which Foundation stops the app), and
@@ -34,8 +34,12 @@ as none, as the app reads it. With no record, it enforces the app's defaults
 (a 10% end floor, thermal rules on) while `config.json` is missing or
 rejected, and the strictest values (95%, on) while the file is there but
 cannot be read either way; both are open stopgaps (spec section 6). A
-journal the app would not load stops the run with the session and the
-journal kept. The app is not
+journal the app would not load, or one whose meaning to the app the check
+cannot tell (an Int64 on which Foundation stops the app, text it does not
+finish reading within 30 s, the two `\u0000` cases in spec section 6), stops
+the run with the session and the journal kept. An edited journal replaces
+`state.json` only when it loads as the app loads it and keeps every `Float`
+the app decodes bit for bit. The app is not
 sandboxed; local logs can contain SSIDs, process metadata, and tmux target names.
 The lines the app writes to `insomnia.log` also reach the unified log with the
 body marked private, so programs reading `log show` see `<private>` instead of

@@ -19,6 +19,7 @@ import XCTest
 final class LockEndRecordTests: XCTestCase {
     var h: Harness!
     var agent: PatchedBackstop!
+    let acls = OwnedACLs()
 
     override func setUp() async throws {
         h = Harness()
@@ -31,8 +32,7 @@ final class LockEndRecordTests: XCTestCase {
         Store.lockReadFailuresForTesting = nil
         RecoveryLockHandle.pwriteForTesting = nil
         try? FileManager.default.setAttributes([.appendOnly: false], ofItemAtPath: lockFile.path)
-        try? TestACL.removeAll(h.home.paths.appSupport)
-        try? TestACL.removeAll(h.home.paths.logs)
+        acls.removeGiven()
         unpinAll()
         h.home.destroy()
     }
@@ -509,8 +509,8 @@ final class LockEndRecordTests: XCTestCase {
         let m = try await startThenPinAll()
         let lockInode = try inode(lockFile)
         let bytes = try Data(contentsOf: h.home.paths.sessionFile)
-        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
-        try TestACL.denyNewFiles(in: h.home.paths.logs)
+        try acls.denyNewFiles(in: h.home.paths.appSupport)
+        try acls.denyNewFiles(in: h.home.paths.logs)
 
         let outcome = await m.end(reason: .user)
 
@@ -522,8 +522,8 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertTrue(logText().contains("; its end is recorded in the recovery lock file .recovery.lock"), logText())
         XCTAssertTrue(h.notifier.posts.last?.body.contains("its end is recorded, so a relaunch will not resume it") == true, "\(h.notifier.posts)")
 
-        try TestACL.removeAll(h.home.paths.appSupport)
-        try TestACL.removeAll(h.home.paths.logs)
+        try acls.removeAll(h.home.paths.appSupport)
+        try acls.removeAll(h.home.paths.logs)
         unpinAll()
         h.guardFake.sleepDisabled = true
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
@@ -754,8 +754,8 @@ final class LockEndRecordTests: XCTestCase {
         let lockInode = try inode(lockFile)
         let bytes = try Data(contentsOf: h.home.paths.sessionFile)
         try agent.failSudo()
-        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
-        try TestACL.denyNewFiles(in: h.home.paths.logs)
+        try acls.denyNewFiles(in: h.home.paths.appSupport)
+        try acls.denyNewFiles(in: h.home.paths.logs)
 
         try await runAgent(expecting: 1)
         XCTAssertTrue(agent.calls.contains(agent.restoreCall), agent.calls.joined(separator: "\n"))
@@ -763,8 +763,8 @@ final class LockEndRecordTests: XCTestCase {
         XCTAssertEqual(try inode(lockFile), lockInode)
         XCTAssertTrue(logText().contains("its end is recorded in the recovery lock file \(lockFile.path) instead"), logText())
 
-        try TestACL.removeAll(h.home.paths.appSupport)
-        try TestACL.removeAll(h.home.paths.logs)
+        try acls.removeAll(h.home.paths.appSupport)
+        try acls.removeAll(h.home.paths.logs)
         unpinAll()
         XCTAssertTrue(h.guardFake.sleepDisabled, "the failed restore left it at 1")
         let alive = AppAliveLock(url: h.home.paths.appAliveFile)
@@ -1388,8 +1388,8 @@ final class LockEndRecordTests: XCTestCase {
         let whole = record(of: try Data(contentsOf: h.home.paths.sessionFile))
         let held = whole.prefix(whole.count / 2)
         try writeInPlace(held, to: lockFile)
-        try TestACL.denyNewFiles(in: h.home.paths.appSupport)
-        try TestACL.denyNewFiles(in: h.home.paths.logs)
+        try acls.denyNewFiles(in: h.home.paths.appSupport)
+        try acls.denyNewFiles(in: h.home.paths.logs)
         Store.lockReadErrnoForTesting = EIO
         let outcome = await running.end(reason: .user)
         Store.lockReadErrnoForTesting = nil

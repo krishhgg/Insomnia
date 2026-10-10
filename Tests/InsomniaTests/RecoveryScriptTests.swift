@@ -4997,7 +4997,7 @@ final class RecoveryScriptTests: XCTestCase {
             }
             return printed
         }
-        let agentRuns = try launches("backstop.sh", functions: ["extract", "type_of", "journal_shape_problems", "check_journal", "journal_cutoffs"], loop: """
+        let agentRuns = try launches("backstop.sh", functions: ["extract", "type_of", "shape_types", "shape_value_type", "shape_type", "shape_name", "journal_shape_problems", "check_journal", "journal_cutoffs"], loop: """
             lock_shared=0
             for STATE in "$@"; do
               APP_SUPPORT="${STATE%/*}"
@@ -5015,7 +5015,7 @@ final class RecoveryScriptTests: XCTestCase {
             done
 
             """)
-        let uninstallRuns = try launches("uninstall.sh", functions: ["extract", "extract_json", "type_of", "journal_shape_problems", "is_refused", "journal_view", "journal_problems"], loop: """
+        let uninstallRuns = try launches("uninstall.sh", functions: ["extract", "extract_json", "type_of", "shape_types", "shape_value_type", "shape_type", "shape_name", "journal_shape_problems", "is_refused", "journal_view", "journal_problems"], loop: """
             for STATE in "$@"; do
               SESSION="${STATE%/*}/session.json"
               WORK="${STATE%/*}/uninstall"
@@ -5061,7 +5061,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testBothScriptsReadTheRecordsTheSameWay() throws {
         let reader = try Self.readerBlock("backstop.sh")
         XCTAssertEqual(reader, try Self.readerBlock("uninstall.sh"))
-        for name in ["json_whole", "json_decimal_reads", "json_range", "json_magnitude_above", "json_string_check", "json_view_put", "json_window_trim", "record_text_problems"] {
+        for name in ["json_whole", "json_decimal_reads", "json_range", "json_magnitude_above", "json_digits_times", "json_float", "json_string_check", "json_nul_mark", "json_view_put", "json_window_trim", "record_text_problems"] {
             XCTAssertTrue(reader.contains("\n\(name)() {"), name)
         }
     }
@@ -5075,17 +5075,18 @@ final class RecoveryScriptTests: XCTestCase {
     /// twice in one object it reads, or spelled with an escape; a whole
     /// number written with a fraction or an exponent, also one a Double
     /// does not hold or rounds to whole; UTF-16 and UTF-32 (without a byte
-    /// order mark, or with UTF-32BE's). A "record: " line is a
-    /// sessionCutoffs the app reads as no record. Where the app refuses the
-    /// text, a line names the problem and no view is written, but for a key
-    /// spelled twice whose first copy has a type the app does not take:
-    /// the view holds that copy, and journal_shape_problems refuses it
-    /// there. The one text the app reads that the reader refuses holds a
-    /// NUL byte, which the shell cannot hold; the app never writes one.
-    /// What the app skips passes: a key twice in an object it does not
-    /// read, a bad escape or 1. in a value it does not read, and in a
-    /// frozen process what follows a startedAt or a startedAtMicros that is
-    /// missing or null, wherever it is in the object. The BOM-less UTF-16
+    /// order mark, or with UTF-32BE's); -0 where the app reads a Float, and
+    /// a NUL byte in text the app skips (both as in
+    /// testTheRecordReaderKeepsFloatsAndNULsAsTheAppReadsThem). A "record: "
+    /// line is a sessionCutoffs the app reads as no record. Where the app
+    /// refuses the text, a line names the problem and no view is written,
+    /// but for a key spelled twice whose first copy has a type the app does
+    /// not take: the view holds that copy, and journal_shape_problems
+    /// refuses it there. What the app skips passes: a key twice in an
+    /// object it does not read, a bad escape or 1. in a value it does not
+    /// read, and in a frozen process what follows a startedAt or a
+    /// startedAtMicros that is missing or null, wherever it is in the
+    /// object. The BOM-less UTF-16
     /// file hiding a key is one the reader passed before it refused NUL
     /// bytes: the shell drops them, and what is left reads as a key inside
     /// an array, while the app reads 1e-400 at the top level, as the reader
@@ -5126,7 +5127,7 @@ final class RecoveryScriptTests: XCTestCase {
                 + "keptDisplayReadLit is 1e39, too large a number for the app's Float\n", false),
             ("UTF-32 with a byte order mark", Data([0xFF, 0xFE, 0x00, 0x00]) + #"{"keptDisplayReadLit":0.8}"#.data(using: .utf32LittleEndian)!,
              "view: state.json is UTF-16LE, read here as UTF-8\n"
-                + "state.json holds a NUL byte, which is not read here\n", false),
+                + "state.json is not a JSON object, which the app's decoder requires\n", false),
             ("UTF-16 without a byte order mark, hiding a key",
              "{\"a\":\"\u{2278}\u{222C}\u{2271}\u{203A}\u{205B}\",\"keptDisplayReadLit\":1e-400,\"b\":\"\u{2C5D}\u{2220}\u{2263}\u{203A}\u{7822}\"}"
                 .data(using: .utf16LittleEndian)!,
@@ -5135,7 +5136,7 @@ final class RecoveryScriptTests: XCTestCase {
             ("UTF-16 without records", #"{"sleepDisabledByUs":true}"#.data(using: .utf16LittleEndian)!,
              "view: state.json is UTF-16LE, read here as UTF-8\n", true),
             ("NUL byte in a string", utf8("{\"keptDisplayReadLit\":0.8,\"a\":\"x\u{0}y\"}"),
-             "state.json holds a NUL byte, which is not read here\n", true),
+             "view: state.json holds a NUL byte in text the app skips, which plutil does not read; left out\n", true),
             ("comma before the end", utf8(#"{"keptDisplayReadLit":0.8,}"#), "", true),
             ("whitespace everywhere", utf8("\n{ \"a\" :\t[ 1 ,2 ] ,\r\n \"keptDisplayReadLit\"\n:\n0.8\n}\n"), "", true),
             ("escaped letter, upper hex", utf8(#"{"kept\#(b)u0044isplayReadLit":1e-400}"#),
@@ -5164,7 +5165,8 @@ final class RecoveryScriptTests: XCTestCase {
              "view: the top level of state.json has keptDisplayReadLit more than once; the app reads the first, and so is it read here\n", true),
             ("boot read twice", utf8(#"{"keptDisplayUnderLowPowerBoot":"a","keptDisplayUnderLowPowerBoot":null}"#),
              "view: the top level of state.json has keptDisplayUnderLowPowerBoot more than once; the app reads the first, and so is it read here\n", true),
-            ("zero forms", utf8(#"{"keptDisplayReadLit":-0,"keptDisplayUnderLowPower":0e-400}"#), "", true),
+            ("zero forms", utf8(#"{"keptDisplayReadLit":-0,"keptDisplayUnderLowPower":0e-400}"#),
+             "view: keptDisplayReadLit is written as -0, which plutil would write back as text the app reads as another Float; read here as -0.0\n", true),
             ("leading zero", utf8(#"{"keptDisplayReadLit":01}"#),
              "keptDisplayReadLit is written as 01, which is not a JSON number the app's decoder reads\n", false),
             ("any key read twice", utf8(#"{"sleepDisabledByUs":true,"sleepDisabledByUs":false}"#),
@@ -5269,6 +5271,20 @@ final class RecoveryScriptTests: XCTestCase {
             ("a pid with a very small exponent", utf8(#"{"frozenPids":[1e-99999]}"#),
              "view: frozenPids[0] is written as 1e-99999, which the app reads as 0; read here as 0\n", true),
         ]
+        try checkRecordReader(cases)
+    }
+
+    /// Runs the reader of each script over each text (`recordTextProblems`)
+    /// and checks what it prints, the view it writes, and the app's decoder
+    /// on the same bytes. Both scripts print the same and write the same
+    /// view. A view is written exactly when the reader prints nothing or
+    /// only "view: " and "record: " lines, and the app decodes it to the
+    /// state it decodes from the text, bit for bit (each Float too, as the
+    /// app's encoder writes it). A view that holds U+E000 for \u0000
+    /// (json_nul_mark) is checked as every journal published from it is
+    /// (journal_candidate_ok): each U+E000 put back as \u0000.
+    private func checkRecordReader(_ cases: [(label: String, bytes: Data, prints: String, appReads: Bool)]) throws {
+        let b = backslash
         let printed = try recordTextProblems(cases.map { ($0.label, $0.bytes) })
         let printedByUninstall = try recordTextProblems(cases.map { ($0.label, $0.bytes) }, script: "uninstall.sh")
         for c in cases {
@@ -5281,9 +5297,212 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(app != nil, c.appReads, "the app's decoder on \(c.label)")
             let onlyViewLines = c.prints.split(separator: "\n").allSatisfy { $0.hasPrefix("view: ") || $0.hasPrefix("record: ") }
             XCTAssertEqual(backstop.view != nil, onlyViewLines, "a view for \(c.label)")
-            if let view = backstop.view {
-                XCTAssertEqual(try? Store.makeDecoder().decode(RuntimeState.self, from: view), app, "the app reads the view of \(c.label) as the text")
+            if var view = backstop.view {
+                if c.prints.contains("written in the view as U+E000") {
+                    view = Data(String(decoding: view, as: UTF8.self).replacingOccurrences(of: "\(b)uE000", with: "\(b)u0000").utf8)
+                }
+                let read = try? Store.makeDecoder().decode(RuntimeState.self, from: view)
+                XCTAssertEqual(read, app, "the app reads the view of \(c.label) as the text")
+                XCTAssertEqual(try read.map { try Store.makeEncoder().encode($0) }, try app.map { try Store.makeEncoder().encode($0) }, "the view of \(c.label), bit for bit")
             }
+        }
+    }
+
+    /// Review35 R35-1: the reader over Floats and NULs, as
+    /// checkRecordReader checks it. A Float plutil would write back as text
+    /// the app reads as another Float (it reads up to 17 digits through a
+    /// Double and up to 38 through a Decimal, and "-0" as the whole number
+    /// 0) is held in the view as the same Float in 9 digits, -0 as -0.0;
+    /// one plutil keeps stays as written. A NUL byte in text the app skips,
+    /// which plutil does not read, is left out of the view; one the app
+    /// refuses (in a string it reads, between values) is refused. A string
+    /// the app reads that holds \u0000, which plutil cannot hold, is held
+    /// in the view with U+E000 for each \u0000 (json_nul_mark); after
+    /// escaped backslashes too, in each place the app reads a string: an
+    /// audio output, an App Nap entry, the kept record's boot, a frozen
+    /// process's bootSession, endedSession. Where the app does not read the
+    /// string, or reads it as no record, it goes as any such string. The
+    /// texts the app loads that the reader refuses, its kept residual
+    /// cost: such a string longer than 1024 bytes, as bash takes time that
+    /// grows with the square of the length to mark it, and a journal that
+    /// holds U+E000 as well, raw or as an escape, which the view could not
+    /// tell from a mark. U+E000 alone passes.
+    func testTheRecordReaderKeepsFloatsAndNULsAsTheAppReadsThem() throws {
+        let b = backslash
+        func utf8(_ s: String) -> Data { Data(s.utf8) }
+        // The line for a string the app reads that holds \u0000.
+        func marked(_ shown: String) -> String {
+            "view: \(shown) holds \(b)u0000, which plutil cannot hold; written in the view as U+E000 (\(b)uE000), which each journal published from it writes back as \(b)u0000\n"
+        }
+        let markRefused = "state.json holds \(b)u0000 where the app reads it, which the view writes as U+E000, and U+E000 as well, so what the app reads is not known here\n"
+        let skippedNUL = "view: state.json holds a NUL byte in text the app skips, which plutil does not read; left out\n"
+        let cases: [(label: String, bytes: Data, prints: String, appReads: Bool)] = [
+            ("NUL byte in a key the app skips", utf8("{\"a\":{\"x\u{0}\":1}}"), skippedNUL, true),
+            ("NUL byte in a string the app reads", utf8("{\"appNapOverrides\":[{\"bundleId\":\"a\u{0}b\"}]}"),
+             "appNapOverrides[0].bundleId is a string the app's decoder does not read (a control character, bytes that are not UTF-8, an escape JSON does not have, or a lone surrogate)\n", false),
+            ("NUL byte between values", utf8("{\"a\":1,\u{0}\"b\":2}"), "the text of state.json is not JSON the app's decoder reads\n", false),
+            ("\\u0000 in a device UID", utf8(#"{"savedAudioOutputs":[{"deviceUID":"a\#(b)u0000b","volume":0.5,"muted":false}]}"#),
+             marked("savedAudioOutputs[0].deviceUID"), true),
+            ("\\u0000 after escaped backslashes", utf8(#"{"appNapOverrides":[{"bundleId":"a\#(b)\#(b)u0000\#(b)\#(b)\#(b)u0000"}]}"#),
+             marked("appNapOverrides[0].bundleId"), true),
+            ("\\u0000 in the kept record's boot", utf8(#"{"keptDisplayUnderLowPower":0.8,"keptDisplayUnderLowPowerBoot":"\#(b)u0000"}"#),
+             marked("keptDisplayUnderLowPowerBoot"), true),
+            ("\\u0000 in a bootSession", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"startedAtMicros":0,"bootSession":"b\#(b)u0000"}]}"#),
+             marked("frozenProcesses[0].bootSession"), true),
+            ("\\u0000 in a bootSession the app does not read", utf8(#"{"frozenProcesses":[{"pid":1,"startedAt":5,"bootSession":"b\#(b)u0000"}]}"#),
+             "view: frozenProcesses[0].bootSession, which the app does not read there, is a string the app would not read; left out\n", true),
+            ("\\u0000 in an endedSession", utf8(#"{"endedSession":"e\#(b)u0000"}"#), marked("endedSession"), true),
+            ("\\u0000 in a record", utf8(#"{"sessionCutoffs":"30\#(b)u0000 false"}"#),
+             "record: sessionCutoffs is a string the app does not read as a record\n", true),
+            ("\\u0000 where the app does not read it", utf8(#"{"note":"\#(b)u0000","appNapOverrides":[{"bundleId":"a","a\#(b)u0000":1}]}"#), "", true),
+            ("U+E000 without \\u0000", utf8("{\"appNapOverrides\":[{\"bundleId\":\"\u{E000}\"}],\"note\":\"\(b)uE000\"}"), "", true),
+            ("\\u0000 and U+E000", utf8("{\"appNapOverrides\":[{\"bundleId\":\"a\(b)u0000\"},{\"bundleId\":\"\u{E000}\"}]}"),
+             marked("appNapOverrides[0].bundleId") + markRefused, true),
+            ("\\u0000 and U+E000 as an escape", utf8(#"{"appNapOverrides":[{"bundleId":"a\#(b)u0000"}],"note":"\#(b)ue000"}"#),
+             marked("appNapOverrides[0].bundleId") + markRefused, true),
+            ("\\u0000 in a string longer than 1024 bytes",
+             utf8(#"{"savedAudioOutputs":[{"deviceUID":"a","name":""# + String(repeating: "n", count: 1100) + #"\#(b)u0000","volume":0.5,"muted":false}]}"#),
+             "savedAudioOutputs[0].name holds \(b)u0000, which the app reads and plutil does not; not read here\n", true),
+            ("a Float plutil would write back as another", utf8(#"{"keptDisplayReadLit":0.5000000298023223876953125000000000000001}"#),
+             "view: keptDisplayReadLit is written as 0.50000002980232238769531250000000000000, which plutil would write back as text the app reads as another Float; read here as 0.50000006\n", true),
+            ("a Float at the midpoint of two", utf8(#"{"keptDisplayReadLit":0.5000000298023223876953125}"#),
+             "view: keptDisplayReadLit is written as 0.5000000298023223876953125, which plutil would write back as text the app reads as another Float; read here as 0.5\n", true),
+            ("negative zero Floats", utf8(#"{"keptDisplayReadLit":-0,"savedDisplayBrightness":-0.0}"#),
+             "view: keptDisplayReadLit is written as -0, which plutil would write back as text the app reads as another Float; read here as -0.0\n", true),
+            ("a Float plutil keeps", utf8(#"{"keptDisplayReadLit":0.30000001192092896}"#), "", true),
+        ]
+        try checkRecordReader(cases)
+    }
+
+    /// A journal the app loads whose Floats plutil would write back as
+    /// others, or whose strings the app reads hold \u0000, what a backstop
+    /// run over it calls and exits with, and what the journal it publishes
+    /// holds afterwards. `ending` journals go with a valid session whose
+    /// end is recorded in the journal.
+    private typealias PublishedJournalRow = (label: String, journal: String, ending: Bool, status: Int32,
+                                             calls: (ScriptFixture) -> [String], undone: (inout RuntimeState, ScriptFixture) throws -> Void)
+
+    private static func publishedJournalRows() -> [PublishedJournalRow] {
+        let lit = "0.5000000298023223876953125000000000000001"
+        let mid = "0.50000002980232238769531250"
+        let above = "0.500000059604644775390625"
+        let sleepOff = { (f: ScriptFixture) in "sudo -n \(f.fakePmset) -a disablesleep 0" }
+        let lowPowerOff = { (f: ScriptFixture) in "sudo -n \(f.fakePmset) -b lowpowermode 0" }
+        return [
+            ("Floats plutil would write back as others",
+             #"{"sleepDisabledByUs":true,"savedOutputVolume":0.50000002980232239,"savedDisplayBrightness":\#(lit),"savedKeyboardBrightness":0.500000029802322387695312500000000001,"displayRestoredUnderLowPower":\#(mid),"displayRestoreRefused":true,"keyboardRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot-private","keptDisplayReadLit":0.5000000298023223876953125000000000000000000000000000001}"#,
+             false, 1, { [sleepOff($0)] }, { s, _ in s.sleepDisabledByUs = false }),
+            ("-0 through four edits, with Low Power Mode",
+             #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"dockerFrozen":true,"frozenProcesses":[{"pid":4343,"startedAt":1760000001}],"savedAudioOutputs":[{"deviceUID":"u\u0000","volume":-0,"muted":true}],"savedOutputVolume":-0.0,"savedDisplayBrightness":-0,"displayRestoreRefused":true,"keptDisplayUnderLowPower":-0e0,"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":-0,"appNapOverrides":[{"bundleId":"com.example.y","previous":false}]}"#,
+             false, 1, { [sleepOff($0), lowPowerOff($0), "defaults write com.example.y NSAppSleepDisabled -bool false"] },
+             { s, f in s.sleepDisabledByUs = false; s.lowPowerSetByUs = false; s.keptDisplayUnderLowPowerBoot = f.bootUUID; s.appNapOverrides = [] }),
+            ("\\u0000 in each string the app reads",
+             #"{"sleepDisabledByUs":true,"savedAudioOutputs":[{"deviceUID":"u\u0000id","name":"n\u0000\\u0000","volume":\#(lit),"muted":true,"saveID":"\u0000"}],"keptDisplayUnderLowPowerBoot":"k\u0000","frozenProcesses":[{"pid":4242,"startedAt":1760000000,"startedAtMicros":5,"bootSession":"b\u0000"},{"pid":4343,"startedAt":1760000001,"bootSession":"c\u0000"}],"appNapOverrides":[{"bundleId":"com.example\u0000x","previous":true},{"bundleId":"com.example.y","previous":false}]}"#,
+             false, 1, { [sleepOff($0), "defaults write com.example.y NSAppSleepDisabled -bool false"] },
+             { s, _ in s.sleepDisabledByUs = false; s.frozenProcesses.removeFirst(); s.appNapOverrides.removeLast() }),
+            ("\\u0000 in the kept display entry's boot, with Low Power Mode",
+             #"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"savedDisplayBrightness":\#(above),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot\u0000","keptDisplayReadLit":\#(above)}"#,
+             false, 0, { [sleepOff($0), lowPowerOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.lowPowerSetByUs = false; s.keptDisplayUnderLowPowerBoot = f.bootUUID }),
+            ("\\u0000 in endedSession, the end recorded in the journal",
+             #"{"sleepDisabledByUs":true,"endedSession":"e\u0000","savedDisplayBrightness":\#(lit),"displayRestoreRefused":true,"keptDisplayUnderLowPower":\#(above),"keptDisplayUnderLowPowerBoot":"boot-private","keptDisplayReadLit":\#(above)}"#,
+             true, 1, { [sleepOff($0)] },
+             { s, f in s.sleepDisabledByUs = false; s.endedSession = try Data(contentsOf: f.session).base64EncodedString() }),
+        ]
+    }
+
+    /// Review35 R35-1, past the reader: whole backstop runs on journals the
+    /// app loads whose Floats plutil would write back as others (38 digits,
+    /// the midpoint of two Floats and digits beside it, -0 in each
+    /// spelling) and whose strings the app reads hold \u0000. Each journal
+    /// the run publishes (the end record in the journal, the kept display
+    /// entry's record given this boot before Low Power Mode goes off, the
+    /// undo at the end, which can take four edits) decodes, bit for bit, to
+    /// what the app read before, but for what the run undid or recorded:
+    /// sleep, Low Power Mode, a frozen process of another boot, an App Nap
+    /// entry restored, this boot, the end. An App Nap entry whose bundle id
+    /// holds \u0000 is kept with no defaults call, and nothing is left
+    /// beside the journal.
+    func testPublishedJournalsKeepTheFloatsAndStringsTheAppReads() async throws {
+        let rows = Self.publishedJournalRows()
+        // One fixture per journal; the runs go several at a time.
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for row in rows {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try f.writeState(row.journal)
+            if row.ending {
+                // session.json, with the app gone, cannot be removed, and
+                // ended-session.json holds a record that cannot be replaced.
+                try f.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+                try setImmutable(f.session, true)
+                try "{}".write(to: f.endedSession, atomically: true, encoding: .utf8)
+                try setImmutable(f.endedSession, true)
+            }
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.backstop) })
+
+        for (row, (f, r)) in zip(rows, zip(fixtures, results)) {
+            let before = try Store.makeDecoder().decode(RuntimeState.self, from: Data(row.journal.utf8))
+            XCTAssertEqual(r.status, row.status, row.label + r.stderr + f.log())
+            XCTAssertEqual(f.calls().filter { call in ["sudo", "defaults", "kill"].contains { call.hasPrefix($0 + " ") } }, row.calls(f), row.label)
+            XCTAssertFalse(f.log().contains("could not publish"), "\(row.label): \(f.log())")
+            XCTAssertEqual(try f.contents(of: f.home).filter { $0.hasPrefix(".state.json") }, [], row.label)
+            let published = try Data(contentsOf: f.state)
+            let text = String(decoding: published, as: UTF8.self)
+            XCTAssertFalse(text.contains("\u{E000}") || text.lowercased().contains("\(backslash)ue000") || text.contains("\u{0}"), "\(row.label): \(text)")
+            var expected = before
+            try row.undone(&expected, f)
+            let after = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            XCTAssertEqual(after, expected, "\(row.label): \(text)")
+            XCTAssertEqual(try Store.makeEncoder().encode(after), try Store.makeEncoder().encode(expected), "\(row.label), bit for bit: \(text)")
+        }
+    }
+
+    /// Review35 R35-1, the same journals through uninstall.sh, which
+    /// publishes a journal only through the backstop it runs. Each
+    /// uninstall undoes what the backstop alone undoes, exits as it does,
+    /// and leaves a journal that decodes, bit for bit, to the same. Where
+    /// an entry only the app restores stays, the uninstall stops with the
+    /// app, the agent and the sudoers rule in place; where only the kept
+    /// display entry stays, it removes them. Every row but the one that
+    /// records a session's end in the journal, which needs a valid session.
+    /// The runs go several at a time, one fixture each.
+    func testAnUninstallPublishesTheFloatsAndStringsTheAppReads() async throws {
+        let rows = Self.publishedJournalRows().filter { !$0.ending }
+        var fixtures: [ScriptFixture] = []
+        defer { fixtures.forEach { $0.destroy() } }
+        for row in rows {
+            let f = try ScriptFixture.concurrentRow()
+            fixtures.append(f)
+            try f.installMachinery()
+            try f.writeConfig(#"{"agentList":[]}"#)
+            try f.writeState(row.journal)
+        }
+
+        let results = try await ScriptFixture.runAll(fixtures.map { $0.launch($0.uninstall) })
+
+        for (row, (f, r)) in zip(rows, zip(fixtures, results)) {
+            let label = "\(row.label): \(r.stdout) \(r.stderr) \(f.log())"
+            XCTAssertEqual(r.status, row.status, label)
+            XCTAssertFalse(r.stderr.contains("malformed") || f.log().contains("malformed"), label)
+            XCTAssertFalse(f.log().contains("could not publish"), label)
+            let undoing = f.calls().filter { call in ["sudo -n ", "defaults write ", "defaults delete ", "kill "].contains { call.hasPrefix($0) } }
+            XCTAssertEqual(undoing, row.calls(f), label)
+            for url in [f.app, f.plist, f.sudoers] {
+                XCTAssertEqual(f.exists(url), row.status != 0, "\(url.lastPathComponent): \(label)")
+            }
+            XCTAssertEqual(try f.contents(of: f.home).filter { $0.hasPrefix(".state.json") }, [], row.label)
+            let published = try Data(contentsOf: f.state)
+            let text = String(decoding: published, as: UTF8.self)
+            XCTAssertFalse(text.contains("\u{E000}") || text.lowercased().contains("\(backslash)ue000") || text.contains("\u{0}"), "\(row.label): \(text)")
+            var expected = try Store.makeDecoder().decode(RuntimeState.self, from: Data(row.journal.utf8))
+            try row.undone(&expected, f)
+            let after = try Store.makeDecoder().decode(RuntimeState.self, from: published)
+            XCTAssertEqual(after, expected, "\(row.label): \(text)")
+            XCTAssertEqual(try Store.makeEncoder().encode(after), try Store.makeEncoder().encode(expected), "\(row.label), bit for bit: \(text)")
         }
     }
 
@@ -10032,7 +10251,8 @@ private final class ScriptFixture {
         let stderr: URL
 
         /// Starts the run. Its output goes to files rather than pipes:
-        /// nothing to drain, nothing to deadlock.
+        /// nothing to drain, nothing to deadlock. Each file is created
+        /// empty here, or the run is not started.
         func start() throws -> (Process, ProcessExit) {
             let fm = FileManager.default
             let p = Process()
@@ -10040,8 +10260,11 @@ private final class ScriptFixture {
             p.arguments = arguments
             p.environment = environment
             p.currentDirectoryURL = directory
-            fm.createFile(atPath: stdout.path, contents: nil)
-            fm.createFile(atPath: stderr.path, contents: nil)
+            for url in [stdout, stderr] {
+                guard fm.createFile(atPath: url.path, contents: nil) else {
+                    throw FixtureError("could not create \(url.path) for the run's output")
+                }
+            }
             let out = try FileHandle(forWritingTo: stdout)
             let err = try FileHandle(forWritingTo: stderr)
             defer { try? out.close(); try? err.close() }
@@ -10055,11 +10278,17 @@ private final class ScriptFixture {
         /// The exit status and what the run printed, once it has exited. An
         /// output file that cannot be read throws, so it never reads as a
         /// run that printed nothing; bytes that are not UTF-8 are kept as
-        /// replacement characters.
+        /// replacement characters. A run a signal ended throws too, with
+        /// the signal and what it printed on standard error: it has no exit
+        /// status, and the signal's number must not read as one the script
+        /// chose. No test ends such a run with a signal (spawn is for that).
         func result(of p: Process) throws -> (status: Int32, stdout: String, stderr: String) {
-            (p.terminationStatus,
-             String(decoding: try Data(contentsOf: stdout), as: UTF8.self),
-             String(decoding: try Data(contentsOf: stderr), as: UTF8.self))
+            let out = String(decoding: try Data(contentsOf: stdout), as: UTF8.self)
+            let err = String(decoding: try Data(contentsOf: stderr), as: UTF8.self)
+            guard p.terminationReason == .exit else {
+                throw FixtureError("bash \(arguments.joined(separator: " ")) ended on signal \(p.terminationStatus); stderr: \(err)")
+            }
+            return (p.terminationStatus, out, err)
         }
     }
 

@@ -17,6 +17,7 @@ final class CutoffAgreementTests: XCTestCase {
     var h: Harness!
     var alive: AppAliveLock!
     var agent: PatchedBackstop!
+    let acls = OwnedACLs()
 
     override func setUp() async throws {
         h = Harness()
@@ -29,7 +30,7 @@ final class CutoffAgreementTests: XCTestCase {
     override func tearDown() async throws {
         alive.release()
         try? setImmutable(h.home.paths.configFile, false)
-        try? TestACL.removeAll(h.home.paths.appSupport)
+        acls.removeGiven()
         h.home.destroy()
     }
 
@@ -116,7 +117,7 @@ final class CutoffAgreementTests: XCTestCase {
         let m = try await startWith(endFloor: 30)
         let dir = h.home.paths.appSupport
         try FileManager.default.removeItem(at: h.home.paths.configFile)
-        try TestACL.denyNewFiles(in: dir)
+        try acls.denyNewFiles(in: dir)
 
         await m.noticeConfigFileChange()
 
@@ -129,7 +130,7 @@ final class CutoffAgreementTests: XCTestCase {
         XCTAssertFalse(m.isActive)
         XCTAssertEqual(h.guardFake.calls.filter { $0 == "disablesleep 1" }.count, 1)
 
-        try TestACL.removeAll(dir)
+        try acls.removeAll(dir)
         await m.start(duration: 3600)
 
         XCTAssertNil(m.rejectedConfigFile)
@@ -145,7 +146,7 @@ final class CutoffAgreementTests: XCTestCase {
         let m = try await startWith(endFloor: 10)
         let dir = h.home.paths.appSupport
         try FileManager.default.removeItem(at: h.home.paths.configFile)
-        try TestACL.denyNewFiles(in: dir)
+        try acls.denyNewFiles(in: dir)
 
         await m.noticeConfigFileChange()
         await m.noticeConfigFileChange()
@@ -154,7 +155,7 @@ final class CutoffAgreementTests: XCTestCase {
         XCTAssertNil(m.rejectedConfigFile)
         let failure = "could not write the settings in use to the missing config.json"
         XCTAssertEqual(logText().components(separatedBy: failure).count - 1, 1, logText())
-        try TestACL.removeAll(dir)
+        try acls.removeAll(dir)
         h.clock.advance(59)
         await m.noticeConfigFileChange()
         XCTAssertNil(try h.store.loadConfig(), "inside the retry delay")
