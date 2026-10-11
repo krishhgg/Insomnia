@@ -12,7 +12,7 @@ final class PrivilegedCommandLockTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = TestScratch.directory
             .appendingPathComponent("insomnia-held-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
@@ -124,7 +124,7 @@ final class PrivilegedCommandLockTests: XCTestCase {
 
         var leftRunning: UnfinishedCommand?
         do {
-            try await RecoveryLock.$held.withValue(handle) { try await pmset.setSleepDisabled(false) }
+            try await RecoveryLock.$held.withValue(handle) { try await pmset.enableSleep() }
             XCTFail("a command that ignores TERM returned")
         } catch let error as CommandStillRunningError {
             leftRunning = error.command

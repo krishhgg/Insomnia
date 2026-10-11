@@ -25,8 +25,11 @@ user the exact command to run in Terminal and wait for them to say it finished.
 4. **Install.** Step 3 of the same section runs `install.sh`, which asks for
    the administrator password, so hand that command to the user. Before they
    run it, tell them the installer adds a sudoers rule. That rule lets their
-   account run four `pmset` power commands without a password, and the page's
-   "What gets installed" section lists them. `--allow-unverified-origin`
+   account run three `pmset` power commands without a password: turning
+   sleep back on and switching battery Low Power Mode on or off. The page's
+   "What gets installed" section lists them. Turning sleep off is not in the
+   rule, so macOS asks for the administrator password each time they start
+   a session. `--allow-unverified-origin`
    tells the installer that both download checks passed. Never suggest it
    when they did not.
 5. **First launch.** macOS blocks the first launch of a downloaded app until

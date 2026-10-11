@@ -117,8 +117,11 @@ The installer checks the bundle's signature, identifier and version before it
 asks for anything (the `v0.1.0` installer checks the signature and
 identifier, not the version). It then installs the app and a background recovery agent,
 and asks for administrator access to install a narrowly scoped sudoers rule. It grants
-**your user account**, not just Insomnia, passwordless access to four
-power-setting commands. Review that permission before installing.
+**your user account**, not just Insomnia, passwordless access to three
+power-setting commands, none of which can keep the Mac awake: they turn sleep
+back on and switch battery Low Power Mode on or off. Turning sleep off is not
+in the rule; Insomnia asks for your administrator password each time you start
+a session. Review that permission before installing.
 
 Release zips are built for arm64 only, and their `install.sh --app` stops on
 an Intel Mac. On Intel, building from source (below) is the only option, and
@@ -155,8 +158,11 @@ current source. `v0.1.0` installs an older layout. Its app has no
 copy with `/bin/bash` without checking any code signature. The sealed script,
 the pinned code requirement and the refusal of an edited or re-signed bundle
 described below do not apply to it, and neither does the upgrade procedure.
-Its sudoers rule grants the same four commands. The `README.md` in its zip
-describes what it installs and its limits.
+Its sudoers rule grants four commands without a password: the three listed
+below and `/usr/bin/pmset -a disablesleep 1`, which turns sleep off. So under
+`v0.1.0` any process running as your user can keep the Mac awake without a
+password. A build of this source does not grant that command. The
+`README.md` in its zip describes what it installs and its limits.
 
 | Location | Purpose |
 | --- | --- |
@@ -164,18 +170,37 @@ describes what it installs and its limits.
 | `~/Library/Application Support/Insomnia/` | Configuration and the session/recovery journals |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
 | `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
-| `/etc/sudoers.d/insomnia` | Permission for the four commands below |
+| `/etc/sudoers.d/insomnia` | Permission for the three commands below |
+| `/private/var/db/com.kgarg.insomnia/<uid>` | The receipt that shows whether the command behind a Start's password dialog turned sleep off, and the lock that command holds until it exits (see [Starting a session](recovery.md#starting-a-session)). Every Insomnia folder of the account shares it. The file and its folder are root's and only root can change them; the installer stops, changing nothing about them, if either is already there in another form |
+| `/private/var/db/com.kgarg.insomnia/<uid>.released` | Your own file beside the receipt: which start, if any, claims the receipt until that start is settled |
 
 ```text
-/usr/bin/pmset -a disablesleep 1
 /usr/bin/pmset -a disablesleep 0
 /usr/bin/pmset -b lowpowermode 1
 /usr/bin/pmset -b lowpowermode 0
 ```
 
-The grant is available to other processes running as your user. Insomnia is not
-sandboxed. The app, scripts, and journals are local; hotspot passwords use the
-login Keychain, not the configuration file.
+The grant is available to other processes running as your user. It lets them
+turn sleep back on and toggle Low Power Mode on battery, and nothing else; the
+command that keeps the Mac awake, `pmset -a disablesleep 1`, always goes
+through the standard macOS administrator password dialog. A reinstall over an
+older install replaces the file, so the old `disablesleep 1` line is removed.
+The installer never writes that line, on any path. The file is one for every
+account on this Mac, and each account that installs Insomnia gets the same
+three lines in it. The installer reads it first and keeps the other accounts'
+lines for those three commands. It stops with nothing changed if the file
+holds a line it did not write, or cannot be read. Two accounts that install
+or uninstall at the same moment can still lose each other's lines, so run
+them one after the other. It asks for your password
+before it quits a running Insomnia, so cancelling the password prompt changes
+nothing and a running session keeps going. When a session is running it says
+the upgrade will end it before asking, and in a terminal it asks whether to
+continue. It stops with nothing changed if the app will not quit. Then,
+under the recovery lock, it writes the rule and replaces the app. If it stops
+between the two, an older build left installed cannot start a session until
+you rerun `./scripts/install.sh`, and the installer says so.
+Insomnia is not sandboxed. The app, scripts, and journals are local; hotspot
+passwords use the login Keychain, not the configuration file.
 
 The recovery agent runs at login and every 60 seconds. Its command line pins
 the installed bundle's code requirement (for an ad-hoc build, the cdhash of
@@ -200,7 +225,7 @@ and names the reason, until you reinstall. With ad-hoc signatures this guards
 against accidental edits and against the app relaying a tampered bundle into
 the agent, not against a process running as you: that process can edit the
 plist, load its own agent, quit the app and launch a replacement, and run the
-four `pmset` commands itself.
+three `pmset` commands of the sudoers rule itself.
 
 ## Upgrades
 
@@ -236,8 +261,9 @@ exited or been stopped, so no `launchctl bootout` it started is still
 running once the lock is released. A call that does not answer in time gets SIGTERM, then SIGKILL
 one to two seconds later, and the install stops, so the lock is released and the app
 and the agent's backstop can take it again to undo a session. `sudo` only
-ever gets SIGTERM: one that ignores it keeps the lock until it ends, and the
-installer prints its pid.
+ever gets SIGTERM: one that ignores it keeps the lock until it ends (a
+restart ends it too). The installer names no pid for it, since by the time
+anyone acted on one it could name another process.
 
 ## Uninstall
 
@@ -262,8 +288,54 @@ The `v0.1.0` zip is different: run `./scripts/uninstall.sh` in its unpacked
 `Insomnia-0.1.0-macos-arm64` folder, as its release notes say. That older
 uninstaller runs the `scripts/backstop.sh` in the same folder.
 
-The uninstaller requests cleanup before removing the app, agent, and sudoers
-rule. If recovery is incomplete or the app refuses to quit, it stops; resolve
+The uninstaller requests cleanup before removing the app, agent, sudoers
+rule, your receipt and its `.released` file. It removes those two only
+under the receipt's lock and only while no start claims the receipt, and
+holds the lock `install.sh` takes until it ends, so no install can make
+them again meanwhile. A
+start from another Insomnia folder of yours that is not settled, a lock
+that stays held, a receipt, `.released` file or folder it cannot read or
+that fails its checks, or one of the two files without the other stops it
+with nothing removed and a message. Those checks read the access control
+lists of the receipts folder and the folders above it with the installed
+app's binary (`Insomnia --access-lists`). A list it cannot read whole, or
+an answer that is late, too long or garbled, stops it the same way. When
+no app of this version is installed (an earlier uninstall removed it, for
+example, before a later `--purge`), nothing can read those lists, so it
+removes only this folder's own files. It keeps the sudoers rule, the
+receipts folder with everything in it and any app bundle, runs nothing
+as root, says what it kept and why, and exits 1. To remove what it kept,
+install this version again and rerun, or run the `sudo rm` it prints once
+no Insomnia folder of yours has a start to settle and no other account on
+this Mac uses Insomnia. One case of a lone `.released` file
+is known: an uninstall of this folder that stopped after removing the
+receipt. Just before that removal it writes `.uninstall-receipt-removal`
+in the folder, and a rerun finishes the removal while that file still
+names the `.released` file as it is now, free. It asks for your password once (`sudo
+-v`), before it takes any lock or removes anything, and runs each command
+that needs root through `sudo -n` with a 30 s limit. One that fails, does
+not answer in time or is still running stops the uninstall there, with
+what it already removed listed; a `sudo` still running keeps the locks
+until it exits. If your sudo credential runs out before those commands,
+it stops before removing anything; if it runs out between them, it stops
+after booting out the LaunchAgent and loads it again. Rerun it. A start
+that is settled can still have a session running in another Insomnia
+folder of yours, so while sleep is off or Low Power Mode is on for
+battery (or either cannot be read), the uninstaller keeps the sudoers
+rule, the receipt and the app, removes the rest of this folder, says
+why and exits 1; rerun it once that session has ended (SECURITY.md). It
+does the same while the recovery agent loaded now is another Insomnia
+folder's (every folder loads its agent under one name, and `launchctl
+print` shows the file it came from), and leaves that agent loaded:
+uninstall that folder first, then rerun. If launchd cannot say whose
+agent is loaded, it stops with nothing removed. Once
+they are gone, any other Insomnia folder of yours needs
+`./scripts/install.sh` again before its next start. It removes the
+receipts folder too once no other account's receipt is in it, and leaves
+the folder and everything in it alone when someone other than root could
+change it. It keeps the sudoers rule, with your own three lines in it, while
+that folder or the rule itself shows another account that installed
+Insomnia, or cannot rule one out, and says so. If recovery is incomplete or the app refuses to quit, it stops; resolve
 the reported problem and retry. With the app it removes what an interrupted
 install left beside it: `~/Applications/.Insomnia.app.previous`, and
 `.Insomnia.app.staging.*` directories of installs that are no longer running.

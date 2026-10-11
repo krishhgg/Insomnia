@@ -79,25 +79,31 @@ file. It installs:
   session's changes.
 - A **sudoers rule** at `/etc/sudoers.d/insomnia`. A sudoers rule decides who
   can run what with `sudo`. This one lets your user account, not just
-  Insomnia, run these four commands without a password:
+  Insomnia, run these three commands without a password:
 
 ```text
-/usr/bin/pmset -a disablesleep 1
 /usr/bin/pmset -a disablesleep 0
 /usr/bin/pmset -b lowpowermode 1
 /usr/bin/pmset -b lowpowermode 0
 ```
 
-Any program running as you can use that rule too, so review it before you
-install. [docs/install.md](docs/install.md#what-gets-installed) lists every
-file and explains how upgrades replace them.
+They turn sleep back on and switch battery Low Power Mode on or off. None of
+them keeps the Mac awake. Turning sleep off (`pmset -a disablesleep 1`) is
+not in the rule: each time you start a session, macOS asks for your
+administrator password. Any program running as you can use the rule too, so
+review it before you install. [docs/install.md](docs/install.md#what-gets-installed)
+lists every file, including the receipt each Start's password command writes,
+and explains how upgrades replace them.
 
 </details>
 
 ## Using it
 
 1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
-   and press Enter.
+   and press Enter. macOS asks for your administrator password to turn sleep
+   off. Cancel starts nothing.
+   [docs/recovery.md](docs/recovery.md#starting-a-session) says what happens
+   when a start fails.
 2. **Add time.** Click the eye or the countdown during a session.
 3. **End early.** Press and hold the end control next to the countdown.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo

@@ -25,7 +25,7 @@ final class ThrowawayKeychain {
     /// by default. A setup that fails removes it again, so nothing
     /// half-made is left behind.
     init(directory: URL? = nil) throws {
-        self.directory = directory ?? FileManager.default.temporaryDirectory
+        self.directory = directory ?? TestScratch.directory
             .appendingPathComponent("insomnia-keychain-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
         do {
@@ -304,7 +304,7 @@ final class KeychainStoreTests: XCTestCase {
     /// A keychain that cannot be created (here the file's path is already a
     /// directory) leaves no directory behind.
     func testFailedSetupLeavesNoFiles() throws {
-        let directory = FileManager.default.temporaryDirectory
+        let directory = TestScratch.directory
             .appendingPathComponent("insomnia-keychain-blocked-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: directory.appendingPathComponent("test.keychain-db"),
@@ -644,6 +644,13 @@ final class KeychainModel: KeychainItemCalls, @unchecked Sendable {
 /// holds afterwards, never by a prompt.
 final class KeychainStoreReplaceTests: XCTestCase {
     private let service = "insomnia-hotspot-test"
+
+    /// A save builds the item's access list with the Security framework
+    /// (SecTrustedApplicationCreateFromPath on this test process and
+    /// SecAccessCreate), even though the keychain itself is the model.
+    override func setUpWithError() throws {
+        try SystemIntegration.require("the Security framework (an access list naming this test process)")
+    }
     private var replacement: String { KeychainStore.replacementService(for: service) }
 
     private func store(_ keychain: KeychainModel) -> KeychainStore {

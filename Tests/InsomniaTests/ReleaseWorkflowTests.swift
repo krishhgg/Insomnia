@@ -307,7 +307,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// end. Returns what the step wrote to $GITHUB_OUTPUT and the calls.
     private func runStep(_ script: String, gh body: String, files: [String: String], environment: [String: String]) throws -> StepResult {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
+        let root = TestScratch.directory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
         let bin = root.appendingPathComponent("bin", isDirectory: true)
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -338,7 +338,7 @@ final class ReleaseWorkflowTests: XCTestCase {
         p.arguments = ["-e", scriptURL.path]
         p.currentDirectoryURL = root
         p.environment = environment.merging([
-            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory(),
+            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": TestScratch.pathWithSlash,
             "GITHUB_REPOSITORY": "krishhgg/Insomnia", "GITHUB_OUTPUT": outputURL.path,
         ]) { _, fixed in fixed }
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.

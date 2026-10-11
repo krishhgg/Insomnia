@@ -453,6 +453,7 @@ final class LoginItemTests: XCTestCase {
     /// The live install identity has the two parts macOS ties the item
     /// to: a hash (or "unsigned") and the bundle path. Read only.
     func testLiveInstallNamesHashPathAndExecutable() throws {
+        try SystemIntegration.require("the Security framework (this test process's code signature)")
         let install = LoginItem.liveInstall()
         let parts = install.split(separator: "@", maxSplits: 1)
         XCTAssertEqual(parts.count, 2, install)
@@ -470,7 +471,7 @@ final class LoginItemTests: XCTestCase {
     /// That reads as a different install, and the same file read twice
     /// reads the same.
     func testAReinstallOfTheSameBuildAtTheSamePathIsADifferentInstall() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("loginitem-\(UUID().uuidString)")
+        let dir = TestScratch.directory.appendingPathComponent("loginitem-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let exe = dir.appendingPathComponent("Insomnia").path

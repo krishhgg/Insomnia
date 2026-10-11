@@ -2975,6 +2975,7 @@ final class RefusedDarkeningTests: XCTestCase {
             sleepGuard: h.guardFake,
             processControl: h.procs,
             backstop: h.backstop,
+            receipts: h.receipts,
             display: refusedDisplay,
             keyboard: CoreBrightnessKeyboardBacklight(loadClass: { ChangedSignatureKeyboardClient.self })
         )
@@ -3009,7 +3010,9 @@ private final class AfterSwitchOffSleepGuard: SleepGuarding, @unchecked Sendable
 
     init(_ inner: FakeSleepGuard) { self.inner = inner }
 
-    func setSleepDisabled(_ disabled: Bool) async throws { try await inner.setSleepDisabled(disabled) }
+    func checkSleepSettingForStart(sleepOffIsOurs: Bool) async throws { try await inner.checkSleepSettingForStart(sleepOffIsOurs: sleepOffIsOurs) }
+    func disableSleep(_ start: PendingStart) async throws { try await inner.disableSleep(start) }
+    func enableSleep() async throws { try await inner.enableSleep() }
     func isSleepDisabled() async throws -> Bool { try await inner.isSleepDisabled() }
     func isLowPowerModeOn() async throws -> Bool { try await inner.isLowPowerModeOn() }
     func setLowPowerMode(_ on: Bool) async throws {

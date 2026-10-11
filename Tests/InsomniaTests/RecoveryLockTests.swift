@@ -47,6 +47,44 @@ final class RecoveryLockTests: XCTestCase {
         mine.release()
     }
 
+    /// Round 39 (item 4): only a regular file at the path is locked. A
+    /// symbolic link fails the open (O_NOFOLLOW), so nothing is made or
+    /// locked where it points; a FIFO is opened without waiting for a
+    /// writer (O_NONBLOCK) and refused; a folder fails the open. Each
+    /// stays as it was: the lock path is never unlinked or replaced.
+    func testOnlyARegularFileIsLocked() throws {
+        let path = home.paths.recoveryLock.path
+        let target = home.root.appendingPathComponent("elsewhere").path
+        XCTAssertEqual(symlink(target, path), 0)
+        XCTAssertThrowsError(try lock.tryAcquire()) { error in
+            XCTAssertEqual(error as? RecoveryLockError, .open(path: path, errno: ELOOP))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target), "nothing is made where the link points")
+        var info = stat()
+        XCTAssertEqual(lstat(path, &info), 0)
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFLNK, "the link stays")
+        XCTAssertEqual(unlink(path), 0)
+
+        XCTAssertEqual(mkfifo(path, 0o600), 0)
+        let started = ContinuousClock.now
+        XCTAssertThrowsError(try lock.tryAcquire()) { error in
+            XCTAssertEqual(error as? RecoveryLockError, .notRegularFile(path: path))
+        }
+        XCTAssertLessThan(ContinuousClock.now - started, .seconds(3))
+        XCTAssertEqual(lstat(path, &info), 0)
+        XCTAssertEqual(info.st_mode & S_IFMT, S_IFIFO, "the FIFO stays")
+        XCTAssertEqual(unlink(path), 0)
+
+        XCTAssertEqual(mkdir(path, 0o700), 0)
+        XCTAssertThrowsError(try lock.tryAcquire()) { error in
+            XCTAssertEqual(error as? RecoveryLockError, .open(path: path, errno: EISDIR))
+        }
+        XCTAssertEqual(rmdir(path), 0)
+
+        let held = try XCTUnwrap(try lock.tryAcquire(), "the control: a regular file is made and locked")
+        held.release()
+    }
+
     func testHandleGoingAwayReleasesTheLock() throws {
         var handle: RecoveryLockHandle? = try lock.tryAcquire()
         XCTAssertNotNil(handle)

@@ -63,10 +63,11 @@ final class RecoverySafetyTests: XCTestCase {
 
     // MARK: Lifecycle under suspended operations (release the hold, then await)
 
-    /// Reconcile's final pmset check is answered late, after a new session
-    /// started. It must not clear that session's sleep guard. The stale bit
-    /// had no journal claim, so it is reported as someone else's before the
-    /// start; the start then clears the warning line.
+    /// Reconcile's final pmset check is answered late, while a start waits
+    /// behind it. The stale bit had no journal claim, so it is reported as
+    /// someone else's, and the queued start leaves it alone: it is refused
+    /// with nothing run. Once the bit reads 0 a start goes through, clears
+    /// the warning line, and keeps its own sleep guard.
     func testLateReconcileMustNotClearNewSessionSleepGuard() async throws {
         let gate = AsyncGate()
         h.guardFake.readGate = gate
@@ -80,11 +81,20 @@ final class RecoverySafetyTests: XCTestCase {
         await reconcile.value
         await start.value
 
+        XCTAssertNil(m.session)
+        XCTAssertTrue(h.guardFake.sleepDisabled, "a bit someone else set was cleared")
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
+        XCTAssertNotEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertEqual(h.notifier.posts.map(\.title), [SessionManager.foreignSleepTitle, "Session not started"])
+        XCTAssertEqual(m.foreignSleepWarning, SessionManager.foreignSleepLine)
+        XCTAssertTrue(try XCTUnwrap(m.lastError).contains("sleep is already off"), m.lastError ?? "")
+
+        h.guardFake.sleepDisabled = false
+        await m.start(duration: 3600)
         XCTAssertTrue(m.isActive)
-        XCTAssertTrue(h.guardFake.sleepDisabled, "the new session's sleep guard was cleared by the late reconcile")
+        XCTAssertTrue(h.guardFake.sleepDisabled, "the new session's sleep guard was cleared")
         XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 1"])
         XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
-        XCTAssertEqual(h.notifier.posts.map(\.title), [SessionManager.foreignSleepTitle])
         XCTAssertNil(m.foreignSleepWarning)
         XCTAssertNil(m.lastError)
     }
@@ -154,14 +164,17 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertNil(m.scheduledDeadline)
     }
 
-    /// The deadline passes while reconcile's `disablesleep 1` for the
-    /// session on disk is still running. The end waits for it, so its
-    /// `disablesleep 0` lands last and nothing stays journaled.
+    /// The deadline passes while reconcile's `pmset -g` check for the
+    /// session on disk is still running. Reconcile never turns sleep off
+    /// again; it keeps the session only because sleep is still off, and then
+    /// journals that. The end waits for it, so its `disablesleep 0` lands
+    /// last and nothing stays journaled.
     func testEndDuringReconcileMustNotLeaveSleepDisabled() async throws {
         let now = h.clock.now
         try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-600), endsAt: now.addingTimeInterval(60)))
+        h.guardFake.sleepDisabled = true
         let gate = AsyncGate()
-        h.guardFake.sleepGate = gate
+        h.guardFake.readGate = gate
         let m = h.makeManager()
 
         let reconcile = Task { await m.reconcile() }
@@ -175,7 +188,7 @@ final class RecoverySafetyTests: XCTestCase {
         // first await, so an end that ran here instead of queuing shows now.
         XCTAssertEqual(m.session, held, "the end ran inside the reconcile")
         XCTAssertEqual(try h.store.loadSession(), held, "the end ran inside the reconcile")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"])
         await gate.open()
         await reconcile.value
         let outcome = await end.value
@@ -184,7 +197,7 @@ final class RecoverySafetyTests: XCTestCase {
         XCTAssertNil(m.session)
         XCTAssertNil(m.scheduledDeadline)
         XCTAssertFalse(h.guardFake.sleepDisabled, "sleep left disabled after the end completed")
-        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0"])
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g", "disablesleep 0"])
         XCTAssertNil(try h.store.loadSession())
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }

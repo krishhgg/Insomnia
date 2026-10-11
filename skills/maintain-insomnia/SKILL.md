@@ -48,7 +48,21 @@ Reference pages in https://github.com/krishhgg/Insomnia:
 ## Warnings in the menu
 
 Match the warning to docs/recovery.md, "Recovery limits and manual attention".
+Warnings about starting a session are in its "Starting a session" section.
 
+- **Start asks for the administrator password.** That is expected: sleep
+  can be turned off only with the password, at every Start. The user types
+  it into the macOS dialog. Never ask for it or pass it on. Cancel starts
+  nothing.
+- **Start refused while an earlier start is still recorded.** A start
+  whose password dialog never finished is settled from the receipt in
+  `/private/var/db/com.kgarg.insomnia/`, after its answer window ends and
+  once nothing holds the receipt's lock. Wait a few minutes and open
+  Insomnia again. If the menu says the receipt is missing or unsafe, the
+  user reruns the installer.
+- **A password dialog or a power command that will not end.** The menu
+  names it with its pid. The user checks the pid with `ps` first, then
+  runs the command the menu shows.
 - **A stuck power command with a pid.** The user checks the pid, then runs the
   `sudo kill <pid>` the menu shows.
 - **Stopped processes Insomnia cannot prove it froze.** The user checks each
@@ -56,8 +70,8 @@ Match the warning to docs/recovery.md, "Recovery limits and manual attention".
 - **An output device still muted.** Reconnect it and open Insomnia, or choose
   "Stop waiting for <device>" in the menu.
 - **Sleep disabled by something else.** Insomnia did not set it and leaves it
-  alone. Whoever set it turns sleep back on with
-  `sudo pmset -a disablesleep 0`.
+  alone, and Start is refused until sleep is back on. Whoever set it turns
+  sleep back on with `sudo pmset -a disablesleep 0`.
 - **Hotspot password unreadable by this build.** A reinstall changes the app's
   signature. Enter the password again in Settings.
 

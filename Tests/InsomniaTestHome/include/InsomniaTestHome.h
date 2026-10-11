@@ -8,4 +8,10 @@ const char *insomnia_test_home_key(void);
 /// loaded, or NULL if the loader has not run.
 const char *insomnia_test_home_root(void);
 
+/// The folder the loader made that directory in: TMPDIR when it is an
+/// absolute path, else Darwin's per-user temp dir, else /tmp, with no
+/// trailing slash. NULL if the loader has not run. Test helpers make their
+/// scratch folders here (TestScratch).
+const char *insomnia_test_scratch_base(void);
+
 #endif

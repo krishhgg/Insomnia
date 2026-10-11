@@ -18,6 +18,7 @@ import Foundation
 enum RecoveryLockError: Error, LocalizedError, Equatable {
     case busy(path: String, seconds: TimeInterval)
     case open(path: String, errno: Int32)
+    case notRegularFile(path: String)
     case lock(path: String, errno: Int32)
 
     var errorDescription: String? {
@@ -26,6 +27,8 @@ enum RecoveryLockError: Error, LocalizedError, Equatable {
             return "recovery lock \(path) still held by another process after \(Int(seconds)) s (backstop running?)"
         case let .open(path, errno):
             return "could not open recovery lock \(path): \(String(cString: strerror(errno)))"
+        case let .notRegularFile(path):
+            return "recovery lock \(path) is not a regular file, so it is not locked"
         case let .lock(path, errno):
             return "could not lock \(path): \(String(cString: strerror(errno)))"
         }
@@ -63,6 +66,11 @@ final class RecoveryLockHandle: @unchecked Sendable {
         }
     }
 
+    /// The locked file, by device and inode; nil once released.
+    var file: FileIdentity? {
+        mutex.withLock { fd >= 0 ? FileIdentity(of: fd) : nil }
+    }
+
     deinit { release() }
 }
 
@@ -81,10 +89,19 @@ struct RecoveryLock: Sendable {
     func tryAcquire() throws -> RecoveryLockHandle? {
         // O_CLOEXEC: no child inherits the lock by accident. One that must
         // keep it is given its own descriptor (`descriptorForChild()`).
+        // O_NOFOLLOW and O_NONBLOCK: a symbolic link at the path fails the
+        // open (ELOOP) rather than leading somewhere else, and a FIFO or
+        // device there cannot hold the open; only a regular file is kept.
+        // Nothing that fails is unlinked or replaced.
         // Owner-only like every other file here; an older 0644 lock is
         // tightened in place, never replaced (same inode for both sides).
-        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, OwnerOnly.fileMode)
+        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, OwnerOnly.fileMode)
         guard fd >= 0 else { throw RecoveryLockError.open(path: path, errno: errno) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            close(fd)
+            throw RecoveryLockError.notRegularFile(path: path)
+        }
         if let problem = OwnerOnly.tighten(fd: fd, path: path) { OwnerOnly.reportOnce(problem) }
         if flock(fd, LOCK_EX | LOCK_NB) == 0 { return RecoveryLockHandle(fd: fd) }
         let err = errno

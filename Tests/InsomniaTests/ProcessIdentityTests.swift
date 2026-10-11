@@ -410,7 +410,8 @@ final class ProcessIdentityTests: XCTestCase {
     /// process both can see, and still answers for a root process, which
     /// proc_pidinfo refuses: `sudo pmset` runs as root. pid 1 (launchd) is
     /// only read.
-    func testTheProcessTableAnswersForTheTestProcessAndForARootProcess() {
+    func testTheProcessTableAnswersForTheTestProcessAndForARootProcess() throws {
+        try SystemIntegration.require("a read of launchd's (pid 1) process entry")
         let me = ProcessInfo.processInfo.processIdentifier
         guard case let .present(direct) = SignalProcessControl.kernelState(pid: me),
               case let .present(table) = SignalProcessControl.processTableState(pid: me) else {

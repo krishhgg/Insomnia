@@ -98,7 +98,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// is told, by the name the menu showed, even though the browser list
     /// no longer has it.
     @MainActor
-    func testAConfirmedRelaunchOfABrowserThatHasGoneSaysSo() async {
+    func testAConfirmedRelaunchOfABrowserThatHasGoneSaysSo() async throws {
+        try SystemIntegration.require("the browser scan, which lists this Mac's running applications, if the cancel comes 2 s after the post")
         let home = TempHome()
         defer { home.destroy() }
         let notifier = ExpectingNotifier()
@@ -131,7 +132,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// status item builds it. Here the browser quit and `open` failed: the
     /// browser is closed, and the line says to open it by hand.
     @MainActor
-    func testARelaunchWhoseOpenFailsLeavesTheReasonInTheMenu() async {
+    func testARelaunchWhoseOpenFailsLeavesTheReasonInTheMenu() async throws {
+        try SystemIntegration.require("the browser scan after the relaunch, which lists this Mac's running applications")
         let h = Harness()
         defer { h.home.destroy() }
         let processes = FakeBrowserProcesses(pids: [42])
@@ -191,7 +193,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// while that one runs, and one that relaunches the browser leaves no
     /// line.
     @MainActor
-    func testTheNextRelaunchReplacesTheMenuLine() async {
+    func testTheNextRelaunchReplacesTheMenuLine() async throws {
+        try SystemIntegration.require("the browser scan after the relaunch, which lists this Mac's running applications")
         let home = TempHome()
         defer { home.destroy() }
         let processes = FakeBrowserProcesses(pids: [42])
@@ -228,7 +231,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// then ends without its quit. Its outcome is not the latest word on
     /// that browser, so it leaves no line and posts nothing.
     @MainActor
-    func testAnOlderRelaunchOfTheSameBrowserThatEndsLastIsDropped() async {
+    func testAnOlderRelaunchOfTheSameBrowserThatEndsLastIsDropped() async throws {
+        try SystemIntegration.require("the browser scan after the relaunch, which lists this Mac's running applications")
         let home = TempHome()
         defer { home.destroy() }
         let notifier = RecordingNotifier()
@@ -254,7 +258,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// a line an earlier relaunch of a third browser left, and each is
     /// notified.
     @MainActor
-    func testOverlappingRelaunchesOfTwoBrowsersEachKeepTheirLine() async {
+    func testOverlappingRelaunchesOfTwoBrowsersEachKeepTheirLine() async throws {
+        try SystemIntegration.require("the browser scan after the relaunch, which lists this Mac's running applications")
         let home = TempHome()
         defer { home.destroy() }
         let notifier = RecordingNotifier()
@@ -334,7 +339,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// the wait ends) reaches the user as a notification naming the browser,
     /// and nothing is launched.
     @MainActor
-    func testARelaunchThatStopsShortIsNotifiedAndLaunchesNothing() async {
+    func testARelaunchThatStopsShortIsNotifiedAndLaunchesNothing() async throws {
+        try SystemIntegration.require("the browser scan after the relaunch, which lists this Mac's running applications")
         let home = TempHome()
         defer { home.destroy() }
         let notifier = RecordingNotifier()
@@ -395,7 +401,8 @@ final class IntegrationWiringTests: XCTestCase {
     /// still names the browser, not its bundle id: the name is the one the
     /// user confirmed.
     @MainActor
-    func testARelaunchFailureNamesTheBrowserAfterTheListChanged() async {
+    func testARelaunchFailureNamesTheBrowserAfterTheListChanged() async throws {
+        try SystemIntegration.require("the browser scan after the relaunch, which lists this Mac's running applications")
         let home = TempHome()
         defer { home.destroy() }
         let notifier = RecordingNotifier()

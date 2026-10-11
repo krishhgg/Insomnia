@@ -36,6 +36,8 @@
 	<string>NSApplication</string>
 	<key>InsomniaResumeFrozenVersion</key>
 	<integer>1</integer>
+	<key>InsomniaAccessListsVersion</key>
+	<integer>1</integer>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Krish Garg. MIT License.</string>
 </dict>
