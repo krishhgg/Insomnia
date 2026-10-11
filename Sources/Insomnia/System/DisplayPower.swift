@@ -86,7 +86,9 @@ enum DisplayPower {
     /// type information, so on any other major the calls are refused until
     /// someone measures them again, rather than passing a display id and a
     /// float pointer into a function whose signature may have changed.
-    static let measuredDisplayServicesMajors: Set<Int> = [26]
+    /// macOS 15 measured on 15.5 (24F74, arm64, Mac14,2): all three symbols
+    /// present, CanChange true on the built-in display, Get/Set return 0.
+    static let measuredDisplayServicesMajors: Set<Int> = [15, 26]
 
     /// nil when `major` was measured; otherwise why DisplayServices is refused.
     static func displayServicesRefusal(osMajorVersion major: Int) -> String? {

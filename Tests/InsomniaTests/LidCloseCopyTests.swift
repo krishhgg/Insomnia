@@ -28,6 +28,7 @@ final class LidCloseCopyTests: XCTestCase {
         return String(source[start..<end])
     }
 
+    @MainActor
     func testMicrophoneNoteSaysTheMicIsDisconnectedAndWhatToUseInstead() {
         let note = SettingsView.microphoneNote
         XCTAssertTrue(note.contains("closing the lid disconnects the built-in microphone in hardware"), note)

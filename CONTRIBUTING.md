@@ -1,7 +1,7 @@
 # Contributing
 
 Insomnia is a native Swift macOS app. Build and run the Swift test suite on
-macOS 26 with an Xcode toolchain that supports the package's Swift 6.2 tools
+macOS 15 or later with an Xcode toolchain that supports the package's Swift 6.1 tools
 version. Pull requests should include regression tests for changed behavior
 and pass the build, test, and shell-script checks.
 

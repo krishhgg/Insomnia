@@ -258,17 +258,27 @@ fi
 
 # --- Helpers -----------------------------------------------------------------
 
+# Prints plutil's output only when it succeeds. On macOS 15 plutil writes a
+# missing key's error to stdout (and exits 1), so a caller reading stdout
+# would take the error text for a value. Output is passed through byte for
+# byte (the trailing x keeps trailing newlines through the substitution).
+plutil_out() { # plutil args...
+  local out rc=0
+  out="$("$PLUTIL" "$@" 2>/dev/null && printf x)" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  printf '%s' "${out%x}"
+}
 # plutil -extract <key> raw prints the scalar; returns non-zero if missing.
 extract() { # file keypath
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" raw -o - "$1"
 }
 extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" json -o - "$1"
 }
 # Type name of a keypath (bool, integer, float, string, array, dictionary,
 # "(any)" for null); empty if the key is absent.
 type_of() { # file keypath
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+  plutil_out -type "$2" -o - "$1" || true
 }
 is_true() { # file key
   [[ "$(extract "$1" "$2" || true)" == "true" ]]

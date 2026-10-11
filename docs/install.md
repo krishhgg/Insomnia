@@ -5,7 +5,9 @@ step and what each one checks. A coding agent can follow
 [skills/install-insomnia](../skills/install-insomnia/SKILL.md), which uses the
 steps on this page.
 
-Requires **macOS 26 or later on an Apple Silicon Mac**.
+Requires **macOS 15 or later on an Apple Silicon Mac**. `v0.1.0` and the
+nightlies before macOS 15 support need macOS 26: on macOS 15, install a
+release whose app reports `LSMinimumSystemVersion` 15.0, or build from source.
 
 ## Channels
 
@@ -126,9 +128,11 @@ it is untested there.
 
 ## Build from source
 
-Requires **Xcode with Swift 6.2 or later**. Clone the latest stable tag, or a
+Requires **Xcode with Swift 6.1 or later**. Clone the latest stable tag, or a
 nightly tag for the newest code, rather than `main`. If the releases page has
-no release yet, leave out `--branch v<version>` to build `main`:
+no release yet, leave out `--branch v<version>` to build `main`. On macOS 15
+the tag's `Package.swift` must say `.macOS(.v15)` (`v0.1.0` needs macOS 26
+and Swift 6.2); until a stable tag does, use a newer nightly or `main`:
 
 ```bash
 git clone --branch v<version> --depth 1 https://github.com/krishhgg/Insomnia.git

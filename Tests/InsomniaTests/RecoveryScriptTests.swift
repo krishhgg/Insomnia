@@ -798,7 +798,7 @@ final class RecoveryScriptTests: XCTestCase {
         for script in [fx.backstop, fx.uninstall] {
             let text = try String(contentsOf: script, encoding: .utf8)
             var functions = ""
-            for name in ["extract", "epoch_of", "epoch_at"] {
+            for name in ["plutil_out", "extract", "epoch_of", "epoch_at"] {
                 let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
                 let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
                 functions += text[start.lowerBound..<end.upperBound]
@@ -817,6 +817,81 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(shell[i], app[i], "\(script.lastPathComponent) and the app read \(text.debugDescription) differently")
             }
         }
+    }
+
+    /// A plutil that writes its errors to stdout and keeps its exit status,
+    /// as /usr/bin/plutil does on macOS 15 for a key that is not there
+    /// (macOS 26 writes them to stderr). Gives that behavior on any macOS.
+    private func plutilWithErrorsOnStdout() throws -> URL {
+        let url = fx.root.appendingPathComponent("plutil-errors-on-stdout")
+        try "#!/bin/bash\nexec /usr/bin/plutil \"$@\" 2>&1\n".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+
+    /// Every script reads plutil through plutil_out, which passes plutil's
+    /// output on only when plutil succeeded, byte for byte, so an error on
+    /// stdout is never read as a value: a missing key prints nothing and
+    /// fails with plutil's status. The readers built on it in backstop.sh
+    /// and uninstall.sh follow: type_of of a missing key is empty and
+    /// extract fails and prints nothing.
+    func testPlutilErrorsOnStdoutAreNotReadAsValues() throws {
+        let plutil = try plutilWithErrorsOnStdout()
+        let file = fx.root.appendingPathComponent("values.json")
+        try #"{"list":[1,2],"name":"x"}"#.write(to: file, atomically: true, encoding: .utf8)
+        let direct = #"""
+            rc=0; v="$(plutil_out -extract list.2 raw -o - "$f")" || rc=$?; printf '[%s] %s\n' "$v" "$rc"
+            v="$(plutil_out -extract name raw -o - "$f"; echo .)"; printf '[%s]\n' "${v%.}"
+
+            """#
+        let readers = #"""
+            printf '[%s]\n' "$(type_of "$f" list.0)"
+            printf '[%s]\n' "$(type_of "$f" list.2)"
+            printf '[%s]\n' "$(extract_json "$f" list)"
+            rc=0; v="$(extract "$f" list.2)" || rc=$?; printf '[%s] %s\n' "$v" "$rc"
+            v="$(extract "$f" name; echo .)"; printf '[%s]\n' "${v%.}"
+
+            """#
+        for (script, hasReaders) in [(fx.backstop, true), (fx.uninstall, true), (fx.install, false)] {
+            let text = try String(contentsOf: script, encoding: .utf8)
+            var functions = ""
+            for name in hasReaders ? ["plutil_out", "extract", "extract_json", "type_of"] : ["plutil_out"] {
+                let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
+                let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
+                functions += text[start.lowerBound..<end.upperBound]
+            }
+            let harness = fx.root.appendingPathComponent("readers.\(script.lastPathComponent)")
+            try ("set -euo pipefail\nPLUTIL='\(plutil.path)'" + functions + "f=\"$1\"\n" + direct + (hasReaders ? readers : ""))
+                .write(to: harness, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(harness, [file.path])
+
+            XCTAssertEqual(r.status, 0, r.stderr)
+            let expected = "[] 1\n[x\n]\n" + (hasReaders ? "[integer]\n[]\n[[1,2]]\n[] 1\n[x\n]\n" : "")
+            XCTAssertEqual(r.stdout, expected, script.lastPathComponent)
+        }
+    }
+
+    /// With plutil's errors on stdout, the backstop's walk over
+    /// session.json's extensions used to read the error text for the
+    /// missing extensions.0 as a type and never end, holding the recovery
+    /// lock. It now ends and undoes the expired session as usual.
+    func testTheBackstopEndsWhenPlutilWritesErrorsToStdout() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let backstop = fx.backstop.deletingLastPathComponent().appendingPathComponent("backstop-plutil-stdout.sh")
+        try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["PLUTIL": try plutilWithErrorsOnStdout().path])
+            .write(to: backstop, atomically: true, encoding: .utf8)
+
+        let shell = try fx.spawn(backstop, ownProcessGroup: true)
+        let ended = waitUntil(30) { shell.hasExited }
+        if !ended { _ = shell.signalGroup(SIGKILL) }
+        let status = shell.wait()
+
+        XCTAssertTrue(ended, "the backstop was still running after 30 s: \(fx.log())")
+        XCTAssertEqual(status, 0, fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertFalse(fx.exists(fx.session), fx.log())
     }
 
     /// A future endsAt with a newline stored after it is not a date for the
@@ -2516,6 +2591,12 @@ final class RecoveryScriptTests: XCTestCase {
         ("keptDisplayUnderLowPowerBoot is in the top level of state.json 2 times", #""keptDisplayUnderLowPowerBoot":"boot A","keptDisplayUnderLowPowerBoot":"boot B""#),
     ]
 
+    /// plutil before macOS 26 reads JSON strictly, so a journal in JSON5
+    /// syntax (comments, single quotes, unquoted keys, .5, +1, 1., \x
+    /// escapes) is refused as a whole file before the scripts check any key.
+    /// Nothing is undone either way; only the reason in the log differs.
+    static let plutilIsStrictJSON = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26
+
     static let keptDisplayRecordKeys = [
         "keptDisplayUnderLowPower", "keptDisplayUnderLowPowerBoot", "keptDisplayReadLit", "displayRestoredUnderLowPower",
     ]
@@ -2539,7 +2620,8 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept for \(json)")
             XCTAssertTrue(f.exists(f.session), json)
-            XCTAssertTrue(f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
+            let refusedAsAFile = Self.plutilIsStrictJSON && f.log().contains("\(f.state.path): not valid JSON")
+            XCTAssertTrue(refusedAsAFile || f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
             XCTAssertTrue(f.log().contains("is unreadable or malformed; nothing undone, evidence kept"), f.log())
         }
     }
@@ -2610,8 +2692,10 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertTrue(f.exists(f.sudoers), json)
             XCTAssertTrue(f.exists(f.app), json)
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
-            XCTAssertTrue(r.stderr.contains("state.json is malformed (unexpected shape)"), "\(json): \(r.stderr)")
-            XCTAssertTrue(r.stderr.contains(problem), "\(json): \(r.stderr)")
+            if !(Self.plutilIsStrictJSON && r.stderr.contains("state.json is unreadable or malformed")) {
+                XCTAssertTrue(r.stderr.contains("state.json is malformed (unexpected shape)"), "\(json): \(r.stderr)")
+                XCTAssertTrue(r.stderr.contains(problem), "\(json): \(r.stderr)")
+            }
             XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
         }
     }
@@ -7433,7 +7517,7 @@ private final class ScriptFixture {
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
-        posix_spawn_file_actions_addchdir(&actions, root.path)
+        posix_spawn_file_actions_addchdir_np(&actions, root.path)
 
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
