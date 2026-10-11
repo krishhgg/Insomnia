@@ -63,7 +63,11 @@ final class ReminderScheduler {
         content.body = body
         content.sound = .default
         let request = UNNotificationRequest(identifier: "insomnia.reminder", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request) { error in
+        // @Sendable: the center calls back on its own queue. Unmarked, the
+        // closure inherits this class's main-actor isolation, and Swift 6
+        // traps on the executor check (the macOS 15 SDK does not mark these
+        // completion handlers sendable).
+        UNUserNotificationCenter.current().add(request) { @Sendable error in
             if let error {
                 Log.error("reminder notification failed: \(error.localizedDescription)")
             }
@@ -73,7 +77,8 @@ final class ReminderScheduler {
     private func requestAuthorizationIfNeeded() {
         guard !authorizationRequested, Self.canNotify else { return }
         authorizationRequested = true
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+        // @Sendable for the same reason as in fire(endsAt:): off the main queue.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { @Sendable granted, error in
             if let error {
                 Log.error("notification authorization failed: \(error.localizedDescription)")
             } else if !granted {
