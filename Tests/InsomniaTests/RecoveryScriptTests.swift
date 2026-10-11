@@ -819,6 +819,81 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    /// A plutil that writes its errors to stdout and keeps its exit status,
+    /// as /usr/bin/plutil does on macOS 15 for a key that is not there
+    /// (macOS 26 writes them to stderr). Gives that behavior on any macOS.
+    private func plutilWithErrorsOnStdout() throws -> URL {
+        let url = fx.root.appendingPathComponent("plutil-errors-on-stdout")
+        try "#!/bin/bash\nexec /usr/bin/plutil \"$@\" 2>&1\n".write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+
+    /// Every script reads plutil through plutil_out, which passes plutil's
+    /// output on only when plutil succeeded, byte for byte, so an error on
+    /// stdout is never read as a value: a missing key prints nothing and
+    /// fails with plutil's status. The readers built on it in backstop.sh
+    /// and uninstall.sh follow: type_of of a missing key is empty and
+    /// extract fails and prints nothing.
+    func testPlutilErrorsOnStdoutAreNotReadAsValues() throws {
+        let plutil = try plutilWithErrorsOnStdout()
+        let file = fx.root.appendingPathComponent("values.json")
+        try #"{"list":[1,2],"name":"x"}"#.write(to: file, atomically: true, encoding: .utf8)
+        let direct = #"""
+            rc=0; v="$(plutil_out -extract list.2 raw -o - "$f")" || rc=$?; printf '[%s] %s\n' "$v" "$rc"
+            v="$(plutil_out -extract name raw -o - "$f"; echo .)"; printf '[%s]\n' "${v%.}"
+
+            """#
+        let readers = #"""
+            printf '[%s]\n' "$(type_of "$f" list.0)"
+            printf '[%s]\n' "$(type_of "$f" list.2)"
+            printf '[%s]\n' "$(extract_json "$f" list)"
+            rc=0; v="$(extract "$f" list.2)" || rc=$?; printf '[%s] %s\n' "$v" "$rc"
+            v="$(extract "$f" name; echo .)"; printf '[%s]\n' "${v%.}"
+
+            """#
+        for (script, hasReaders) in [(fx.backstop, true), (fx.uninstall, true), (fx.install, false)] {
+            let text = try String(contentsOf: script, encoding: .utf8)
+            var functions = ""
+            for name in hasReaders ? ["plutil_out", "extract", "extract_json", "type_of"] : ["plutil_out"] {
+                let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
+                let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
+                functions += text[start.lowerBound..<end.upperBound]
+            }
+            let harness = fx.root.appendingPathComponent("readers.\(script.lastPathComponent)")
+            try ("set -euo pipefail\nPLUTIL='\(plutil.path)'" + functions + "f=\"$1\"\n" + direct + (hasReaders ? readers : ""))
+                .write(to: harness, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(harness, [file.path])
+
+            XCTAssertEqual(r.status, 0, r.stderr)
+            let expected = "[] 1\n[x\n]\n" + (hasReaders ? "[integer]\n[]\n[[1,2]]\n[] 1\n[x\n]\n" : "")
+            XCTAssertEqual(r.stdout, expected, script.lastPathComponent)
+        }
+    }
+
+    /// With plutil's errors on stdout, the backstop's walk over
+    /// session.json's extensions used to read the error text for the
+    /// missing extensions.0 as a type and never end, holding the recovery
+    /// lock. It now ends and undoes the expired session as usual.
+    func testTheBackstopEndsWhenPlutilWritesErrorsToStdout() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let backstop = fx.backstop.deletingLastPathComponent().appendingPathComponent("backstop-plutil-stdout.sh")
+        try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["PLUTIL": try plutilWithErrorsOnStdout().path])
+            .write(to: backstop, atomically: true, encoding: .utf8)
+
+        let shell = try fx.spawn(backstop, ownProcessGroup: true)
+        let ended = waitUntil(30) { shell.hasExited }
+        if !ended { _ = shell.signalGroup(SIGKILL) }
+        let status = shell.wait()
+
+        XCTAssertTrue(ended, "the backstop was still running after 30 s: \(fx.log())")
+        XCTAssertEqual(status, 0, fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertFalse(fx.exists(fx.session), fx.log())
+    }
+
     /// A future endsAt with a newline stored after it is not a date for the
     /// app, so it is not one for the backstop either: the session is
     /// malformed, the journal is undone and the file moved aside, as the

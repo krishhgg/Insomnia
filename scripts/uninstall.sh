@@ -231,7 +231,7 @@ case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolut
 # byte (the trailing x keeps trailing newlines through the substitution).
 plutil_out() { # plutil args...
   local out rc=0
-  out="$("$PLUTIL" "$@" 2>/dev/null; rc=$?; printf x; exit "$rc")" || rc=$?
+  out="$("$PLUTIL" "$@" 2>/dev/null && printf x)" || rc=$?
   (( rc == 0 )) || return "$rc"
   printf '%s' "${out%x}"
 }

@@ -63,27 +63,35 @@ final class ReminderScheduler {
         content.body = body
         content.sound = .default
         let request = UNNotificationRequest(identifier: "insomnia.reminder", content: content, trigger: nil)
-        // @Sendable: the center calls back on its own queue. Unmarked, the
-        // closure inherits this class's main-actor isolation, and Swift 6
-        // traps on the executor check (the macOS 15 SDK does not mark these
-        // completion handlers sendable).
-        UNUserNotificationCenter.current().add(request) { @Sendable error in
-            if let error {
-                Log.error("reminder notification failed: \(error.localizedDescription)")
-            }
-        }
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: Self.reminderAdded)
     }
 
     private func requestAuthorizationIfNeeded() {
         guard !authorizationRequested, Self.canNotify else { return }
         authorizationRequested = true
-        // @Sendable for the same reason as in fire(endsAt:): off the main queue.
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { @Sendable granted, error in
-            if let error {
-                Log.error("notification authorization failed: \(error.localizedDescription)")
-            } else if !granted {
-                Log.info("notifications not granted")
-            }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound], completionHandler: Self.authorizationAnswered)
+    }
+
+    // MARK: Notification center callbacks
+
+    // The center calls these on its own queue, never the main one. Written
+    // inline in this @MainActor class, a closure would inherit main-actor
+    // isolation unless the SDK marks the parameter sendable, and Swift 6
+    // traps on the executor check when the center calls it: the macOS 15
+    // SDK leaves both completion handlers unmarked, so the first session
+    // crashed. Nonisolated and @Sendable here, whatever the SDK says.
+
+    nonisolated static let authorizationAnswered: @Sendable (Bool, (any Error)?) -> Void = { granted, error in
+        if let error {
+            Log.error("notification authorization failed: \(error.localizedDescription)")
+        } else if !granted {
+            Log.info("notifications not granted")
+        }
+    }
+
+    nonisolated static let reminderAdded: @Sendable ((any Error)?) -> Void = { error in
+        if let error {
+            Log.error("reminder notification failed: \(error.localizedDescription)")
         }
     }
 }

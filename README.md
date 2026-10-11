@@ -39,12 +39,9 @@
 
 ## Install
 
-Requires macOS 15 or later on an Apple Silicon Mac.
-
-> **This fork** ports Insomnia to macOS 15 (Sequoia). The private display
-> and keyboard-backlight calls were measured on macOS 15.5 (24F74) and match
-> macOS 26. Release zips from the upstream repository still need macOS 26;
-> on macOS 15, use [Build from source](#build-from-source) with this fork.
+Requires macOS 15 or later on an Apple Silicon Mac. `v0.1.0` and the
+nightlies before macOS 15 support need macOS 26; on macOS 15, use a release
+or tag whose `Package.swift` says `.macOS(.v15)`, or build `main`.
 
 Paste this into your coding agent:
 
@@ -63,7 +60,10 @@ differently.
 ### Build from source
 
 Needs Xcode with Swift 6.1 or later. Replace `v<version>` with the latest
-stable tag, or a nightly tag for the newest code:
+stable tag, or a nightly tag for the newest code. On macOS 15 the tag's
+`Package.swift` must say `.macOS(.v15)` (`v0.1.0` needs macOS 26 and Swift
+6.2); until a stable tag does, use a newer nightly or leave out
+`--branch v<version>` to build `main`:
 
 ```bash
 git clone --branch v<version> --depth 1 https://github.com/krishhgg/Insomnia.git

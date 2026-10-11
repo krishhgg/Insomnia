@@ -111,7 +111,8 @@ instance method type encodings: `copyKeyboardBacklightIDs` `@16@0:8`,
 `setBrightness:forKeyboard:` `B28@0:8f16Q20`,
 `isBacklightSuppressedOnKeyboard:` `B24@0:8Q16`,
 `isBacklightDimmedOnKeyboard:` `B24@0:8Q16`. `DisplayPower.swift` now
-refuses the DisplayServices calls on any macOS major other than 26, and the
+refuses the DisplayServices calls on any macOS major it was not measured on
+(26 here; 15 since the October 11 section below), and the
 keyboard class when a required method is missing or an encoding (offsets
 removed) differs from these; on an Intel Mac `BOOL` encodes as `c`, so the
 keyboard backlight is refused there until measured. A refused device is
@@ -176,6 +177,62 @@ the mode dropped while state.json refuses that clear stays dropped. Unit
 tests with an injected version and
 fake classes only; the rows below stay "Not run", and the guards do not
 stand in for them.
+
+## October 11, 2026 macOS 15 port
+
+MacBook Air (M2, `Mac14,2`), macOS 15.5 (24F74), arm64, Xcode 16.4 with
+Swift 6.1.2. Before the port the package needed Swift 6.2 tools and
+`LSMinimumSystemVersion` 26.0; it compiled against the macOS 15 SDK with
+the platform lowered to `.v15`, so it calls no macOS 26 API.
+
+Private calls, measured read-only on that machine except one write of the
+value just read: `DisplayServicesGetBrightness` / `SetBrightness` /
+`CanChangeBrightness` present, `CanChangeBrightness` true on the built-in
+display, `GetBrightness` rc 0 (0.628), `SetBrightness` of that value rc 0
+and read back unchanged. The six `KeyboardBrightnessClient` encodings, with
+offsets removed, equal the macOS 26.2 ones above. `DisplayPower.swift` now
+allows DisplayServices on 15 and 26; the keyboard guard is unchanged.
+
+Two defects found only on macOS 15, each with a regression test that runs on
+any macOS:
+
+- `plutil -type` and `-extract` write a missing key's error to stdout there
+  (exit 1). `type_of` ends in `|| true`, so it returned the error text, and
+  the backstop's `while [[ -n "$(type_of ... "extensions.$i")" ]]` walk
+  never ended, holding the recovery lock: the first `swift test` run hung
+  in `AgentModeExitInANewBootTests`. All three scripts now read plutil
+  through `plutil_out`. `testTheBackstopEndsWhenPlutilWritesErrorsToStdout`
+  uses a plutil that sends stderr to stdout; against the previous
+  `backstop.sh` it is still running after 30 s and nothing is undone.
+- The `UNUserNotificationCenter` completion handlers are not
+  `NS_SWIFT_SENDABLE` in the macOS 15 SDK, so the closures written in
+  `@MainActor` `ReminderScheduler` were main-actor isolated, and the center
+  calls them on its own queue: `EXC_BREAKPOINT` in `dispatch_assert_queue`
+  28 s into the first session. They are now nonisolated `@Sendable` statics
+  (`ReminderSchedulerTests`). `NotificationCenter` blocks are sendable in that
+  SDK, and the other callbacks run on the main queue or run loop.
+
+On macOS 15 plutil reads JSON strictly, so a journal in JSON5 syntax is
+refused as a whole file ("not valid JSON") before any key is checked; the
+malformed-journal tests accept that reason before macOS 26. Nothing is
+undone in either case.
+
+`swift test` on that machine: 1223 tests before the two regression tests
+were added, zero failures, 13 skipped (tmux not installed).
+
+Supervised run of commit `2a5f75d` (the port with the notification fix,
+before these tests), on battery, lid on a desk. `install.sh` first ended the
+session the crashed build had left (`pmset -a disablesleep 0 ok`, journal
+cleared). A 2 h session started at 16:26:29Z. Lid closed at 16:28:04Z: the
+log shows the display darkened (0.626 journaled), the keyboard backlight
+off (0.692 journaled), display sleep requested, built-in speakers muted,
+Low Power Mode on. Lid opened at 16:30:32Z: audio, display and keyboard
+backlight restored, Low Power Mode off, both restores re-asserted 2 s later.
+`pmset -g log` has no Sleep event that day. Notification authorization was
+denied by macOS ("Notifications are not allowed for this application"), so
+the reminder was logged, not shown. Not observed in that run: the deadline
+end, freezing (no app on the freeze list was running), the battery and heat
+rules, and the network failover.
 
 ## Hardware validation still required
 
