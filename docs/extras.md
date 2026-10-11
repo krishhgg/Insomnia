@@ -88,7 +88,26 @@ app will keep working while the lid is closed.
 
 Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](../Sources/Insomnia/Model/Config.swift)
-defines the full configuration and defaults. Local logs can contain SSIDs,
+defines the full configuration and defaults. The backstop reads the end
+floor and thermal setting from the file too, through the installed app's
+decoder, or with its own reader when that binary cannot answer, so the file
+decides those two for both. Its own reader takes a hand edit only in a form it
+can read as the app does: it does not use a file over 8 MiB, one it cannot
+finish reading within 30 s, or one on which the app's decoder stops, and then
+uses the values the app recorded for the session, or a stopgap where there are
+none (spec section 6). The app checks it whenever it starts, extends or ends a
+session, and every second while one runs with the lid open: a hand edit to
+either value is taken into the app, and a change to either in Settings that
+cannot be saved does not take effect (Settings says why). If a hand edit
+leaves the file unreadable, the app renames it to
+`config.json.unreadable-<time>`, starts with the defaults and posts a
+notification; fix the copy, quit Insomnia and rename it back. While an
+unreadable file cannot be renamed (a locked file, for example), Insomnia
+starts no session and ends a running one. Make the file writable or delete
+it. After a rename or a delete, the app writes the settings it runs on in the
+file's place. When that write fails (a full disk, for example), no session
+runs unless the app's end floor and thermal setting are the defaults the
+backstop falls back to without the file (10%, on). Local logs can contain SSIDs,
 process metadata, and tmux targets. Check them before sharing publicly.
 Lines the app writes to `insomnia.log` also go to the unified log with their
 bodies marked private, so `log show` and other local programs see `<private>`
@@ -105,7 +124,11 @@ another account access (`ls -le` shows it). The LaunchAgent plist and the instal
 scripts hold no private data and keep the modes the installer gives them.
 `insomnia.log` and `handoffs.log` are capped at 1 MiB: a
 log past the cap is renamed to `insomnia.log.1` or `handoffs.log.1`,
-replacing the previous copy, and a new file starts. The cap does not apply
+replacing the previous copy, and a new file starts. `insomnia.log` can hold
+the record of a session's end, so the app renames it only while it holds
+the recovery lock, and waits while `insomnia.log.1` or the saved session
+cannot be read and could hold such a record; until then the file grows past
+the cap. The backstop appends to it and never renames it. The cap does not apply
 to a log you replace with a symlink. Insomnia writes through the link and
 never rotates it, since the rename would move the link and not the file it
 points to, and it logs that once. You set up the link, so trimming the file

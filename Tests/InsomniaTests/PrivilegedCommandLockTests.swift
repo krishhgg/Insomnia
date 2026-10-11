@@ -12,7 +12,7 @@ final class PrivilegedCommandLockTests: XCTestCase {
     private var dir: URL!
 
     override func setUpWithError() throws {
-        dir = FileManager.default.temporaryDirectory
+        dir = ProcessTestHome.temporaryDirectory
             .appendingPathComponent("insomnia-held-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }

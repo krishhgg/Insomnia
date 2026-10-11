@@ -64,10 +64,36 @@ struct Paths: Sendable, Equatable {
     }
 
     var sessionFile: URL { appSupport.appendingPathComponent("session.json") }
+    /// Written when a session is ended but session.json cannot be removed (an
+    /// immutable file): a copy of that file's exact bytes. While the two
+    /// match, the session is over whatever its endsAt says. backstop.sh
+    /// writes and honours the same file.
+    var endedSessionFile: URL { appSupport.appendingPathComponent("ended-session.json") }
+    /// The same record under a fresh name, for when neither
+    /// ended-session.json nor state.json can be written: this prefix and
+    /// eight letters or digits, created exclusively (Store, and mktemp in
+    /// backstop.sh), in one of `endedSessionAsideFolders`. Only a regular
+    /// file this user owns with exactly that name counts; backstop.sh and
+    /// uninstall.sh use the same shape.
+    static let endedSessionAsidePrefix = "ended-session.json."
+    /// Where records aside go and are looked for, in this order: beside
+    /// ended-session.json, then the log folder, which is outside
+    /// Application Support and so can take a new file when that folder
+    /// does not. The log folder counts only while it is a directory, not a
+    /// symlink, owned by this user. No other folder is searched.
+    var endedSessionAsideFolders: [URL] { [appSupport, logs] }
+    static func isEndedSessionAsideName(_ name: String) -> Bool {
+        guard name.hasPrefix(endedSessionAsidePrefix) else { return false }
+        let suffix = name.utf8.dropFirst(endedSessionAsidePrefix.utf8.count)
+        return suffix.count == 8 && suffix.allSatisfy { (0x30...0x39).contains($0) || (0x41...0x5A).contains($0) || (0x61...0x7A).contains($0) }
+    }
     /// Where an unreadable session.json goes: this prefix, a UTC stamp
     /// (yyyyMMddTHHmmssZ) and, if that name is taken, -1, -2, ... The same
     /// shape is produced by backstop.sh and removed by `uninstall.sh --purge`.
     static let unreadableSessionPrefix = "session.json.unreadable-"
+    /// Where a config.json that does not decode goes at launch, named the
+    /// same way. Only the app moves it; `uninstall.sh --purge` removes it.
+    static let unreadableConfigPrefix = "config.json.unreadable-"
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
     /// scripts/backstop.sh as install.sh seals it into a bundle, under
@@ -81,6 +107,10 @@ struct Paths: Sendable, Equatable {
     /// flock(2) file shared with backstop.sh (`lockf -k` on the same path).
     /// Created once, never unlinked, so both sides lock the same inode.
     var recoveryLock: URL { appSupport.appendingPathComponent(".recovery.lock") }
+    /// flock(2) file the app holds for its whole lifetime (`AppAliveLock`).
+    /// backstop.sh probes it without waiting: acquiring it means no Insomnia
+    /// process is alive, and a valid session is then ended. Never unlinked.
+    var appAliveFile: URL { appSupport.appendingPathComponent(".app.alive") }
     /// The `sudo pmset` left running that holds the recovery lock, written
     /// while it runs so a relaunch after a crash can name it. Removed when
     /// it exits, and by the next transaction that takes the lock.

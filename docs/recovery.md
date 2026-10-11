@@ -5,8 +5,147 @@ has every case.
 
 Insomnia records pending changes in a recovery journal. On session end, the app
 attempts to undo them. An independent `launchd` agent checks every minute and
-can attempt recovery after the app exits unexpectedly, once the saved deadline
-has passed. It leaves a valid, unexpired session alone.
+restores the journal once the saved deadline has passed. It also ends a valid
+session early, restoring the journal the same way, in three cases. No Insomnia
+process holds the liveness lock: `.app.alive` is an `flock(2)` the app takes at
+launch, and the kernel releases it when the process dies, however it dies. A
+second copy that cannot take it quits at launch without changing anything. The
+Mac is on battery power with the charge below the end floor from `config.json`
+(default 10%); a battery that is present but cannot be read counts as below
+it. Or the thermal pressure level reported by `notifyutil` is critical while
+the thermal rule is on. The agent normally does not parse `config.json` itself.
+It passes the file to the app's binary in `~/Applications/Insomnia.app` with
+`--agent-cutoffs`, which decodes it with the app's own code, prints the end
+floor and the thermal setting, and exits without starting the app. This runs
+once a minute while a session is valid, the app is running and the file exists.
+Without the file, or with one the app rejects or cannot read, the agent uses
+the end floor and thermal setting the app recorded for the session in
+`state.json`, read the same way with `--agent-session-cutoffs`. The app records
+them before a session starts or resumes and before a change to either takes
+effect; when it cannot, it refuses the change or ends the session. A journal
+without them (a session an older build started) gives the app's defaults (10%,
+on). When the binary cannot answer (it was removed or replaced by an older or
+newer build after the agent checked the bundle's signature, it gives no answer
+in its form within 30 seconds, or `config.json` is over 8 MiB), the agent reads
+`config.json` itself and logs that it did. It copies the file once, at most
+8 MiB, and reads the copy's text with its own reader, without `plutil`, as the
+app's decoder reads it: the first copy of a key, keys after their escapes,
+numbers as the setting's type reads them (`1e-400` as an end floor of 0), and
+what the decoder skips skipped. A file the decoder rejects (text that is not
+JSON it reads, a setting of a type it does not take, a number the type does
+not hold) counts as rejected. A file over 8 MiB, one the reader does not
+finish within 30 seconds, and one with an Int64 on which Foundation stops the
+app (the app stops there; it neither loads nor rejects the file) are not
+used: what the app makes of them is not known here, and they count as read
+neither way, below. For a rejected file, and one the agent does not use, it
+reads the recorded values from `state.json` itself. On either path, a
+recorded value the app does not write
+counts as none, as the app reads it, and so does a `state.json` that is a
+symlink to nothing, which the app reads as no journal. With `config.json`
+missing, not a regular file, not readable by you, or rejected, none gives the
+app's defaults (10%, on). With `config.json` a regular file you can read but
+read neither by the binary nor by the agent, none gives the strictest values,
+a 95% end floor with the thermal rule on, and a log line says why. The values the app enforces are not known to the agent then, though
+they may be on disk: a valid `config.json` over 8 MiB, or one the reader does
+not finish within 30 seconds, still holds the values the app takes from it. A
+file on which Foundation stops the app is not a decode; the app never loads it.
+So the agent can end a session on battery below 95%, or at critical heat with
+the thermal rule off, that the app would keep. A running app that answers writes its record
+within a second, so these cases need an app that has stopped answering. The
+defaults and the 95% values here are stopgaps no one has approved; spec section
+6 lists them as open. Before it reads them, or ends a session, the agent checks
+the parts of `state.json` the app decodes. It reads the file's text as the
+app's decoder reads it: a key written twice counts by its first copy, and a
+number `plutil` would read otherwise is read as the app reads it. When the
+parts do not load as the app loads them, or the check cannot tell what the app
+makes of them (an Int64 on which Foundation stops the app, text it does not
+finish reading within 30 seconds), the agent keeps the session, changes
+nothing and logs why, until the app or a person fixes the file; the first run
+after the fix ends the session if it is over. A string the app reads that
+holds `\u0000`, which `plutil` cannot hold, is read through a placeholder that
+no string of the journal holds, whatever its length and whatever else the
+journal holds; when no placeholder can be had (the system's `grep` fails), the
+check refuses the journal as not known (spec section 6). A running app
+rewrites the journal in its own form the next time it writes it, but with the
+app crashed or hung, a journal the check refuses keeps the session and its
+sleep hold, past the deadline too, until someone fixes the file. A journal
+the agent edits is published only when the edited copy loads as the app loads
+it, holds every `Float` the app decodes bit for bit as before, and has the
+text of each string that holds `\u0000` back once, in the entry and under the
+key it had (when the agent takes entries out of an array, each entry that
+moves up keeps its own strings); otherwise
+the agent keeps the old journal, with what it still has to undo, and exits 1. Each
+early end is logged with its reason, and the saved session is deleted before
+the restore starts. A restore that cannot finish leaves entries in the journal
+for the next run and the app. If the saved session cannot be deleted, its end
+is recorded before anything is restored: in `ended-session.json`; when that
+file cannot be written, in the journal (`endedSession` in `state.json`); when
+neither can be written, in a new file beside them named `ended-session.json.`
+followed by eight letters or digits; when that folder takes no new file,
+in a file with such a name in `~/Library/Logs/Insomnia`; and when neither
+folder takes one, in the recovery lock file `.recovery.lock`, which exists
+already. That record is written in place, so the file keeps its inode and stays
+the lock both sides take. A writer cuts the file back to bytes it shares with
+the start of the record, or to nothing, before it appends the rest, so a writer
+stopped partway leaves the old bytes, an empty file or the record's first
+bytes. A writer counts the record only once it reads it back whole. The saved
+session's record cut short as a writer leaves it when it stops partway (its
+first bytes, or the whole record followed by bytes the file held before) still
+counts as that session's end, and a writer completes it instead of emptying it.
+Other content there (other bytes, a record of other bytes cut short, more than
+1 MiB) ends no session, and the agent empties it, as the app does before it
+starts or resumes a session. A record's first bytes are also the first bytes of
+a later session's record, so a start empties everything but a record of the
+saved session it replaces before it writes its own. A lock file that cannot be
+read on three tries 0.1 s apart counts as the end of the saved session, since
+it may hold one, and no writer writes over it. That rule keeps to the safe
+side and is no proof: a lock file that holds no record but keeps failing to
+read (an I/O error) ends a session nobody ended. When the log holds a record of
+that session, the app and the agent name the log instead. When the lock file
+takes no write either, the end goes into `insomnia.log` as one line holding the
+saved session's bytes. A line that lacks only its newline at the end of the log
+counts too, so Insomnia's writers of the log (the app, the agent and its
+LaunchAgent) put a newline first when the log does not end in one, and hold
+flock(2) on the log from that check until their line is written. An ordinary
+line they cannot lock in time waits in memory in the app and goes to standard
+error from the agent; a record they cannot lock in time is not written. A
+process that appends without that lock can still join a line to a record that
+already read back, and that record then ends nothing. A record counts only once
+it reads back as a whole line, a saved session over 64 KiB is never recorded
+there, and the app and the agent do not search a log that cannot be read or is
+over 64 MiB, so a record such a log holds ends nothing for them. The app rotates that log only while it holds the recovery
+lock and copies such a line forward when it does, so the record lasts while the
+saved session stays. The agent reads each
+record back before it restores anything. The app and the agent count a record
+aside or in the lock file only if it is a regular file you own, not a link,
+and the log folder only if it is a real folder you own, not a link.
+`ended-session.json` counts as `session.json` does: a link there is
+followed to a regular file, and its owner is not checked. While a record matches the saved
+session byte for byte, the app restores that session instead of resuming it,
+whatever `pmset` reports, and every agent run ends it again. A record matches
+bytes, not a session: a saved session written later with the same bytes,
+which takes the same start and end times to the second, would read as ended
+too. A session the app was running when it crashed, with no record of its
+bytes in any of these places, resumes at the next launch under the rules
+below. Only when neither folder takes a new file, the lock file takes no
+write and `insomnia.log` takes no new line either (a full disk, say) is
+nothing recorded. The agent still runs the restore,
+but it cannot confirm the result, so it keeps the journal and exits 1. The app
+resumes no session while it cannot write `state.json`, none whose journal says
+sleep is held while `pmset` reports it is not, and none whose `session.json`
+it cannot replace with the same bytes. That last rule has a cost: a session
+the app was running when it crashed is ended at the next launch, not resumed,
+while its `session.json` cannot be replaced. Once `session.json` can be
+replaced and `state.json` written again, an app launched before the next agent
+run resumes a session ended with nothing recorded if sleep still reads as
+disabled (the restore failed, or something else disabled sleep), because
+nothing on disk tells that end from a crash. An end stopped before any record
+of it counts (before `session.json` is removed and before a record is whole, or
+before the first byte of one in the lock file) has undone nothing yet, so a
+relaunch before the next agent run resumes that session too, and an end you
+asked for is lost. Both cases are open limits, not accepted ones. Otherwise the
+session stands until its deadline, and sessions are capped at 24 hours by
+default (`maxDuration`).
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
@@ -24,11 +163,13 @@ app keeps trying it and will not quit until the file is gone.
 `uninstall.sh --purge` removes the renamed copies that are regular files;
 without `--purge` they stay.
 
-**Recovery is not "everything always gets undone."** The backstop does not
-monitor battery or temperature. Saved audio needs the app to reopen, and
-unconfirmed process freezes may need manual inspection. If a warning remains,
-resolve it before leaving the Mac unattended. Real-machine crash, reboot, and
-installation scenarios still need [release validation](release-validation.md).
+**Recovery is not "everything always gets undone."** The backstop checks the
+battery and the thermal level once a minute and only for the two ends above.
+Low Power Mode requests and notifications need the app. Saved audio needs the
+app to reopen, and unconfirmed process freezes may need manual inspection. If a
+warning remains, resolve it before leaving the Mac unattended. Real-machine
+crash, reboot, and installation scenarios still need
+[release validation](release-validation.md).
 
 ## Recovery limits and manual attention
 

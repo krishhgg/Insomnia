@@ -142,3 +142,14 @@ enum WiFiStatusName {
 func chipLabel(for seconds: TimeInterval) -> String {
     SessionMath.formatRemaining(seconds).replacingOccurrences(of: " ", with: "")
 }
+
+/// Every unit of a duration, floored to the minute: "1d30m", "23h", "<1m".
+/// For a time the user may type back into the pills (the allowance beside
+/// them, the Days tooltip), where `chipLabel` would drop the minutes past a
+/// day ("1d" for 1d 30m) and hide what still fits.
+func exactLabel(for seconds: TimeInterval) -> String {
+    let minutes = Int(max(seconds, 0) / 60)
+    guard minutes >= 1 else { return "<1m" }
+    let units = [(minutes / 1440, "d"), (minutes % 1440 / 60, "h"), (minutes % 60, "m")]
+    return units.filter { $0.0 > 0 }.map { "\($0.0)\($0.1)" }.joined()
+}

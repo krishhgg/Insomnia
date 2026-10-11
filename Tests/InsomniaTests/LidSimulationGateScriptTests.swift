@@ -23,7 +23,7 @@ final class LidSimulationGateScriptTests: XCTestCase {
     private static let otherStrings = "launched\nRestore incomplete"
 
     override func setUpWithError() throws {
-        root = fm.temporaryDirectory.appendingPathComponent("lid-gate-\(UUID().uuidString)", isDirectory: true)
+        root = ProcessTestHome.temporaryDirectory.appendingPathComponent("lid-gate-\(UUID().uuidString)", isDirectory: true)
         let scripts = root.appendingPathComponent("scripts", isDirectory: true)
         let bin = root.appendingPathComponent("bin", isDirectory: true)
         for dir in [scripts, bin, plain, sim] {
@@ -38,7 +38,7 @@ final class LidSimulationGateScriptTests: XCTestCase {
         // `swift build` succeeds without building; --show-bin-path names the
         // plain directory, or the sim one for the opt-in scratch path.
         try stub("swift", """
-            for a in "$@"; do [[ $a == --scratch-path ]] && dir=\(sim.path); done
+            for a in "$@"; do [[ $a == --scratch-path ]] && dir='\(sim.path)'; done
             for a in "$@"; do [[ $a == --show-bin-path ]] && echo "${dir:-\(plain.path)}"; done
             exit 0
             """)
@@ -141,7 +141,7 @@ final class LidSimulationGateScriptTests: XCTestCase {
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = [root.appendingPathComponent("scripts/check-lid-simulation-gate.sh").path]
         // No stub on PATH: the script reaches them only through the patched lines.
-        p.environment = ["PATH": "/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory()]
+        p.environment = ["PATH": "/usr/bin:/bin", "TMPDIR": ProcessTestHome.temporaryDirectory.path + "/"]
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
         let outURL = root.appendingPathComponent("stdout")
         let errURL = root.appendingPathComponent("stderr")

@@ -161,9 +161,9 @@ describes what it installs and its limits.
 | Location | Purpose |
 | --- | --- |
 | `~/Applications/Insomnia.app` | The menu bar app, with `backstop.sh` sealed inside it at `Contents/Resources` |
-| `~/Library/Application Support/Insomnia/` | Configuration and the session/recovery journals |
+| `~/Library/Application Support/Insomnia/` | Configuration, the session/recovery journals, and lock files |
 | `~/Library/LaunchAgents/com.insomnia.backstop.plist` | Per-user recovery agent: verifies the app's code signature, then runs the sealed `backstop.sh` |
-| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink |
+| `~/Library/Logs/Insomnia/` | `insomnia.log` and `handoffs.log`, each capped at 1 MiB with one older copy kept as `.1`, unless you replace it with a symlink; `insomnia.log` can pass the cap for a while (see [Configuration and privacy](extras.md#configuration-and-privacy)). A session end record lands here only when the Application Support folder takes no new file, or, as a line in `insomnia.log`, when the recovery lock file takes no write either (see [How recovery works](recovery.md)) |
 | `/etc/sudoers.d/insomnia` | Permission for the four commands below |
 
 ```text

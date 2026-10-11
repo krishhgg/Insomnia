@@ -99,7 +99,12 @@ The defaults are worth knowing:
   read. One failed read is tolerated, and the level is re-read every 30 s
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
-  session. These rules require the app to be running.
+  session. The Low Power Mode requests need the app to be running. The ends
+  do not: the `launchd` backstop reads the battery and the thermal pressure
+  level once a minute and ends the session itself when the app is gone, the
+  charge is below the end floor on battery power or cannot be read, or the
+  thermal level is critical (see [How recovery works](recovery.md)). Like the app, it
+  treats a Mac as a desktop only when the I/O Registry has no battery.
   Setting the end floor to 0 turns the battery end off. Otherwise the end
   floor stays below the Low Power Mode floor. The Settings steppers move the
   other floor when the two would cross, and a hand-edited `config.json` with

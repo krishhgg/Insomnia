@@ -112,8 +112,9 @@ On battery power, Insomnia turns on Low Power Mode below 40% and ends the
 session below 10%. Those are the defaults. You can change both in Settings,
 and an end floor of 0 turns the battery end off. The heat rules turn on Low Power
 Mode when the Mac gets seriously hot and end the session at critical heat.
-They are on by default, and Settings can turn them off. All of these rules
-only work while the app runs.
+They are on by default, and Settings can turn them off. Low Power Mode needs
+the app to run. The two ends don't, since the recovery agent also checks them
+once a minute.
 
 Before your first session, check Settings. Then run a short session you can
 watch, and read `~/Library/Logs/Insomnia/insomnia.log` afterward.
@@ -152,18 +153,20 @@ and how to test lid actions without closing the lid.
 ## How recovery works
 
 <p align="center">
-  <img src="docs/assets/recovery-flow.svg" alt="The app and a launchd backstop coordinate through a shared lock and recovery journal. The app handles normal cleanup. The backstop checks every minute and attempts due recovery, leaving valid active sessions alone. Failed or unreadable recovery evidence stays on disk; saved audio needs the app and unconfirmed stopped processes need inspection." width="880">
+  <img src="docs/assets/recovery-flow.svg" alt="The app and a launchd backstop coordinate through a shared lock and recovery journal. The app handles normal cleanup. The backstop checks every minute: it attempts recovery once the deadline has passed, and ends a session early when the app is gone, the battery is below the end floor or the Mac is critically hot. Failed or unreadable recovery evidence stays on disk; saved audio needs the app and unconfirmed stopped processes need inspection." width="880">
 </p>
 
 Insomnia writes each change to a **recovery journal**, a file on disk, before
 it makes the change. Ending the session tries to undo what the journal lists.
-If the app crashes or quits, the recovery agent tries the same once the
-session's end time has passed.
+The recovery agent checks once a minute. It ends the session and tries the
+same undo when the app is gone, the end time has passed, the battery is below
+the end floor or the Mac is critically hot.
 
 Some things need you:
 
 - The recovery agent can't restore audio. Open Insomnia again for that.
-- The recovery agent doesn't watch the battery or the temperature.
+- Without the app, nothing turns on Low Power Mode. The recovery agent still
+  ends the session at the battery end floor and at critical heat.
 - Insomnia only unfreezes a process it can prove it froze. A frozen process
   it can't prove stays frozen until you check it.
 

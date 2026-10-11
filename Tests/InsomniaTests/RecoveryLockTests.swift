@@ -7,13 +7,24 @@ import XCTest
 final class RecoveryLockTests: XCTestCase {
     var home: TempHome!
     var lock: RecoveryLock!
+    /// The lockf holder a test started, if any.
+    var holder: LockfHolder?
 
     override func setUp() {
         home = TempHome()
         lock = RecoveryLock(url: home.paths.recoveryLock)
     }
 
-    override func tearDown() { home.destroy() }
+    /// Stops a holder the test left running. One that still has not
+    /// exited keeps the home it locks.
+    override func tearDown() {
+        if let holder, !holder.isSettled, holder.stop() == -1 {
+            XCTFail("the lockf holder \(holder.child.pid) did not exit; keeping \(home.root.path): \(holder.problems)")
+            home.keep()
+            return
+        }
+        home.destroy()
+    }
 
     func testSecondHolderIsRefusedUntilRelease() throws {
         let first = try XCTUnwrap(try lock.tryAcquire())
@@ -57,24 +68,18 @@ final class RecoveryLockTests: XCTestCase {
 
     /// backstop.sh locks with `/usr/bin/lockf -k` on the same path. Prove the
     /// two really contend: a lockf holder in another process blocks the app.
-    func testLockHeldByLockfInAnotherProcessIsRespected() async throws {
-        let ready = home.root.appendingPathComponent("holder-ready")
-        let holder = Process()
-        holder.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
-        holder.arguments = ["-k", "-t", "0", home.paths.recoveryLock.path, "/bin/sh", "-c", "touch '\(ready.path)'; sleep 30"]
-        let holderExit = ProcessExit(holder)
-        try holder.run()
-        defer { holder.terminate() }
-        let deadline = Date().addingTimeInterval(5)
-        while !FileManager.default.fileExists(atPath: ready.path), Date() < deadline {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path), "lockf holder never started")
+    /// The holder's command is cat, which prints back a line only once lockf
+    /// holds the lock and runs it. Closing cat's input ends cat, lockf reaps
+    /// it and exits 0, and the test reaps lockf (LockfHolder).
+    func testLockHeldByLockfInAnotherProcessIsRespected() throws {
+        let holder = try LockfHolder(
+            file: home.paths.recoveryLock, wait: 0, errors: home.root.appendingPathComponent("holder-errors"),
+            environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"], directory: home.root)
+        self.holder = holder
+        XCTAssertTrue(holder.held(within: 5), "lockf holder never ran its command: \(holder.problems) \(holder.errorText())")
 
         XCTAssertNil(try lock.tryAcquire(), "flock did not see the lock lockf holds")
-        holder.terminate()
-        let exited = await holderExit.exited(within: 10)
-        XCTAssertTrue(exited, "the lockf holder did not exit within 10 s of SIGTERM")
+        XCTAssertEqual(holder.stop(), 0, "lockf, reaped once its cat read the end of its input: \(holder.problems) \(holder.errorText())")
         XCTAssertNotNil(try lock.tryAcquire())
     }
 }

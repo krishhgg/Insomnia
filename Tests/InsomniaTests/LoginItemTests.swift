@@ -470,7 +470,7 @@ final class LoginItemTests: XCTestCase {
     /// That reads as a different install, and the same file read twice
     /// reads the same.
     func testAReinstallOfTheSameBuildAtTheSamePathIsADifferentInstall() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("loginitem-\(UUID().uuidString)")
+        let dir = ProcessTestHome.temporaryDirectory.appendingPathComponent("loginitem-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let exe = dir.appendingPathComponent("Insomnia").path

@@ -8,8 +8,12 @@ struct Config: Codable, Equatable, Sendable {
     /// Preset durations in seconds, shown as chips.
     var presets: [TimeInterval] = Config.defaultPresets
     var defaultPreset: TimeInterval = 4 * 3600
-    /// Hard ceiling on a session, including extensions. 30 days.
-    var maxDuration: TimeInterval = 30 * 24 * 3600
+    /// Hard ceiling on a session, including extensions. 24 hours by default:
+    /// the backstop ends a session within a minute of the app going away, but
+    /// the deadline is still the last line, and one typo should not hold a
+    /// closed laptop awake for days. Raise it in config.json for longer
+    /// sessions; the Days pill accepts up to 30 days.
+    var maxDuration: TimeInterval = 24 * 3600
 
     // Lid-close actions
     /// Bundle ids to SIGSTOP while the lid is closed.
@@ -81,6 +85,12 @@ struct Config: Codable, Equatable, Sendable {
     /// first launch with the flag on registers once and records it.
     var launchAtLoginInstall: String?
 
+    /// Which defaults the file was written under; 2 is the 24-hour ceiling.
+    /// A file without the key comes from an older build, and only such a
+    /// file has its stock values migrated on read.
+    var configVersion: Int = Config.currentVersion
+    static let currentVersion = 2
+
     // One-time updates
     /// Whether this config has had the lid-close update
     /// (`applyLidCloseDefaults`). True for a config this build creates;
@@ -101,8 +111,16 @@ struct Config: Codable, Equatable, Sendable {
         8 * 3600,
         12 * 3600,
         24 * 3600,
-        3 * 24 * 3600,
     ]
+
+    /// What builds before the 24-hour ceiling wrote into config.json as
+    /// their defaults. Settings saves the whole struct, so an ordinary
+    /// install has these as explicit values; in a file without
+    /// `configVersion` the decoder reads exactly these as the current
+    /// defaults and keeps any other value, which a person chose by hand,
+    /// unless it no longer fits under the new ceiling.
+    static let legacyMaxDuration: TimeInterval = 30 * 24 * 3600
+    static let legacyPresets: [TimeInterval] = defaultPresets + [3 * 24 * 3600]
 
     /// Default freeze list: chat apps that burn battery in the background.
     static let defaultFreezeList: [String] = [
@@ -143,7 +161,25 @@ struct Config: Codable, Equatable, Sendable {
         let d = Config()
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
-        maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
+        let savedMax = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration)
+        maxDuration = savedMax ?? d.maxDuration
+        // In a current file every value was written by this build or by
+        // hand, a 30-day ceiling included; only an older file is migrated.
+        // The key alone marks a current file, as in Store.configHasVersion:
+        // its value is never decoded, so a hand-edited "2" cannot fail the
+        // whole file.
+        if !c.contains(.configVersion) {
+            if presets == Config.legacyPresets { presets = d.presets }
+            if maxDuration == Config.legacyMaxDuration { maxDuration = d.maxDuration }
+            // A ceiling the user never set is now 24 hours, not the 30 days
+            // the presets and default were picked under. Presets above it go
+            // (Settings refuses to add them), and a default above it moves
+            // to the largest preset left, since bare Enter would refuse it.
+            if savedMax == nil || savedMax == Config.legacyMaxDuration {
+                presets.removeAll { $0 > maxDuration }
+                if defaultPreset > maxDuration { defaultPreset = presets.max() ?? d.defaultPreset }
+            }
+        }
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
         dockerRule = try c.decodeIfPresent(Bool.self, forKey: .dockerRule) ?? d.dockerRule
@@ -266,4 +302,64 @@ extension Config {
         guard (lowPowerFloor, endFloor) != before else { return nil }
         return "battery floors corrected: lowPowerFloor \(before.0) -> \(lowPowerFloor), endFloor \(before.1) -> \(endFloor)"
     }
+}
+
+// MARK: Cutoffs the recovery agent enforces
+
+/// The two settings backstop.sh enforces on its own while a session runs,
+/// the end floor and the thermal rule, as `AgentCutoffsCommand` prints them
+/// from config.json, or from the journal's record of them
+/// (`RuntimeState.sessionCutoffs`) when config.json cannot be used.
+struct AgentCutoffs: Equatable, Sendable {
+    /// 0...`Config.maxEndFloor`; 0 is off.
+    let endFloor: Int
+    let thermalRules: Bool
+
+    init(endFloor: Int, thermalRules: Bool) {
+        self.endFloor = endFloor
+        self.thermalRules = thermalRules
+    }
+
+    /// The form the journal records them in, and the one
+    /// `AgentCutoffsCommand` prints after "cutoffs ": the end floor in
+    /// decimal, a space, and true or false. `"30 false"`.
+    var journalValue: String { "\(endFloor) \(thermalRules)" }
+
+    /// Reads `journalValue` back: nil for anything else, such as a floor
+    /// outside 0...`Config.maxEndFloor`, a leading zero, a sign, other
+    /// spacing, or another word for the rule. No other text means the
+    /// same cutoffs.
+    init?(journalValue text: String) {
+        let parts = text.split(separator: " ", omittingEmptySubsequences: false)
+        guard parts.count == 2, let floorText = parts.first, let rule = parts.last,
+              !floorText.isEmpty, floorText.count <= 2,
+              floorText.utf8.allSatisfy({ (0x30...0x39).contains($0) }),
+              floorText == "0" || !floorText.hasPrefix("0"),
+              let floor = Int(floorText), floor <= Config.maxEndFloor
+        else { return nil }
+        switch rule {
+        case "true": thermalRules = true
+        case "false": thermalRules = false
+        default: return nil
+        }
+        endFloor = floor
+    }
+
+    var description: String {
+        "end floor \(endFloor == 0 ? "off" : "\(endFloor)%"), thermal rules \(thermalRules ? "on" : "off")"
+    }
+}
+
+extension Config {
+    /// The cutoffs the agent enforces for this config: the end floor
+    /// clamped as `normalizeFloors` clamps it (above `maxEndFloor` is
+    /// `maxEndFloor`, 0 or below is off).
+    var agentCutoffs: AgentCutoffs {
+        AgentCutoffs(endFloor: min(max(endFloor, 0), Config.maxEndFloor), thermalRules: thermalRules)
+    }
+
+    /// What the agent enforces while config.json is missing, or holds bytes
+    /// the app's decoder rejects: the app's defaults (read_cutoffs in
+    /// backstop.sh).
+    static let agentDefaultCutoffs = AgentCutoffs(endFloor: 10, thermalRules: true)
 }

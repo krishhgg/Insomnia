@@ -395,7 +395,7 @@ final class TmuxLiveRunnerTests: XCTestCase {
     /// reach the pane in order, so once `X` is in the file, everything the
     /// nudge sent is too, however slow the pane.
     func testLivePaneGetsContinueWithoutEnterByDefault() async throws {
-        let received = FileManager.default.temporaryDirectory
+        let received = ProcessTestHome.temporaryDirectory
             .appendingPathComponent("insomnia-nudge-\(UUID().uuidString).txt")
         defer { try? FileManager.default.removeItem(at: received) }
         // tmux runs the command through sh -c: quote the path for it.

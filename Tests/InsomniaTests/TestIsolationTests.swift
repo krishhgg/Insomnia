@@ -3,21 +3,30 @@ import XCTest
 import InsomniaTestHome
 @testable import Insomnia
 
-/// The suite must never write to the real ~/Library, which holds Insomnia's
-/// Logs, Application Support files and LaunchAgent. `Log.append` and
+/// The suite must never write to the places in ~/Library that hold
+/// Insomnia's real files: its Application Support and Logs folders and the
+/// LaunchAgents folder, nor to the installed app. `Log.append` and
 /// `SessionManager.live` resolve INSOMNIA_HOME at call time, so these tests
-/// check that the variable names an existing directory outside ~/Library,
-/// that every path the app resolves sits inside it, that a default-argument
-/// log line lands there, and that a TempHome hands the variable back instead
-/// of unsetting it. They do not check which temp directory the loader used:
-/// it prefers Darwin's per-user temp dir and falls back to TMPDIR, and
-/// Foundation's temporaryDirectory need not match either. This class extends
-/// XCTestCase directly on purpose: isolation must not depend on a base class
-/// or on which tests a `--filter` selects.
+/// check that the variable names an existing directory outside those
+/// places, that every path the app resolves sits inside it, that a
+/// default-argument log line lands there, and that a TempHome hands the
+/// variable back instead of unsetting it. They compare against those places,
+/// not all of ~/Library, so a run whose TMPDIR is a folder of its own under
+/// ~/Library passes. When the run sets TMPDIR they also check that the
+/// loader's home, and the scratch directory TempHome and the fixtures use,
+/// are in it. This class extends XCTestCase directly on purpose: isolation
+/// must not depend on a base class or on which tests a `--filter` selects.
 final class TestIsolationTests: XCTestCase {
-    /// The real ~/Library. Only compared against, never read or written.
-    private var realLibrary: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library", isDirectory: true)
+    /// Where the app keeps its real files (`Paths.standard`). Only compared
+    /// against, never read or written.
+    private var realLocations: [URL] {
+        let real = Paths.standard
+        return [real.appSupport, real.logs, real.launchAgents, real.appBundle]
+    }
+
+    /// `url` is one of the real locations or sits inside one.
+    private func isInsideReal(_ url: URL) -> Bool {
+        realLocations.contains { isInside(url, $0) }
     }
 
     /// `url` is `dir` or sits inside it. `standardized` only removes `.` and
@@ -40,10 +49,10 @@ final class TestIsolationTests: XCTestCase {
         ]
     }
 
-    /// True only when nothing the app would write resolves into the real
-    /// ~/Library. Callers that would write must stop when this is false.
+    /// True only when nothing the app would write resolves into one of its
+    /// real locations. Callers that would write must stop when this is false.
     private func isIsolated(_ paths: Paths) -> Bool {
-        paths != Paths.standard && !locations(paths).contains { isInside($0, realLibrary) }
+        paths != Paths.standard && !locations(paths).contains { isInsideReal($0) }
     }
 
     private func isDirectory(_ url: URL) -> Bool {
@@ -56,7 +65,39 @@ final class TestIsolationTests: XCTestCase {
         let root = ProcessTestHome.root
         XCTAssertTrue(root.lastPathComponent.hasPrefix("insomnia-tests-process-"), root.path)
         XCTAssertTrue(isDirectory(root), "the loader's directory does not exist: \(root.path)")
-        XCTAssertFalse(isInside(root, realLibrary), root.path)
+        XCTAssertFalse(isInsideReal(root), root.path)
+    }
+
+    /// TMPDIR as the run set it. Unset or empty sends the loader to Darwin's
+    /// per-user temp directory, then /tmp, and there is nothing to compare.
+    private func runTMPDIR() throws -> URL {
+        guard let raw = getenv("TMPDIR"), raw.pointee != 0 else { throw XCTSkip("TMPDIR is unset") }
+        return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
+    }
+
+    /// `a` and `b` are the same directory: the same device and inode.
+    private func assertSameDirectory(_ a: URL, _ b: URL, file: StaticString = #filePath, line: UInt = #line) {
+        var sa = stat(), sb = stat()
+        XCTAssertEqual(stat(a.path, &sa), 0, "stat \(a.path): errno \(errno)", file: file, line: line)
+        XCTAssertEqual(stat(b.path, &sb), 0, "stat \(b.path): errno \(errno)", file: file, line: line)
+        XCTAssertEqual(sa.st_dev, sb.st_dev, "\(a.path) and \(b.path)", file: file, line: line)
+        XCTAssertEqual(sa.st_ino, sb.st_ino, "\(a.path) and \(b.path)", file: file, line: line)
+    }
+
+    func testLoaderHomeSitsInTMPDIRWhenTheRunSetsIt() throws {
+        let tmp = try runTMPDIR()
+        let parent = ProcessTestHome.root.deletingLastPathComponent()
+        // The loader joins TMPDIR and the name, so the path matches too.
+        XCTAssertEqual(parent.standardized.path, tmp.standardized.path)
+        assertSameDirectory(parent, tmp)
+    }
+
+    func testScratchDirectoryIsTMPDIRWhenTheRunSetsIt() throws {
+        let tmp = try runTMPDIR()
+        assertSameDirectory(ProcessTestHome.temporaryDirectory, tmp)
+        let home = TempHome()
+        defer { home.destroy() }
+        assertSameDirectory(home.root.deletingLastPathComponent(), tmp)
     }
 
     func testEveryResolvedPathSitsInsideTheTestHome() throws {
@@ -64,13 +105,13 @@ final class TestIsolationTests: XCTestCase {
         XCTAssertFalse(value.isEmpty, "INSOMNIA_HOME is empty")
         let home = URL(fileURLWithPath: value, isDirectory: true)
         XCTAssertTrue(isDirectory(home), "INSOMNIA_HOME does not exist: \(home.path)")
-        XCTAssertFalse(isInside(home, realLibrary), home.path)
+        XCTAssertFalse(isInsideReal(home), home.path)
 
         let resolved = Paths.fromEnvironment()
         XCTAssertNotEqual(resolved, Paths.standard)
         for url in locations(resolved) {
             XCTAssertTrue(isInside(url, home), "\(url.path) is outside INSOMNIA_HOME \(home.path)")
-            XCTAssertFalse(isInside(url, realLibrary), url.path)
+            XCTAssertFalse(isInsideReal(url), url.path)
         }
     }
 
@@ -100,7 +141,7 @@ final class TestIsolationTests: XCTestCase {
     func testTempHomeDestroyKeepsTheProcessWideHome() {
         let home = TempHome()
         XCTAssertEqual(ProcessTestHome.current, home.root.path)
-        XCTAssertFalse(isInside(home.root, realLibrary), home.root.path)
+        XCTAssertFalse(isInsideReal(home.root), home.root.path)
 
         home.destroy()
 

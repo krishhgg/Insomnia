@@ -11,6 +11,14 @@ enum EndReason: String, Sendable {
     case batteryUnreadable
     case thermalCritical
     case backstop
+    /// session.json was gone, or recorded as ended (in ended-session.json or
+    /// the journal's endedSession), while this process still held the
+    /// session: the recovery agent ended it (its log line says why: app not
+    /// running, battery below the end floor, critical heat) while the app
+    /// was stopped, hung, or not holding the alive lock, and restored from
+    /// the journal.
+    /// The app ends on its side from whatever the journal still holds.
+    case agentCutoff
     /// Reconcile found a session on disk but could not arm the recovery
     /// agent, journal, or hold sleep for it, so it ended the session instead
     /// of holding sleep with nothing to release it.
@@ -19,6 +27,17 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
+    /// config.json could not be read and could not be moved aside, or is
+    /// missing and the settings in use, whose cutoffs differ from the
+    /// agent's defaults, could not be written in its place
+    /// (`rejectedConfigFile`). backstop.sh reads its cutoffs from that file
+    /// itself, so the session would run on cutoffs the app does not enforce.
+    case settingsFileRejected
+    /// The end floor and thermal rule in use could not be recorded for the
+    /// running session in state.json (`publishSessionCutoffs`). backstop.sh
+    /// enforces that record while config.json cannot be used, so a hung
+    /// app's session would run on cutoffs the app does not enforce.
+    case cutoffsNotRecorded
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -36,8 +55,9 @@ enum EndOutcome: Sendable, Equatable {
     /// session is still active. An in-process retry is scheduled.
     case locked
     /// session.json could not be removed. Whatever the journal held was
-    /// undone, but a relaunch would find a valid session and hold sleep
-    /// again, so the end is retried in process and quit is refused.
+    /// undone and the end is recorded in ended-session.json when that write
+    /// works, so a relaunch restores instead of resuming. The removal is
+    /// retried in process and quit is refused.
     case sessionRetained
     /// state.json cannot be read. Nothing was changed: Insomnia does not
     /// know what to undo and will not guess. The session stays active until
@@ -372,9 +392,14 @@ final class SessionManager {
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
     private let appNap: any AppNapPreferencing
-    private let notifier: any Notifying
+    /// Not private: a copy that quits at launch (LaunchGate) posts through it.
+    let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
     private let clock: @Sendable () -> Date
+    /// The manager's idea of now (a fake in tests). UI decisions about the
+    /// session the manager holds, such as how much an extension may still add
+    /// under `config.maxDuration`, must use this clock, not the wall clock.
+    var now: Date { clock() }
     /// What the process table says a pid is now. Read only, to tell whether
     /// a recorded command is still running (`recordedLockHolder`).
     private let processLookup: @Sendable (Int32) -> ProcessLookup
@@ -410,6 +435,9 @@ final class SessionManager {
     /// device change, lid open, end or launch tries again.
     @ObservationIgnored private var audioRetriesLeft = SessionManager.audioRetryLimit
     static let audioRetryLimit = 10
+    /// Set once `watchOutputDevices` has registered for CoreAudio's device
+    /// changes.
+    @ObservationIgnored private var watchingOutputDevices = false
     /// Called just before Insomnia takes Low Power Mode over, before the
     /// ownership is journaled: `AppServices` samples the display brightness
     /// then, so the value journaled at a later lid close is the user's,
@@ -438,9 +466,30 @@ final class SessionManager {
     /// nil in tests. Started after a session starts, stopped when it ends.
     @ObservationIgnored var services: AppServices?
 
+    #if DEBUG
+    /// The points in a start where tests copy the files on disk, as a crash
+    /// there would leave them, or change them: once the lock file's bytes
+    /// are read, before it is settled, and after each write. Debug builds
+    /// only; nothing sets it otherwise.
+    enum StartStep { case lockFileRead, sessionWritten, journalWritten }
+    @ObservationIgnored var onStartStepForTesting: ((StartStep) -> Void)?
+    #endif
+
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
+    @ObservationIgnored private var checkingAgentEnd = false
+    /// The tick's last read of the logs for an end record, with what it
+    /// read them at (`logRecordsSessionEnd`).
+    @ObservationIgnored private var lastLogEndRecordRead: (fingerprint: String, found: Bool)?
+    /// The tick's next look for the agent's end after a transaction for it
+    /// was refused: the recovery lock was held, state.json did not decode,
+    /// or an unfinished command held the lock. backstop.sh removes
+    /// session.json before its undo, so an undo command that hangs keeps
+    /// the lock past the end, and a journal stays unreadable until a person
+    /// repairs it. The tick then asks again after `recoveryRetryDelay`, not
+    /// on every second with a new lock wait and log line each time.
+    @ObservationIgnored private var agentEndRetryAt = Date.distantPast
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -530,6 +579,48 @@ final class SessionManager {
         case notASession
     }
 
+    /// What init found wrong with config.json, posted by the first
+    /// reconcile: init runs before the app has finished launching, and a
+    /// second copy that never takes the alive lock never reconciles.
+    @ObservationIgnored private var configNotice: String?
+    /// Why no session may run, set by every transaction while config.json
+    /// is there, the app rejects it, and it could not be moved aside, or
+    /// while it is missing and the settings in use cannot be written there
+    /// (`publishConfig`). backstop.sh reads the cutoffs from that file
+    /// through the app's decoder, and while it is missing or rejected, from
+    /// the journal's record for the session (`RuntimeState.sessionCutoffs`)
+    /// or else its own defaults. Sessions stay refused until the file holds
+    /// the settings in use, so no session rests on that record alone. Nil
+    /// once the file reads again or the settings in use are written where
+    /// it was.
+    @ObservationIgnored private(set) var rejectedConfigFile: String?
+    /// config.json was rejected and the settings in use are not yet written
+    /// in its place. Set when the file is moved aside, and also when it
+    /// cannot be: a person who then deletes it, as the refusal suggests,
+    /// would otherwise leave config.json missing, and the agent on the
+    /// journal's record or its defaults, while the app runs on its own
+    /// settings. Every transaction that finds no file tries the write
+    /// again.
+    @ObservationIgnored private var configWriteOwed = false
+    /// Why the last change Settings made to the end floor or the thermal
+    /// rules did not take effect: config.json could not be written
+    /// (`updateConfig`). Settings shows it under those controls. Nil once a
+    /// change is saved.
+    private(set) var configSaveError: String?
+    /// The last failure to write the settings in use where config.json is
+    /// missing, when the agent's defaults are the app's cutoffs and nothing
+    /// is refused; kept so each transaction does not log it again.
+    @ObservationIgnored private var configPublishFailure: String?
+    @ObservationIgnored private var checkingConfigFile = false
+    /// The tick's next look at config.json after a transaction left it
+    /// missing, unreadable or carrying other cutoffs (a write that failed,
+    /// a busy lock): `recoveryRetryDelay` later, not every second.
+    @ObservationIgnored private var configCheckRetryAt = Date.distantPast
+    /// Run by `updateConfig` after config.json refused a cutoff change and
+    /// before the journal's record of the old cutoffs is put back.
+    /// Injection point for tests that make that write fail.
+    @ObservationIgnored var beforeRecordedCutoffsPutBack: (() -> Void)?
+
     init(
         paths: Paths,
         sleepGuard: any SleepGuarding,
@@ -587,7 +678,28 @@ final class SessionManager {
         self.state = loadedState ?? .clean
         self.lowPowerWasOurs = loadedState.map { $0.lowPowerSetByUs && !$0.lowPowerClaimFromEarlierBoot(boot: bootSession) } ?? false
         self.lastError = loadError
-        if var c = (try? store.loadConfig()) ?? nil {
+        var loadedConfig: Config?
+        do {
+            loadedConfig = try store.loadConfig()
+        } catch {
+            // The file is the user's settings with something this build
+            // cannot decode (a hand edit's typo or wrong type), or it could
+            // not be read at all. Defaults written over it would lose those
+            // settings for good, so it is renamed aside first, and when the
+            // rename fails nothing is written over it.
+            var detail = error.localizedDescription
+            if case let StoreError.unreadable(_, brief) = error { detail = brief }
+            do {
+                let moved = try store.moveAsideUnreadableConfig(now: clock())
+                Log.error("config.json could not be read (\(detail)); moved to \(moved.path); using default settings")
+                configNotice = "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia is using default settings. To get yours back, quit Insomnia, fix that file and rename it to config.json."
+            } catch let moveError {
+                Log.error("config.json could not be read (\(detail)) or moved aside (\(moveError.localizedDescription)); left in place; using default settings")
+                configNotice = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
+                    + " Meanwhile Insomnia uses default settings and left the file as it is."
+            }
+        }
+        if var c = loadedConfig {
             // Settings keeps the end floor below the Low Power Mode floor; a
             // hand-edited config.json may not. Fix it here and write it back.
             var corrections = c.normalizeFloors().map { [$0] } ?? []
@@ -610,13 +722,33 @@ final class SessionManager {
                 }
             }
             self.config = c
+            // An older build's file was just read with its stock values
+            // migrated. Writing it back once marks it current, so a ceiling
+            // typed into it later is read as the user's.
+            if (try? store.configHasVersion()) == false { try? store.saveConfig(c) }
             self.pendingLidCloseNotice = lidClose
         } else {
             // A fresh install: the defaults already are the update, and
             // `Config()` carries its mark, so there is nothing to announce.
+            // Not written here: init runs before LaunchGate, and a second
+            // copy that the gate refuses would write its defaults over a
+            // config.json the running copy has yet to write back. The first
+            // transaction after the gate writes the settings in use
+            // (`checkConfigFile`); until then the agent's defaults are
+            // these.
             self.config = Config()
-            try? store.saveConfig(self.config)
         }
+    }
+
+    /// Registers for CoreAudio's device changes, so an output device still
+    /// muted from a lid close gets its volume back when it reconnects
+    /// (`outputDevicesChanged`). LaunchGate calls it once this process holds
+    /// the alive lock, not init: a second copy of the app waiting at the
+    /// gate, or refused there, must not restore a device the copy that owns
+    /// the session muted. Registers once; later calls do nothing.
+    func watchOutputDevices() {
+        guard !watchingOutputDevices else { return }
+        watchingOutputDevices = true
         do {
             try audio.onDevicesChanged { [weak self] in
                 Task { @MainActor in await self?.outputDevicesChanged() }
@@ -686,12 +818,15 @@ final class SessionManager {
     /// `op` is not run at all when the lock cannot be taken within the
     /// bound or when state.json does not decode: nothing is read, decided
     /// or changed unlocked, and an unreadable journal is never overwritten.
+    /// With `syncSession` (every caller but `end`, which does this work
+    /// itself) a session the recovery agent has ended meanwhile is ended
+    /// here first, so `op` never acts on a session that is over on disk.
     /// Never blocks the main actor; the wait is polled.
     ///
     /// Refused while an unfinished command runs, `deferred` is recorded in
     /// the refusal itself, before the caller resumes: the command can exit
     /// and its holder settle in between, and must find the work then.
-    private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
+    private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, syncSession: Bool = true, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
@@ -738,9 +873,25 @@ final class SessionManager {
             self.writeOwedEdits()
             self.settleDisplayAfterUnreadOff()
             let before = self.unfinishedCommand
-            // Every `sudo pmset` `op` runs is handed this lock
-            // (`PmsetSleepGuard`) and holds it until it exits.
-            let result = await RecoveryLock.$held.withValue(handle) { await op() }
+            // Every `sudo pmset` this transaction runs, in an end below or
+            // in `op`, is handed this lock (`PmsetSleepGuard`) and holds it
+            // until it exits.
+            let result: Result<T, TransactionRefusal> = await RecoveryLock.$held.withValue(handle) {
+                if syncSession { await self.adoptAgentEnd() }
+                self.checkConfigFile()
+                if syncSession {
+                    await self.endIfConfigFileRejected()
+                    await self.publishSessionCutoffs()
+                }
+                // An end above that stopped at a sudo pmset left running
+                // ends the transaction there (`stopTransaction`): `op` must
+                // not change anything beside that command. The end is
+                // retried when it exits.
+                if let stuck = self.unfinishedCommand, stuck !== before {
+                    return .failure(.commandRunning(pid: stuck.pid))
+                }
+                return .success(await op())
+            }
             if let stuck = self.unfinishedCommand, stuck !== before {
                 // A sudo pmset this transaction ran did not stop on SIGTERM.
                 // The lock goes with it, not with the transaction: the
@@ -753,10 +904,356 @@ final class SessionManager {
                 lockHandedOver = true
                 self.holdLock(handle, until: stuck)
             }
-            return .success(result)
+            return result
         }
         lifecycleTail = Task { _ = await task.value }
         return await task.value
+    }
+
+    /// Disk decides whether a session exists. session.json gone while this
+    /// process still holds a session means backstop.sh ended it (its log
+    /// line says why) while this process could not act: stopped, hung, or
+    /// without the alive lock. So does a session.json the agent recorded as
+    /// ended because it could not remove the file, in ended-session.json,
+    /// in the journal's endedSession, in a record aside
+    /// (ended-session.json.<8 letters or digits>), in the recovery lock
+    /// file (`Store.sessionEndRecordedInLock`), or in insomnia.log or
+    /// insomnia.log.1 (`Store.sessionEndRecordedInLog`). The agent has restored
+    /// what it could; the end here runs from the journal just read under the
+    /// lock, so anything it left is retried, and observers, timers and the
+    /// countdown stop. An unreadable session.json is not a vanished one and
+    /// is left alone.
+    private func adoptAgentEnd() async {
+        guard let s = session else { return }
+        let onDisk: Session?
+        do {
+            onDisk = try store.loadSession()
+        } catch {
+            return
+        }
+        if onDisk == nil {
+            Log.error("session.json is gone while the session until \(iso(s.endsAt)) was active: the recovery agent ended it (its log line says why); ending here from the journal")
+        } else if store.sessionEndIsRecorded() {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in ended-session.json: the recovery agent ended it but could not remove session.json (its log line says why); ending here from the journal")
+        } else if store.sessionEndIsJournaled(in: state) {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in state.json (endedSession): the recovery agent ended it but could not remove session.json or write ended-session.json (its log line says why); ending here from the journal")
+        } else if let record = store.sessionEndRecordAside() {
+            Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(record.lastPathComponent): the recovery agent ended it but could not remove session.json or write ended-session.json or state.json (its log line says why); ending here from the journal")
+        } else if let (place, inLog) = store.sessionEndRecordedInLockOrLog() {
+            if inLog {
+                Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(place): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json, a new file or the recovery lock file (its log line says why); ending here from the journal")
+            } else {
+                Log.error("the session until \(iso(s.endsAt)) is recorded as ended in \(place): the recovery agent ended it but could not remove session.json or write ended-session.json, state.json or a new file (its log line says why); ending here from the journal")
+            }
+        } else {
+            return
+        }
+        endTicket += 1
+        _ = await performEnd(reason: .agentCutoff)
+    }
+
+    /// The rules for config.json, applied in every transaction, because
+    /// backstop.sh reads the file's endFloor and thermalRules on every run
+    /// and enforces them itself. Both sides must enforce the same cutoffs
+    /// before a session starts, resumes or goes on:
+    /// - A file that decodes is what the agent enforces, so its end floor
+    ///   and thermal rule are taken into the settings in use when they
+    ///   differ (a hand edit, a repair after a rejection); every other
+    ///   setting stays as it is (`adoptConfigFileCutoffs`).
+    /// - A missing file (deleted, moved aside below, or never written) gets
+    ///   the settings in use written in its place (`publishConfig`).
+    /// - A file the app rejects is moved aside and replaced the same way.
+    ///   When the rename fails, `rejectedConfigFile` says why and no
+    ///   session runs.
+    private func checkConfigFile() {
+        let detail: String
+        do {
+            guard let onDisk = try store.loadConfig() else {
+                publishConfig()
+                return
+            }
+            if onDisk.agentCutoffs != config.agentCutoffs { adoptConfigFileCutoffs(onDisk) }
+            if rejectedConfigFile != nil { Log.info("config.json reads again; sessions can start") }
+            rejectedConfigFile = nil
+            configWriteOwed = false
+            configPublishFailure = nil
+            return
+        } catch let StoreError.unreadable(_, brief) {
+            detail = brief
+        } catch {
+            detail = error.localizedDescription
+        }
+        do {
+            let moved = try store.moveAsideUnreadableConfig(now: clock())
+            Log.error("config.json could not be read (\(detail)); moved to \(moved.path)")
+            configWriteOwed = true
+            publishConfig()
+            if let why = rejectedConfigFile {
+                notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)) and was moved to \(moved.path). \(why)")
+            } else {
+                notifier.post(title: Self.configFileTitle, body: "config.json could not be read (\(detail)). It was moved to \(moved.path), and Insomnia wrote the settings it is using back to config.json.")
+            }
+        } catch let moveError {
+            let why = Self.rejectedConfigMessage(paths.configFile.path, detail: detail, moveError: moveError.localizedDescription)
+            if rejectedConfigFile != why { Log.error(why) }
+            rejectedConfigFile = why
+            configWriteOwed = true
+        }
+    }
+
+    /// Takes the end floor and thermal rule of a config.json that decodes,
+    /// which the agent enforces, into the settings in use. The Low Power
+    /// Mode floor is raised above the new end floor if needed
+    /// (`normalizeFloors`); nothing else changes, and the file is not
+    /// rewritten. The floors run again so the change applies now.
+    private func adoptConfigFileCutoffs(_ onDisk: Config) {
+        let before = config.agentCutoffs
+        var c = config
+        c.endFloor = onDisk.endFloor
+        c.thermalRules = onDisk.thermalRules
+        let corrected = c.normalizeFloors()
+        config = c
+        Log.info("config.json has \(c.agentCutoffs.description), the app had \(before.description): the recovery agent enforces the file, so the app does too" + (corrected.map { "; \($0)" } ?? ""))
+        services?.reevaluateFloors()
+    }
+
+    /// Writes the settings in use where config.json is missing. While it is
+    /// missing the agent enforces the cutoffs the journal records for the
+    /// session (`RuntimeState.sessionCutoffs`), or its own defaults
+    /// (`agentDefaultCutoffs`) when it records none. A write that fails
+    /// stops sessions (`rejectedConfigFile`) when the app's cutoffs differ
+    /// from those defaults, or when the file was rejected
+    /// (`configWriteOwed`): the settings the app fell back to are not in
+    /// config.json. Otherwise both enforce the same cutoffs, and the next
+    /// transaction writes again.
+    private func publishConfig() {
+        do {
+            try store.saveConfig(config)
+            Log.info("the settings in use were written to config.json" + (rejectedConfigFile != nil ? "; sessions can start" : ""))
+            configWriteOwed = false
+            rejectedConfigFile = nil
+            configPublishFailure = nil
+        } catch {
+            let detail = error.localizedDescription
+            guard configWriteOwed || config.agentCutoffs != Config.agentDefaultCutoffs else {
+                if rejectedConfigFile != nil { Log.info("config.json is missing and the recovery agent's defaults are the app's cutoffs; sessions can start") }
+                rejectedConfigFile = nil
+                if configPublishFailure != detail {
+                    Log.error("could not write the settings in use to the missing config.json (\(detail)); the recovery agent enforces the cutoffs recorded for a session in state.json, else its defaults, and both are the app's \(config.agentCutoffs.description)")
+                }
+                configPublishFailure = detail
+                return
+            }
+            let why = "Insomnia could not write the settings it uses to config.json. The recovery agent reads its end floor and thermal rules from that file, so Insomnia runs no session until the file is written. Free some disk space or make \(paths.appSupport.path) writable."
+            if rejectedConfigFile != why { Log.error("\(why) (\(detail))") }
+            rejectedConfigFile = why
+        }
+    }
+
+    /// Settings' way to change the settings. A change to the end floor or
+    /// the thermal rule (`Config.agentCutoffs`) is written to config.json
+    /// first and takes effect only once that write succeeds: the agent
+    /// reads the file, so a cutoff only the app knew would let the agent
+    /// keep a session the app ends, or end one the app keeps. While a
+    /// session exists (in this process or as session.json) the new cutoffs
+    /// are recorded for it in the journal before that, under the recovery
+    /// lock taken without waiting (`recordSessionCutoffs`), since the agent
+    /// enforces the record while config.json cannot be used; the lock is
+    /// held until config.json is written. A busy lock, an unreadable
+    /// journal or a write that fails leaves both on the old cutoffs (a
+    /// journal record already written is put back), says so in
+    /// `configSaveError`, and returns false. When the record cannot be put
+    /// back either, the journal holds cutoffs config.json does not, so the
+    /// session ends: on disk before the lock is released
+    /// (`endSessionOnDisk`), then in process. Any other change takes effect
+    /// at once and is written behind it; a write that fails is logged, and
+    /// the next save writes it.
+    @discardableResult
+    func updateConfig(_ change: (inout Config) -> Void) -> Bool {
+        var c = config
+        change(&c)
+        guard c != config else { return true }
+        let cutoffsChange = c.agentCutoffs != config.agentCutoffs
+        var recorded: (lock: RecoveryLockHandle, before: AgentCutoffs?)?
+        defer { recorded?.lock.release() }
+        if cutoffsChange, session != nil || store.sessionEntryExists() {
+            do {
+                recorded = try recordSessionCutoffs(c.agentCutoffs)
+            } catch {
+                let line = "Could not record the change for the session in state.json (\(error.localizedDescription)). The recovery agent enforces the end floor and thermal rules recorded there when it cannot use config.json, so both stay at \(config.agentCutoffs.description)."
+                Log.error("settings: \(c.agentCutoffs.description) not applied: \(line)")
+                configSaveError = line
+                return false
+            }
+        }
+        do {
+            try store.saveConfig(c)
+        } catch {
+            let detail = error.localizedDescription
+            guard cutoffsChange else {
+                Log.error("could not save config: \(detail)")
+                config = c
+                return false
+            }
+            if let recorded {
+                beforeRecordedCutoffsPutBack?()
+                do {
+                    try journal { $0.sessionCutoffs = recorded.before }
+                } catch {
+                    // The journal records cutoffs config.json does not
+                    // carry, and the agent enforces that record whenever it
+                    // cannot use config.json. The session ends on disk here,
+                    // under the lock the record was written under, so no
+                    // agent run or relaunch reads it as live; the undo
+                    // follows in its own transaction.
+                    let putBack = error.localizedDescription
+                    Log.error("settings: could not put the session's recorded \(recorded.before?.description ?? "absence of cutoffs") back in state.json (\(putBack)); ending the session")
+                    let retained = RecoveryLock.$held.withValue(recorded.lock) { endSessionOnDisk() }
+                    endTicket += 1
+                    pendingEnd = .cutoffsNotRecorded
+                    Task { @MainActor [weak self] in _ = await self?.end(reason: .cutoffsNotRecorded) }
+                    let line = "Could not save the change to config.json (\(detail)), or put back the end floor and thermal rules recorded for the session in state.json (\(putBack)). The recovery agent reads them from those files, so Insomnia ended the session" + (retained.map { ": \($0)" } ?? ".") + " The settings stay at \(config.agentCutoffs.description)."
+                    Log.error("settings: \(c.agentCutoffs.description) not applied: \(line)")
+                    configSaveError = line
+                    return false
+                }
+            }
+            let line = "Could not save the change to config.json (\(detail)). The recovery agent reads the end floor and thermal rules from that file, so both stay at \(config.agentCutoffs.description)."
+            Log.error("settings: \(c.agentCutoffs.description) not applied: \(line)")
+            configSaveError = line
+            return false
+        }
+        config = c
+        configSaveError = nil
+        if cutoffsChange { services?.reevaluateFloors() }
+        return true
+    }
+
+    private struct SessionCutoffsNotRecorded: LocalizedError {
+        let errorDescription: String?
+    }
+
+    /// Takes the recovery lock without waiting and records `cutoffs` for
+    /// the session in the journal read under it. Returns the lock, for the
+    /// caller to release once config.json is written, and the cutoffs the
+    /// journal recorded before. Throws, with nothing changed and the lock
+    /// released, when the lock is busy (an agent run or a transaction), the
+    /// journal cannot be read, or the write fails.
+    private func recordSessionCutoffs(_ cutoffs: AgentCutoffs) throws -> (lock: RecoveryLockHandle, before: AgentCutoffs?) {
+        guard let lock = try recoveryLock.tryAcquire() else {
+            throw SessionCutoffsNotRecorded(errorDescription: "the recovery lock is busy; try again in a moment")
+        }
+        do {
+            try loadJournal()
+            let before = state.sessionCutoffs
+            try journal { $0.sessionCutoffs = cutoffs }
+            return (lock, before)
+        } catch {
+            lock.release()
+            throw error
+        }
+    }
+
+    /// A session still running while config.json is rejected in place, or
+    /// while its replacement is owed, ends through the normal path, as any
+    /// other cutoff does.
+    private func endIfConfigFileRejected() async {
+        guard session != nil, let why = rejectedConfigFile else { return }
+        Log.error("ending the session: \(why)")
+        endTicket += 1
+        _ = await performEnd(reason: .settingsFileRejected)
+    }
+
+    /// Records the cutoffs in use for the running session in the journal
+    /// (`RuntimeState.sessionCutoffs`) when it holds others or none: after
+    /// `checkConfigFile` took a hand edit, or after a write that failed.
+    /// backstop.sh enforces that record while config.json is missing,
+    /// cannot be read or is rejected, so a hung app's session keeps the
+    /// cutoffs the app enforced last. A session whose cutoffs cannot be
+    /// recorded ends through the normal path, as one whose config.json is
+    /// rejected does.
+    private func publishSessionCutoffs() async {
+        guard session != nil, state.sessionCutoffs != config.agentCutoffs else { return }
+        do {
+            try journal { $0.sessionCutoffs = config.agentCutoffs }
+        } catch {
+            Log.error("ending the session: could not record its \(config.agentCutoffs.description) in state.json (\(error.localizedDescription)); the recovery agent enforces the cutoffs recorded there while config.json cannot be used")
+            endTicket += 1
+            _ = await performEnd(reason: .cutoffsNotRecorded)
+        }
+    }
+
+    private static func rejectedConfigMessage(_ path: String, detail: String, moveError: String) -> String {
+        "config.json could not be read (\(detail)) or moved aside (\(moveError)). The recovery agent reads its end floor and thermal rules from that file itself, so Insomnia runs no session until the file is fixed. Make \(path) writable or delete it."
+    }
+
+    /// The 1 Hz tick's look for a session the agent ended while the lid was
+    /// open and nothing else transacted: a cheap look first (session.json
+    /// gone, or recorded as ended in ended-session.json, the journal, a
+    /// record aside on disk, the recovery lock file or the log; a record
+    /// aside lists the folder, and the logs are read again only once they
+    /// or session.json changed), then the decision
+    /// and the end under the lock (`adoptAgentEnd`). Internal so tests can
+    /// run one tick at a time.
+    func noticeAgentEnd() async {
+        guard session != nil, !checkingAgentEnd, now >= agentEndRetryAt,
+              !FileManager.default.fileExists(atPath: paths.sessionFile.path) || store.sessionEndIsRecorded()
+                || ((try? store.loadState()).map { store.sessionEndIsJournaled(in: $0) } ?? false)
+                || store.sessionEndRecordAside() != nil || store.sessionEndRecordedInLock() != nil
+                || logRecordsSessionEnd()
+        else { return }
+        checkingAgentEnd = true
+        defer { checkingAgentEnd = false }
+        let result = await exclusive("agent end") {}
+        if case .failure = result {
+            agentEndRetryAt = now.addingTimeInterval(recoveryRetryDelay)
+        }
+    }
+
+    /// The tick's look at the logs for the end of the session: read again
+    /// only when session.json or a log changed since the last read
+    /// (`Store.logEndRecordFingerprint`).
+    private func logRecordsSessionEnd() -> Bool {
+        let fingerprint = store.logEndRecordFingerprint()
+        if let last = lastLogEndRecordRead, last.fingerprint == fingerprint { return last.found }
+        let found = store.sessionEndRecordedInLog() != nil
+        lastLogEndRecordRead = (fingerprint, found)
+        return found
+    }
+
+    /// The 1 Hz tick's look at config.json while a session runs: a file that
+    /// is missing, does not decode, or carries another end floor or thermal
+    /// rule than the app (a hand edit, a deletion), or a journal that
+    /// records other cutoffs for the session than the app's, goes through a
+    /// transaction (`checkConfigFile`, `publishSessionCutoffs`), so the app
+    /// and the agent agree within a second, not at the next Start, lid
+    /// event or extend. A file still in that state after the transaction (a
+    /// write that failed, a busy lock) is looked at again after
+    /// `recoveryRetryDelay`. Internal so tests can run one tick at a time.
+    func noticeConfigFileChange() async {
+        guard session != nil, !checkingConfigFile, now >= configCheckRetryAt, configFileDiffers() else { return }
+        checkingConfigFile = true
+        defer { checkingConfigFile = false }
+        _ = await exclusive("settings check") {}
+        if configFileDiffers() {
+            configCheckRetryAt = now.addingTimeInterval(recoveryRetryDelay)
+        }
+    }
+
+    /// config.json is missing, does not decode, or has other cutoffs than
+    /// the settings in use, or state.json records others for the session
+    /// (missing counts; one that cannot be read is left to the transaction
+    /// that reads it, which refuses).
+    private func configFileDiffers() -> Bool {
+        guard let onDisk = try? store.loadConfig() else { return true }
+        if onDisk.agentCutoffs != config.agentCutoffs { return true }
+        let journal: RuntimeState?
+        do {
+            journal = try store.loadState()
+        } catch {
+            return false
+        }
+        return journal?.sessionCutoffs != config.agentCutoffs
     }
 
     /// Disk is the source of truth. Missing means clean; anything that does
@@ -1191,6 +1688,11 @@ final class SessionManager {
             Log.info("start abandoned: an end was requested first")
             return
         }
+        if let why = rejectedConfigFile {
+            fail("start refused, nothing changed: \(why)")
+            notifier.post(title: Self.configFileTitle, body: "Insomnia did not start a session. \(why)")
+            return
+        }
         let now = clock()
         let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A
@@ -1208,14 +1710,64 @@ final class SessionManager {
             fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Remove it or move it out of \(paths.appSupport.path), then start again")
             return
         }
+        // A rollback puts back the session.json this start replaces byte for
+        // byte, since every record of its end matches exact bytes, and with
+        // it the recovery lock file, which may hold such a record
+        // (`Store.recordSessionEndInLock`). Both must be read whole. With no
+        // session.json the lock file ends nothing: its bytes are put back
+        // when they can be read, and a file that cannot be read is emptied
+        // and stays empty.
+        var sessionBytesBefore: Data?
+        var lockBefore = store.lockContents()
+        if sessionBefore != nil {
+            guard let bytes = try? store.readData(from: paths.sessionFile) else {
+                fail("start refused, nothing changed: session.json could not be read again")
+                return
+            }
+            guard let lock = lockBefore else {
+                fail("start refused, nothing changed: \(paths.recoveryLock.path) could not be read whole, and it may record the end of the session.json in place")
+                return
+            }
+            sessionBytesBefore = bytes
+            lockBefore = lock
+        }
 
+        #if DEBUG
+        onStartStepForTesting?(.lockFileRead)
+        #endif
         do {
+            // Before the new session.json exists, the lock file is left
+            // holding nothing that could count as its end: a stale record's
+            // first bytes are also the first bytes of the new session's
+            // record. What records the end of the session.json being
+            // replaced stays, whole, until that file is gone
+            // (`Store.settleLockForStart`).
+            guard store.settleLockForStart(replacing: sessionBytesBefore) else {
+                throw StoreError.lockRecordNotCleared(file: paths.recoveryLock.path)
+            }
             try store.saveSession(new)
             keptSessionFile = nil
-            try journal { $0.sleepDisabledByUs = true }
+            #if DEBUG
+            onStartStepForTesting?(.sessionWritten)
+            #endif
+            // The cutoffs the agent enforces for this session when it
+            // cannot use config.json (`RuntimeState.sessionCutoffs`), in
+            // the journal before anything runs for the session. A recorded
+            // end of an earlier session.json goes in the same write, only
+            // after the file it ends is replaced: a crash before it then
+            // leaves that earlier file ended, and a new file with the same
+            // bytes would read as ended, the safe side.
+            try journal {
+                $0.endedSession = nil
+                $0.sleepDisabledByUs = true
+                $0.sessionCutoffs = config.agentCutoffs
+            }
+            #if DEBUG
+            onStartStepForTesting?(.journalWritten)
+            #endif
         } catch {
             fail("could not write session: \(error.localizedDescription)")
-            rollBackStart(journal: journalBefore, session: sessionBefore)
+            rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
             return
         }
 
@@ -1224,13 +1776,22 @@ final class SessionManager {
         do {
             try await backstop.arm()
         } catch {
-            rollBackStart(journal: journalBefore, session: sessionBefore)
+            rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
             fail("could not arm backstop: \(error.localizedDescription)")
             return
         }
         guard endTicket == ticket else {
-            rollBackStart(journal: journalBefore, session: sessionBefore)
+            rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
             Log.info("start abandoned before disabling sleep: end requested meanwhile")
+            return
+        }
+        // The record of the replaced session.json's end goes last, once
+        // nothing left can roll this start back: it ends no other file, so
+        // until now a rollback only had to cut the file back to the bytes
+        // it held, never write them again.
+        guard store.clearLockEndRecord() else {
+            rollBackStart(journal: journalBefore, session: sessionBytesBefore, lock: lockBefore)
+            fail("could not write session: \(StoreError.lockRecordNotCleared(file: paths.recoveryLock.path).localizedDescription)")
             return
         }
 
@@ -1308,7 +1869,8 @@ final class SessionManager {
     /// Requesting an end invalidates every start, extend or Low Power change
     /// still queued or in flight. If the recovery lock cannot be taken the
     /// end changes nothing and is retried in process. If the journal cannot
-    /// be read the end changes nothing and waits for a person.
+    /// be read the end changes nothing and is retried too, until a person
+    /// repairs the file or the agent ends the session.
     @discardableResult
     func end(reason: EndReason) async -> EndOutcome {
         endTicket += 1
@@ -1316,31 +1878,30 @@ final class SessionManager {
         retryTimer?.invalidate()
         retryTimer = nil
         let outcome: EndOutcome
-        switch await exclusive("end", owes: .end(reason), { await self.performEnd(reason: reason) }) {
+        switch await exclusive("end", owes: .end(reason), syncSession: false, { await self.performEnd(reason: reason) }) {
         case let .success(o): outcome = o
         case .failure(.lockBusy): outcome = .locked
         case .failure(.journalUnreadable): outcome = .journalUnreadable
         case let .failure(.commandRunning(pid)): outcome = .privilegedCommandRunning(pid: pid)
         }
         switch outcome {
-        case .restored, .incomplete(agentArmed: true):
-            pendingEnd = nil
+        case .restored, .incomplete, .sessionRetained:
+            // performEnd settled the pending end or scheduled its retry.
+            break
         case .locked:
             notifier.post(
                 title: Self.notEndedTitle,
                 body: "The recovery lock is held by another process, so nothing was changed. The session is still active; Insomnia retries in \(Int(recoveryRetryDelay)) s."
             )
             scheduleEndRetry(reason)
-        case .incomplete(agentArmed: false), .sessionRetained:
-            scheduleEndRetry(reason)
         case .journalUnreadable:
-            // No timer: a broken file does not heal by itself. The end stays
-            // pending, so new starts are refused and quit is deferred, until
-            // the next end request finds a readable journal.
-            pendingEnd = reason
-            quitRequested = false
+            // The end stays pending, so new starts are refused and quit is
+            // deferred. The retry ends the session once a person repairs the
+            // file; if the agent ends it first, the tick adopts that end. The
+            // notification goes out once per error, so a retry only logs.
+            scheduleEndRetry(reason)
         case .privilegedCommandRunning:
-            // No timer either: the task holding the lock for the command
+            // No timer: the task holding the lock for the command
             // retries the end the moment it exits. Nothing is recorded
             // here: the refusal or the stopped end recorded `pendingEnd`
             // before that task could run, and it may already have run and
@@ -1370,17 +1931,7 @@ final class SessionManager {
         countdownText = ""
         // Why session.json is still in place when a relaunch could act on
         // it; the end is then retried and quit refused.
-        var retainedBecause: String?
-        if let kept = keptSessionFile {
-            retainedBecause = retryMovingAsideKeptSessionFile(kept)
-        } else {
-            do {
-                try store.deleteSession()
-            } catch {
-                retainedBecause = "session.json could not be removed (\(error.localizedDescription)); a relaunch would hold sleep again for it."
-                fail("could not remove session.json: \(error.localizedDescription)")
-            }
-        }
+        let retainedBecause = endSessionOnDisk()
         let stuck = await restoreAll()
         services?.stop()
 
@@ -1480,11 +2031,51 @@ final class SessionManager {
             // Reconcile and a failed start reach here without `end()`; the
             // retry is scheduled here so they are covered too (rescheduling
             // from `end()` is harmless).
-            if !agentCanFinish { scheduleEndRetry(reason) }
+            if agentCanFinish { settlePendingEnd() } else { scheduleEndRetry(reason) }
             return .incomplete(agentArmed: agentCanFinish)
         }
         notifier.post(title: Self.endTitle(reason, had: had), body: endBody(reason, waiting: waiting))
+        settlePendingEnd()
         return .restored
+    }
+
+    /// The end decided on disk, under the lock the caller holds, before
+    /// anything is undone: session.json removed (moved aside when it was
+    /// kept unread), or, when it cannot be removed, recorded as ended in
+    /// ended-session.json, else the journal, else a record aside, else the
+    /// recovery lock file, else a line in insomnia.log, so it does not read
+    /// as a live session to the next launch or to backstop.sh. Returns why
+    /// session.json is still in place when a relaunch could act on it, or
+    /// nil.
+    private func endSessionOnDisk() -> String? {
+        if let kept = keptSessionFile {
+            return retryMovingAsideKeptSessionFile(kept)
+        }
+        do {
+            try store.deleteSession()
+            dropJournaledSessionEnd()
+            return nil
+        } catch {
+            let recordedIn: String? = store.recordSessionEnd() ? "ended-session.json"
+                : journalSessionEnd() ? "state.json"
+                : store.recordSessionEndAside()?.lastPathComponent
+                    ?? (store.recordSessionEndInLock() ? "the recovery lock file \(paths.recoveryLock.lastPathComponent)"
+                        : store.recordSessionEndInLog() ? "the log file \(paths.logFile.lastPathComponent)" : nil)
+            let relaunch = recordedIn != nil
+                ? "its end is recorded, so a relaunch will not resume it"
+                : "a relaunch does not resume it while the file cannot be replaced, but once it and state.json take writes again, one while sleep is still disabled could hold sleep again for it"
+            fail("could not remove session.json: \(error.localizedDescription)" + (recordedIn.map { "; its end is recorded in \($0)" } ?? "; its end could not be recorded either"))
+            return "session.json could not be removed (\(error.localizedDescription)); \(relaunch)."
+        }
+    }
+
+    /// An end that finished, or left the rest to an armed agent, resolves
+    /// any end still pending, whichever path ran it: `end()`, the adoption
+    /// of an end the agent made, or reconcile. Its retry timer is obsolete.
+    private func settlePendingEnd() {
+        pendingEnd = nil
+        retryTimer?.invalidate()
+        retryTimer = nil
     }
 
     /// What an end checks before it reports a restore. A brightness kept
@@ -2496,6 +3087,10 @@ final class SessionManager {
     /// makes active first (`earlierCommandCheckOwed`).
     func reconcile() async {
         announceLidCloseUpdate()
+        if let configNotice {
+            self.configNotice = nil
+            notifier.post(title: Self.configFileTitle, body: configNotice)
+        }
         reconcileRetry?.cancel()
         reconcileRetry = nil
         await reconcile(ticket: endTicket, isRetry: false)
@@ -2610,11 +3205,54 @@ final class SessionManager {
             onDisk = nil
         }
 
-        if let s = onDisk, !s.isExpired(at: now) {
+        // A session ended earlier whose session.json could not be removed
+        // (ended-session.json, the journal's endedSession, a record aside,
+        // the recovery lock file or a line in insomnia.log or
+        // insomnia.log.1 holds its bytes, or the lock file cannot be read
+        // whole in three tries) is over, deadline or not, whatever pmset
+        // reads now. A record in the log is named before a lock file that
+        // cannot be read, which only may hold the end. Other content in the
+        // lock file ends nothing (`Store.LockEndRecord.foreign`).
+        let endRecordedIn: String? = onDisk == nil ? nil
+            : store.sessionEndIsRecorded() ? "ended-session.json"
+            : store.sessionEndIsJournaled(in: state) ? "state.json"
+            : store.sessionEndRecordAside()?.lastPathComponent ?? store.sessionEndRecordedInLockOrLog()?.place
+        let endedEarlier = endRecordedIn != nil
+
+        // A valid session is not resumed while config.json is rejected in
+        // place: the agent would enforce the file's cutoffs, not the app's.
+        let resumable = onDisk.map { !$0.isExpired(at: now) && !endedEarlier } ?? false
+
+        if let s = onDisk, resumable, rejectedConfigFile == nil {
             // Step 2: valid session. Arm first, then journal, then hold
             // sleep. Any failure ends the session rather than holding sleep
             // with nothing guaranteed to release it.
             session = s
+            // A disable the journal records must still be in effect. Only an
+            // end undoes it, and nothing outside this transaction can run one
+            // now (the recovery lock), so a bit that reads 0 was set back
+            // while no Insomnia ran: by an agent end that could neither
+            // remove session.json nor record the end anywhere (it restores
+            // sleep and keeps the entry), by hand, or never set by a start
+            // that died before its pmset. Holding sleep again would revive a
+            // session that was ended, so it ends here, and the end is
+            // recorded wherever it can be now. A read that fails cannot
+            // confirm the hold, so it ends the session too.
+            if state.sleepDisabledByUs {
+                let held: Bool
+                do {
+                    held = try await sleepGuard.isSleepDisabled()
+                } catch {
+                    fail("could not read SleepDisabled for the session on disk: \(error.localizedDescription); ending it")
+                    _ = await performEnd(reason: .recoveryUnavailable)
+                    return
+                }
+                guard held else {
+                    Log.error("reconcile: session.json holds a session whose sleep hold was undone while Insomnia was not running: sleepDisabledByUs is journaled but SleepDisabled reads 0 (a recovery agent end that could record nothing, a hand-run pmset, or a start that died before disabling sleep); ending it, not resuming")
+                    _ = await performEnd(reason: .backstop)
+                    return
+                }
+            }
             do {
                 try await backstop.arm()
             } catch {
@@ -2622,14 +3260,55 @@ final class SessionManager {
                 _ = await performEnd(reason: .recoveryUnavailable)
                 return
             }
-            if !state.sleepDisabledByUs {
-                do {
-                    try journal { $0.sleepDisabledByUs = true }
-                } catch {
-                    fail("could not journal sleep guard: \(error.localizedDescription); ending session")
-                    _ = await performEnd(reason: .recoveryUnavailable)
-                    return
+            // Written even when sleepDisabledByUs is already set: a session
+            // resumes only from a journal this process can write. An agent
+            // run that ended the session but could neither remove
+            // session.json nor record the end anywhere leaves just that flag
+            // behind; when its restore failed as well, the bit still reads 1
+            // above, and the write that fails here keeps the session it
+            // ended from resuming while state.json stays unwritable.
+            // The cutoffs the agent enforces for the session while
+            // config.json cannot be used go in with it
+            // (`RuntimeState.sessionCutoffs`).
+            do {
+                try journal {
+                    $0.sleepDisabledByUs = true
+                    $0.sessionCutoffs = config.agentCutoffs
                 }
+            } catch {
+                fail("could not journal sleep guard: \(error.localizedDescription); ending session")
+                _ = await performEnd(reason: .recoveryUnavailable)
+                return
+            }
+            // An end, by the agent or by an earlier app, removes
+            // session.json, and records the end when it cannot: in
+            // ended-session.json, the journal, a new file beside them or in
+            // the log folder, or else the recovery lock file, which exists
+            // already. When none of those took a write (the lock file not a
+            // regular file this user owns, or refusing the write too, as on
+            // a full disk), nothing on disk says the session is over, and
+            // the bit pmset reports cannot say it either: it is global, and
+            // another process or a failed restore can leave it at 1. Such an
+            // end left a session.json it could not remove, so sleep is held
+            // again only for a session.json that can be replaced now (the
+            // same bytes, written and read back). One that cannot ends here
+            // instead, and the end is recorded wherever it can be now.
+            // Nothing tells such an end from a crash once session.json and
+            // the journal take writes again.
+            guard store.rewriteSessionFile() else {
+                Log.error("reconcile: session.json holds a session valid until \(iso(s.endsAt)), but it cannot be replaced, so an end of it may have gone unrecorded (a recovery agent end that could neither remove it nor record its end anywhere); ending it, not resuming")
+                _ = await performEnd(reason: .backstop)
+                return
+            }
+            // Whatever the recovery lock file holds ends nothing here (it
+            // would have ended the session above), so it is emptied before
+            // the session goes on: an end of it written to that file later
+            // then starts from an empty file. One that cannot be emptied
+            // stays; the end's writer keeps only the bytes the file shares
+            // with the record, so it never leaves the record's first bytes
+            // over these (`RecoveryLockHandle.replaceContents`).
+            if !store.clearLockEndRecord() {
+                Log.error("reconcile: could not empty \(paths.recoveryLock.path), which holds bytes that end no session; resuming, and an end recorded there later replaces them")
             }
             do {
                 try await sleepGuard.setSleepDisabled(true)
@@ -2665,16 +3344,23 @@ final class SessionManager {
             return
         }
 
-        // Step 1: missing or expired -> full end. A restore stopped at a
-        // sudo pmset that did not stop on SIGTERM ends the reconcile too:
-        // step 3 would run a second `disablesleep 0` beside the live one.
-        // The lock goes to the command and the end is retried when it exits.
-        // A session.json kept in place is renamed by an end, which is
-        // retried until it moves, so saved output volumes alone then call
-        // for one too, as on any other dirty journal.
+        // Step 1: missing, expired, ended earlier, or not to be resumed ->
+        // full end. A restore stopped at a sudo pmset that did not stop on
+        // SIGTERM ends the reconcile too: step 3 would run a second
+        // `disablesleep 0` beside the live one. The lock goes to the command
+        // and the end is retried when it exits. A session.json kept in place
+        // is renamed by an end, which is retried until it moves, so saved
+        // output volumes alone then call for one too, as on any other dirty
+        // journal.
         let savedOutputs = Set(state.savedAudioOutputs.map(\.deviceUID))
         let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
-        if onDisk != nil {
+        if endedEarlier {
+            Log.info("reconcile: session.json holds a session already ended (recorded in \(endRecordedIn ?? "ended-session.json")); restoring, not resuming")
+            if case .privilegedCommandRunning = await performEnd(reason: .backstop) { return }
+        } else if let s = onDisk, resumable, let why = rejectedConfigFile {
+            Log.error("reconcile: session valid until \(iso(s.endsAt)) not resumed: \(why)")
+            if case .privilegedCommandRunning = await performEnd(reason: .settingsFileRejected) { return }
+        } else if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
             if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
         } else if owesEnd {
@@ -2894,23 +3580,42 @@ final class SessionManager {
 
     // MARK: Private
 
-    /// Undo the writes made at the top of `start` by restoring the journal
-    /// and session file exactly as they were read under this transaction's
-    /// lock. Nothing has touched the machine at this point.
-    private func rollBackStart(journal before: RuntimeState, session previous: Session?) {
+    /// Undo the writes made at the top of `start` by restoring the journal,
+    /// the session file and the recovery lock file exactly as they were
+    /// read under this transaction's lock. Lock bytes that count as the end
+    /// of the earlier session.json go back before that file: until the
+    /// start's last step the lock file holds that record whole, so putting
+    /// back its first bytes only cuts the file
+    /// (`RecoveryLockHandle.replaceContents`). Other bytes ended nothing;
+    /// the start emptied them before it wrote its session.json, and they go
+    /// back only once the earlier file is back or the new one is gone, so
+    /// none of them is read against the new session. `lock` is nil when
+    /// they could not be read; the file then stays empty. Nothing has
+    /// touched the machine at this point.
+    private func rollBackStart(journal before: RuntimeState, session previous: Data?, lock lockBefore: Data?) {
         do {
             try persistState(before)
         } catch {
             fail("could not restore the journal after a failed start: \(error.localizedDescription)")
         }
+        var lockAfterSession = lockBefore
+        if let previous, let lockBefore, Store.lockContents(lockBefore, endSessionWithBytes: previous) {
+            lockAfterSession = nil
+            if !store.restoreLockContents(lockBefore) {
+                fail("could not restore \(paths.recoveryLock.path) after a failed start; it may hold more or less of the record of an earlier session's end than it did")
+            }
+        }
         do {
             if let previous {
-                try store.saveSession(previous)
+                try store.restoreSessionFile(previous)
             } else {
                 try store.deleteSession()
             }
         } catch {
             fail("could not restore session.json after a failed start: \(error.localizedDescription)")
+        }
+        if let lockAfterSession, !store.restoreLockContents(lockAfterSession) {
+            fail("could not restore \(paths.recoveryLock.path) after a failed start; it held bytes that ended no session, and it is left as it is")
         }
     }
 
@@ -2947,7 +3652,12 @@ final class SessionManager {
         guard session != nil else { return }
         let first = SessionMath.nextSecondBoundary(after: clock())
         let timer = Timer(fire: first, interval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshCountdown() }
+            Task { @MainActor in
+                guard let self else { return }
+                self.refreshCountdown()
+                await self.noticeAgentEnd()
+                await self.noticeConfigFileChange()
+            }
         }
         timer.tolerance = 0.1
         RunLoop.main.add(timer, forMode: .common)
@@ -2959,6 +3669,41 @@ final class SessionManager {
         deadlineTimer = nil
         countdownTimer?.invalidate()
         countdownTimer = nil
+    }
+
+    /// Records the end of the session in session.json in the journal
+    /// (`RuntimeState.endedSession`), for an end that could neither remove
+    /// that file nor write ended-session.json, such as an unrelated record
+    /// there that cannot be replaced. True when the journal on disk now
+    /// records it.
+    private func journalSessionEnd() -> Bool {
+        guard let marker = store.sessionEndMarker() else { return false }
+        if state.endedSession == marker { return true }
+        do {
+            try journal { $0.endedSession = marker }
+            return true
+        } catch {
+            Log.error("could not record the end of session.json in state.json either: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Removes a journaled end once its session.json is gone. It would end
+    /// nothing, since it matches only that file's bytes, but a later file
+    /// with the same bytes would read as ended. The cutoffs recorded for
+    /// that session go too; they apply to no other. A write that fails
+    /// leaves them for the next one; a start removes the end before it
+    /// writes session.json and records its own cutoffs.
+    private func dropJournaledSessionEnd() {
+        guard state.endedSession != nil || state.sessionCutoffs != nil else { return }
+        do {
+            try journal {
+                $0.endedSession = nil
+                $0.sessionCutoffs = nil
+            }
+        } catch {
+            Log.error("could not remove the recorded session end and cutoffs from state.json: \(error.localizedDescription)")
+        }
     }
 
     private func persistState(_ s: RuntimeState) throws {
@@ -3129,6 +3874,7 @@ final class SessionManager {
     static let journalTitle = "Recovery journal unreadable"
     static let commandRunningTitle = "Power command still running"
     static let sessionFileTitle = "Session file unreadable"
+    static let configFileTitle = "Settings file unreadable"
     static let foreignSleepTitle = "Sleep is disabled by something else"
     static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
     static let foreignSleepLine = "Sleep is disabled by something other than Insomnia; to re-enable it: \(foreignSleepCommand)"
@@ -3183,8 +3929,11 @@ final class SessionManager {
         case .backstop: outputsWaiting
             ? "A previous session left changes behind. Sleep is back to normal."
             : "A previous session left changes behind; everything has been undone."
+        case .agentCutoff: "The recovery agent ended the session while Insomnia could not (see insomnia.log for its reason). Sleep is back to normal."
         case .recoveryUnavailable: "Insomnia could not arm its recovery agent for the session found on disk, so it ended the session. Sleep is back to normal."
         case .startFailed: "Insomnia could not disable sleep, so no session was started. Sleep is back to normal."
+        case .settingsFileRejected: "\(rejectedConfigFile ?? "config.json could not be read or moved aside.") Sleep is back to normal."
+        case .cutoffsNotRecorded: "Insomnia could not record the session's end floor and thermal rules in state.json, which the recovery agent reads when it cannot use config.json, so it ended the session. Sleep is back to normal."
         }
     }
 }

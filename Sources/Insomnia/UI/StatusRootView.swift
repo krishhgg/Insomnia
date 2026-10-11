@@ -145,6 +145,7 @@ struct StatusRootView: View {
                 focusBounce: model.focusBounce,
                 rejectBounce: model.rejectBounce,
                 reduceMotion: reduceMotion,
+                maxDuration: manager.config.maxDuration,
                 onTap: { onTapPill(field) }
             )
             .onGeometryChange(for: CGFloat.self) { proxy in
@@ -196,8 +197,9 @@ struct StatusRootView: View {
             .accessibilityLabel(model.phase == .starting ? "Starting session" : countdownText)
     }
 
-    /// The manager refused the start: say so next to the pills the value is
-    /// still in. The full reason lives in the right-click menu.
+    /// The manager refused the start, or the time typed is over the maximum
+    /// session: say so next to the pills the value is still in. The full
+    /// reason for a refused start lives in the right-click menu.
     private func startError(_ text: String) -> some View {
         Label(text, systemImage: "exclamationmark.triangle.fill")
             .font(.system(size: 11, weight: .medium, design: .rounded))
@@ -206,6 +208,6 @@ struct StatusRootView: View {
             .lineLimit(1)
             .fixedSize()
             .transition(Motion.errorTransition(reduceMotion: reduceMotion))
-            .accessibilityLabel("Start failed")
+            .accessibilityLabel(text)
     }
 }

@@ -307,7 +307,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// end. Returns what the step wrote to $GITHUB_OUTPUT and the calls.
     private func runStep(_ script: String, gh body: String, files: [String: String], environment: [String: String]) throws -> StepResult {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
+        let root = ProcessTestHome.temporaryDirectory.appendingPathComponent("release-step-\(UUID().uuidString)", isDirectory: true)
         let bin = root.appendingPathComponent("bin", isDirectory: true)
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
@@ -338,7 +338,7 @@ final class ReleaseWorkflowTests: XCTestCase {
         p.arguments = ["-e", scriptURL.path]
         p.currentDirectoryURL = root
         p.environment = environment.merging([
-            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": NSTemporaryDirectory(),
+            "PATH": "\(bin.path):/usr/bin:/bin", "TMPDIR": ProcessTestHome.temporaryDirectory.path + "/",
             "GITHUB_REPOSITORY": "krishhgg/Insomnia", "GITHUB_OUTPUT": outputURL.path,
         ]) { _, fixed in fixed }
         // Capture to files rather than pipes: nothing to drain, nothing to deadlock.
@@ -443,17 +443,63 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// theirs is wherever the user unpacked it (/tmp, Downloads). They take
     /// sibling scripts from their own folder only; a path built from the
     /// parent of the script's folder would run whatever another account put
-    /// there. RecoveryScriptTests runs both from a zip layout.
+    /// there. Each script's own code up to in_checkout runs here from a zip
+    /// folder whose parent looks like a source checkout (scripts/ and
+    /// Package.swift): SCRIPT_DIR is the zip folder, which is no checkout.
+    /// uninstall.sh also runs with a dirname first in PATH and CDPATH that
+    /// both name a decoy folder, and finds its own folder without either;
+    /// install.sh's line is main's and is run without them.
+    /// RecoveryScriptTests runs both whole from a zip layout.
     func testTheZipsScriptsTakeNothingFromTheFolderAboveTheirOwn() throws {
         let text = try releaseWorkflow()
         let copy = try XCTUnwrap(lines(text).first { $0.contains(#""release/$pkg/""#) && $0.contains("cp ") }, "no cp into the package folder")
         let shipped = copy.split(separator: " ").map(String.init).filter { $0.hasPrefix("scripts/") }
         XCTAssertEqual(shipped, ["scripts/install.sh", "scripts/uninstall.sh"])
         let repo = workflowsDir.deletingLastPathComponent().deletingLastPathComponent()
+        let fm = FileManager.default
+        let tmp = ProcessTestHome.temporaryDirectory.appendingPathComponent("zip-scripts-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tmp) }
+        let unpackedIn = tmp.appendingPathComponent("unpacked", isDirectory: true)
+        let zip = unpackedIn.appendingPathComponent("Insomnia-1.0", isDirectory: true)
+        let decoy = tmp.appendingPathComponent("decoy", isDirectory: true)
+        for dir in [zip, unpackedIn.appendingPathComponent("scripts"), decoy.appendingPathComponent("Insomnia-1.0")] {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        try "".write(to: unpackedIn.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+        try "".write(to: unpackedIn.appendingPathComponent("scripts/backstop.sh"), atomically: true, encoding: .utf8)
+        let shadow = tmp.appendingPathComponent("bin", isDirectory: true)
+        try fm.createDirectory(at: shadow, withIntermediateDirectories: true)
+        let ranShadow = tmp.appendingPathComponent("dirname.ran")
+        try "#!/bin/bash\ntouch '\(ranShadow.path)'\necho '\(decoy.path)'\n".write(to: shadow.appendingPathComponent("dirname"), atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shadow.appendingPathComponent("dirname").path)
         for path in shipped {
+            let name = String(path.dropFirst("scripts/".count))
             let script = try String(contentsOf: repo.appendingPathComponent(path), encoding: .utf8)
             XCTAssertFalse(script.contains(#"BASH_SOURCE[0]}")/.."#), "\(path) resolves a path from the parent of its folder")
-            XCTAssertTrue(script.contains(#"SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)""#), "\(path) has no SCRIPT_DIR")
+            let checkout = try XCTUnwrap(script.range(of: "\nin_checkout() {"), "\(path) has no in_checkout")
+            let lineEnd = try XCTUnwrap(script.range(of: "\n", range: checkout.upperBound..<script.endIndex), path)
+            try (String(script[..<lineEnd.upperBound]) + #"printf '%s\n' "$SCRIPT_DIR"; if in_checkout; then echo checkout; else echo zip; fi"# + "\n")
+                .write(to: zip.appendingPathComponent(name), atomically: true, encoding: .utf8)
+            let shadowed = name == "uninstall.sh"
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = ["-c", #"cd "$0" && exec /bin/bash "$1""#, unpackedIn.path, "Insomnia-1.0/\(name)"]
+            p.environment = ["PATH": (shadowed ? "\(shadow.path):" : "") + "/usr/bin:/bin", "HOME": tmp.path]
+                .merging(shadowed ? ["CDPATH": decoy.path] : [:]) { $1 }
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            try p.run()
+            let printed = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            p.waitUntilExit()
+            XCTAssertEqual(p.terminationStatus, 0, path)
+            let got = printed.split(separator: "\n").map(String.init)
+            XCTAssertEqual(got.count, 2, "\(path): \(printed)")
+            XCTAssertTrue(got.first?.hasSuffix("/unpacked/Insomnia-1.0") == true, "\(path) found \(printed)")
+            XCTAssertEqual(got.last, "zip", "\(path): \(printed)")
+            if shadowed {
+                XCTAssertFalse(fm.fileExists(atPath: ranShadow.path), "\(path) ran the dirname in PATH")
+            }
         }
     }
 }

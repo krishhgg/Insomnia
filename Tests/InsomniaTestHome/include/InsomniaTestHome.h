@@ -8,4 +8,9 @@ const char *insomnia_test_home_key(void);
 /// loaded, or NULL if the loader has not run.
 const char *insomnia_test_home_root(void);
 
+/// The directory the loader made that one in, without a trailing slash:
+/// TMPDIR when the run set it, else Darwin's per-user temp directory, then
+/// /tmp. NULL if the loader has not run.
+const char *insomnia_test_home_temp_dir(void);
+
 #endif

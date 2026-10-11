@@ -403,22 +403,49 @@ final class UIStatusTests: XCTestCase {
     @MainActor
     func testBareEnterStartsTheDefaultPresetButNeverExtends() {
         let preset: TimeInterval = 4 * 3600
+        let month: TimeInterval = 30 * 24 * 3600
         XCTAssertEqual(
-            MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: preset),
+            MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: preset, maxDuration: month),
             .run(preset)
         )
         XCTAssertEqual(
-            MenuBarModel.commitAction(mode: .start, typed: 1800, defaultPreset: preset),
+            MenuBarModel.commitAction(mode: .start, typed: 1800, defaultPreset: preset, maxDuration: month),
             .run(1800)
         )
         XCTAssertEqual(
-            MenuBarModel.commitAction(mode: .extend, typed: nil, defaultPreset: preset),
+            MenuBarModel.commitAction(mode: .extend, typed: nil, defaultPreset: preset, maxDuration: month),
             .reject
         )
         XCTAssertEqual(
-            MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: 0),
+            MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: 0, maxDuration: month),
             .reject
         )
+    }
+
+    /// A time that would end past the maximum session is refused with what
+    /// still fits, never clamped quietly: the user typed a number and gets
+    /// it, or hears why not. Extending counts the time already left.
+    @MainActor
+    func testTimesPastTheMaximumAreRefusedWithTheAllowance() {
+        let day: TimeInterval = 24 * 3600
+        XCTAssertEqual(MenuBarModel.commitAction(mode: .start, typed: day, defaultPreset: 3600, maxDuration: day), .run(day))
+        XCTAssertEqual(MenuBarModel.commitAction(mode: .start, typed: day + 60, defaultPreset: 3600, maxDuration: day), .tooLong(allowed: day))
+        // The default preset is held to it too (a preset that outgrew a lowered maximum).
+        XCTAssertEqual(MenuBarModel.commitAction(mode: .start, typed: nil, defaultPreset: 2 * day, maxDuration: day), .tooLong(allowed: day))
+        // 1h left under a 24h ceiling leaves 23h to add.
+        XCTAssertEqual(MenuBarModel.commitAction(mode: .extend, typed: 23 * 3600, defaultPreset: 3600, maxDuration: day, remaining: 3600), .run(23 * 3600))
+        XCTAssertEqual(MenuBarModel.commitAction(mode: .extend, typed: 23 * 3600 + 60, defaultPreset: 3600, maxDuration: day, remaining: 3600), .tooLong(allowed: 23 * 3600))
+        // A maximum under the shortest session still allows that much.
+        XCTAssertEqual(MenuBarModel.commitAction(mode: .start, typed: 60, defaultPreset: 60, maxDuration: 1), .run(60))
+
+        // The same label the 24h preset chip and the Settings maximum row show.
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: day), "Up to 1d")
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: 23 * 3600 + 30 * 60), "Up to 23h30m")
+        // Minutes past a day are kept: the user can type 1d30m back in.
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: day + 30 * 60), "Up to 1d30m")
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: day + 30 * 60 + 45), "Up to 1d30m")
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: 30), "At the maximum")
+        XCTAssertEqual(MenuBarModel.tooLongText(allowed: -5), "At the maximum")
     }
 
     /// The pills can be in start mode over a live session: the user reopened

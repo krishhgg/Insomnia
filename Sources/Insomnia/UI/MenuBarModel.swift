@@ -22,15 +22,32 @@ final class MenuBarModel {
         case run(TimeInterval)
         /// Nothing to act on: shake the focused pill.
         case reject
+        /// The time would end past the maximum session (`Config.maxDuration`
+        /// from now): shake and say how much still fits, never shorten it
+        /// without saying so. `allowed` is what could be entered instead.
+        case tooLong(allowed: TimeInterval)
     }
 
     /// Bare Enter with every pill empty starts the default preset, so the
     /// common case is one keystroke. While extending there is no sensible
-    /// default duration, so it shakes instead.
-    static func commitAction(mode: Mode, typed: TimeInterval?, defaultPreset: TimeInterval) -> CommitAction {
-        if let typed { return .run(typed) }
+    /// default duration, so it shakes instead. A time that would put the end
+    /// past `maxDuration` from now (`remaining` is the live session's time
+    /// left while extending) is refused with the allowance rather than
+    /// clamped: the user typed a number and gets it, or hears why not.
+    static func commitAction(mode: Mode, typed: TimeInterval?, defaultPreset: TimeInterval, maxDuration: TimeInterval, remaining: TimeInterval = 0) -> CommitAction {
+        let allowed = max(maxDuration, SessionMath.minimumDuration) - max(remaining, 0)
+        if let typed {
+            return typed > allowed ? .tooLong(allowed: allowed) : .run(typed)
+        }
         guard mode == .start, defaultPreset > 0 else { return .reject }
-        return .run(defaultPreset)
+        return defaultPreset > allowed ? .tooLong(allowed: allowed) : .run(defaultPreset)
+    }
+
+    /// Label beside the pills for a refused `tooLong`: "Up to 1d", "Up to
+    /// 1d30m" (every unit that still fits, floored to the minute, so the
+    /// user can type it back), or "At the maximum" once nothing more fits.
+    static func tooLongText(allowed: TimeInterval) -> String {
+        allowed >= SessionMath.minimumDuration ? "Up to \(exactLabel(for: allowed))" : "At the maximum"
     }
 
     enum Phase: Equatable, Sendable {
@@ -61,8 +78,8 @@ final class MenuBarModel {
     static let startFailedText = "Couldn\u{2019}t start"
 
     var phase: Phase = .idle
-    /// Concise start failure shown beside the pills; cleared on the next
-    /// commit, open or collapse.
+    /// Concise start failure, or a refused over-maximum time, shown beside
+    /// the pills; cleared on the next commit, open or collapse.
     var startError: String?
     /// The label is drawn only while the pills are up: a retry (Enter)
     /// hides it at once but keeps its text, and so its room in the layout,

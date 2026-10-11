@@ -27,7 +27,12 @@ Reference pages in https://github.com/krishhgg/Insomnia:
 ## Check the state
 
 1. `tail -n 100 ~/Library/Logs/Insomnia/insomnia.log` shows what the app and
-   the recovery agent did last.
+   the recovery agent did last. A line with `ending the session before its
+   deadline` gives the agent's reason: Insomnia was not running, the battery
+   was below the end floor, or the Mac was critically hot. A line saying
+   `state.json` "is unreadable or malformed" means the agent kept the session
+   and its sleep hold. Ask the user to open Insomnia. The app rewrites a
+   journal it loads the next time it writes it. Don't edit the file.
 2. `pmset -g | grep -i sleepdisabled` shows `1` while sleep is turned off.
 3. `cat ~/Library/Application\ Support/Insomnia/state.json` shows what is
    still waiting to be undone. These entries are pending:
@@ -37,9 +42,13 @@ Reference pages in https://github.com/krishhgg/Insomnia:
    - `savedDisplayBrightness` or `savedKeyboardBrightness`, unless
      `displayRestoreRefused` or `keyboardRestoreRefused` is `true`
 
-   Other keys, such as `keptDisplayReadLit`, `keptDisplayUnderLowPower` and
-   `displayRestoredUnderLowPower`, are records the app keeps, not changes to
-   undo. A brightness value kept after a refused restore blocks nothing.
+   Other keys, such as `keptDisplayReadLit`, `keptDisplayUnderLowPower`,
+   `displayRestoredUnderLowPower`, `sessionCutoffs` and `endedSession`, are
+   records the app keeps, not changes to undo. So are `ended-session.json` and
+   files named `ended-session.json.` plus eight letters or digits, here or in
+   `~/Library/Logs/Insomnia/`: each says a session ended whose `session.json`
+   could not be removed yet. A brightness value kept after a refused restore
+   blocks nothing.
    Saved audio for an output that isn't connected waits for it to reconnect
    and doesn't block ending a session.
 4. `launchctl print gui/$(id -u)/com.insomnia.backstop` shows whether the

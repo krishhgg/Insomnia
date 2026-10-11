@@ -1168,6 +1168,7 @@ final class LidActionsTests: XCTestCase {
     /// while Insomnia runs, CoreAudio's device change restores it.
     func testQuitKeepsTheEntryOfAnUnpluggedDeviceAndItsReconnectRestoresIt() async throws {
         let (m, _) = await closeOnTheHeadsetAndUnplugIt()
+        m.watchOutputDevices() // LaunchGate's call once the launch holds the alive lock
 
         let outcome = await m.end(reason: .quit)
 
@@ -1440,6 +1441,7 @@ final class LidActionsTests: XCTestCase {
         s.savedAudioOutputs = [Self.headsetSaved]
         try h.store.saveState(s)
         try h.store.saveSession(SessionMath.newSession(now: h.clock.now, duration: 3600, maxDuration: 86400))
+        h.guardFake.sleepDisabled = true // the crashed session's hold
         h.clamshell.closed = true
         h.audio.connect("usb-headset", name: "USB Headset", volume: 0.3, muted: true)
         let m = h.makeManager(lockTimeout: 0.05)

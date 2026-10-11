@@ -47,6 +47,19 @@ enum ProcessTestHome {
         return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
     }()
 
+    /// The directory the loader made `root` in: TMPDIR when the run set it,
+    /// else Darwin's per-user temp directory, then /tmp. Tests make their
+    /// scratch files here. FileManager's temporaryDirectory and
+    /// NSTemporaryDirectory are Darwin's per-user directory whatever TMPDIR
+    /// says, so a run that points TMPDIR at its own folder would not find
+    /// their files there.
+    static let temporaryDirectory: URL = {
+        guard let raw = insomnia_test_home_temp_dir() else {
+            fatalError("InsomniaTestHome did not run at load; refusing to test against the real ~/Library")
+        }
+        return URL(fileURLWithPath: String(cString: raw), isDirectory: true)
+    }()
+
     /// Where INSOMNIA_HOME points right now, as the app would resolve it.
     static var current: String? {
         guard let value = getenv(Paths.environmentKey) else { return nil }
@@ -62,7 +75,7 @@ final class TempHome {
     let paths: Paths
 
     init() {
-        root = FileManager.default.temporaryDirectory
+        root = ProcessTestHome.temporaryDirectory
             .appendingPathComponent("insomnia-tests-\(UUID().uuidString)", isDirectory: true)
         try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         setenv(Paths.environmentKey, root.path, 1)
@@ -73,6 +86,24 @@ final class TempHome {
         setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
         try? FileManager.default.removeItem(at: root)
     }
+
+    /// Hands the variable back as `destroy` does but leaves `root` in place,
+    /// for a test whose child process may still use it: removing a folder
+    /// under a live child would hide what it does next.
+    func keep() {
+        setenv(Paths.environmentKey, ProcessTestHome.root.path, 1)
+    }
+}
+
+/// Points INSOMNIA_HOME at `home` for a test that does not own a TempHome,
+/// and returns the closure that puts back the value it had before (the
+/// loader's `ProcessTestHome.root` if it somehow had none). Call it in a
+/// defer. Never unsetenv instead: `Log.append` and `SessionManager.live`
+/// would then resolve the real ~/Library for the rest of the process.
+func pointInsomniaHome(at home: URL) -> () -> Void {
+    let previous = ProcessTestHome.current ?? ProcessTestHome.root.path
+    setenv(Paths.environmentKey, home.path, 1)
+    return { setenv(Paths.environmentKey, previous, 1) }
 }
 
 /// Records every call; can be told to throw.
@@ -438,6 +469,9 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     func set(_ uid: String, volume: Float, muted: Bool) {
         lock.withLock { _devices[uid]?.volume = volume; _devices[uid]?.muted = muted }
     }
+
+    /// Whether SessionManager has registered for device changes.
+    var watched: Bool { lock.withLock { _devicesChanged != nil } }
 
     /// Calls the handler SessionManager registered, as CoreAudio does when
     /// a device connects or disconnects.
@@ -854,6 +888,30 @@ struct Harness {
     }
 }
 
+/// Sets or clears the user immutable flag (chflags uchg) on a test file, so
+/// unlink and rename onto it fail with EPERM, as for a file a person locked.
+/// Tests clear it again before their temp home is removed.
+func setImmutable(_ url: URL, _ on: Bool) throws {
+    try FileManager.default.setAttributes([.immutable: on], ofItemAtPath: url.path)
+}
+
+/// Runs `body` with this process's file size limit at `bytes` and SIGXFSZ
+/// ignored, so a write past that offset stops there, as one cut short by a
+/// full disk does: the kernel writes the bytes below the limit and fails
+/// the rest with EFBIG. The limit holds for the whole process, so it is set
+/// around one write only.
+func withFileSizeLimit<T>(_ bytes: Int, _ body: () -> T) throws -> T {
+    var old = rlimit()
+    guard getrlimit(RLIMIT_FSIZE, &old) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+    var limited = old
+    limited.rlim_cur = rlim_t(bytes)
+    let handler = signal(SIGXFSZ, SIG_IGN)
+    defer { signal(SIGXFSZ, handler) }
+    guard setrlimit(RLIMIT_FSIZE, &limited) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EINVAL) }
+    defer { setrlimit(RLIMIT_FSIZE, &old) }
+    return body()
+}
+
 /// Runs `request` in a new main-actor task and returns that task once the
 /// request has been called and the task has let go of the main actor: at
 /// its first suspension, or because it finished. Lifecycle requests join
@@ -967,12 +1025,17 @@ final class BlockingKeychain: KeychainStoring, @unchecked Sendable {
 /// something does, open(2) blocks until a writer appears; the watchdog opens
 /// the FIFO for writing once a second, which lets a blocked reader through
 /// (it reads EOF) and records that a reader was there. A regression then
-/// fails its test instead of hanging the suite.
+/// fails its test instead of hanging the suite. `stop` returns only once
+/// the watchdog's thread has returned, so nothing opens the path after it.
 final class FIFOWatch: @unchecked Sendable {
     let url: URL
     private let lock = NSLock()
-    private var stopped = false
     private var seen = false
+    /// Signalled by `stop`; ends the watchdog's wait between checks early.
+    private let stopSignal = DispatchSemaphore(value: 0)
+    /// Signalled once when the watchdog's thread returns. Each `stop` takes
+    /// it and puts it back, so every call returns.
+    private let finished = DispatchSemaphore(value: 0)
 
     init(at url: URL) throws {
         self.url = url
@@ -981,9 +1044,10 @@ final class FIFOWatch: @unchecked Sendable {
         }
         let path = url.path
         Thread.detachNewThread { [self] in
+            defer { self.finished.signal() }
             for _ in 0..<120 {
-                Thread.sleep(forTimeInterval: 1)
-                if self.isStopped { return }
+                // A second between checks, as before, unless stopped first.
+                if self.stopSignal.wait(timeout: .now() + 1) == .success { return }
                 // Succeeds only while a reader has the FIFO open.
                 let fd = open(path, O_WRONLY | O_NONBLOCK)
                 if fd >= 0 {
@@ -1003,10 +1067,41 @@ final class FIFOWatch: @unchecked Sendable {
         return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFIFO
     }
 
-    func stop() { lock.lock(); stopped = true; lock.unlock() }
+    /// Stops the watchdog and returns once its thread has returned: at
+    /// most the open and close of a check under way, never a second's wait.
+    func stop() {
+        stopSignal.signal()
+        finished.wait()
+        finished.signal()
+    }
 
-    private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
     private func markSeen() { lock.lock(); seen = true; lock.unlock() }
+}
+
+/// The ACL entries one test gives (TestACL.denyNewFiles), so that its
+/// cleanup takes off exactly those. No ACL is read to find them, and a test
+/// that gives none makes no ACL call at all, in its body or its tearDown.
+final class OwnedACLs {
+    private var given: [URL] = []
+
+    /// TestACL.denyNewFiles, kept for removeGiven once chmod added it.
+    func denyNewFiles(in dir: URL) throws {
+        try TestACL.denyNewFiles(in: dir)
+        given.append(dir)
+    }
+
+    /// TestACL.removeAll on `dir`, which this test gave an entry.
+    func removeAll(_ dir: URL) throws {
+        try TestACL.removeAll(dir)
+        given.removeAll { $0 == dir }
+    }
+
+    /// Takes off the entries still given, for a tearDown; runs nothing
+    /// when there are none.
+    func removeGiven() {
+        for dir in given { try? TestACL.removeAll(dir) }
+        given = []
+    }
 }
 
 /// Access control lists for the tests that check Insomnia leaves them alone.
@@ -1014,16 +1109,37 @@ enum TestACL {
     /// Gives `url` one entry letting its owner, the user running the tests,
     /// read it. On a 0200 file that entry is the only way to read it.
     static func grantOwnerRead(_ url: URL) throws {
+        try chmod(["+a", "user:\(owner) allow read", url.path])
+    }
+
+    /// Gives directory `dir` one entry that stops its owner creating files
+    /// in it, so the temp file of an atomic write fails as on a full disk.
+    /// A directory inside can still be renamed: that needs
+    /// add_subdirectory, which the entry leaves allowed.
+    static func denyNewFiles(in dir: URL) throws {
+        try chmod(["+a", "user:\(owner) deny add_file", dir.path])
+    }
+
+    /// Removes every ACL entry from `url`, which the caller gave one
+    /// (OwnedACLs keeps which): no ACL is read first.
+    static func removeAll(_ url: URL) throws {
+        try chmod(["-N", url.path])
+    }
+
+    private static var owner: String { String(cString: getpwuid(getuid()).pointee.pw_name) }
+
+    private static func chmod(_ arguments: [String]) throws {
         let chmod = Process()
         chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmod.arguments = ["+a", "user:\(String(cString: getpwuid(getuid()).pointee.pw_name)) allow read", url.path]
+        chmod.arguments = arguments
         let exit = ProcessExit(chmod)
         try chmod.run()
         exit.wait()
         guard chmod.terminationStatus == 0 else { throw POSIXError(.EPERM) }
     }
 
-    /// How many ACL entries `url` has, without following a symlink.
+    /// How many ACL entries `url` has, without following a symlink. Only
+    /// for a test that checks the entries it gave.
     static func entries(_ url: URL) -> Int {
         guard let acl = acl_get_link_np(url.path, ACL_TYPE_EXTENDED) else { return 0 }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
@@ -1035,5 +1151,84 @@ enum TestACL {
             which = ACL_NEXT_ENTRY.rawValue
         }
         return count
+    }
+}
+
+/// The Insomnia executable this build made, beside the test bundle. Tests
+/// that run backstop.sh hand it config.json through `--agent-cutoffs`, as
+/// the installed app binary is in production, so the agent's reading of the
+/// file is the app's decoder and not a test double.
+enum BuiltApp {
+    private final class Marker {}
+
+    static var binary: URL {
+        Bundle(for: Marker.self).bundleURL.deletingLastPathComponent().appendingPathComponent("Insomnia")
+    }
+
+    /// An app bundle's Info.plist declaring `InsomniaAgentCutoffsVersion`
+    /// as `agentCutoffsVersion`, or without that key when nil, and
+    /// `InsomniaResumeFrozenVersion` likewise.
+    static func infoPlist(resumeFrozenVersion: String? = nil, agentCutoffsVersion: String?) -> String {
+        let frozen = resumeFrozenVersion.map { "<key>InsomniaResumeFrozenVersion</key><integer>\($0)</integer>" } ?? ""
+        let cutoffs = agentCutoffsVersion.map { "<key>InsomniaAgentCutoffsVersion</key><integer>\($0)</integer>" } ?? ""
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(frozen)\(cutoffs)</dict></plist>
+
+        """
+    }
+}
+
+/// The scripts in this checkout's scripts/ folder, as the tests that patch
+/// a copy of one read them. Each read takes the file's bytes from disk
+/// again. The lines split from them, and which lines set each constant,
+/// are kept and reused only while those bytes are the ones they came from,
+/// so a script changed on disk is split anew and never read stale.
+final class ScriptSource: @unchecked Sendable {
+    static let shared = ScriptSource()
+
+    static var folder: URL {
+        // .../Tests/InsomniaTests/TestSupport.swift -> .../scripts
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("scripts", isDirectory: true)
+    }
+
+    struct NotUTF8: Error, CustomStringConvertible {
+        let name: String
+        var description: String { "scripts/\(name) is not UTF-8" }
+    }
+
+    private struct Kept {
+        let bytes: Data
+        let lines: [String]
+        var hits: [String: [Int]] = [:]
+    }
+
+    private let lock = NSLock()
+    private var kept: [String: Kept] = [:]
+
+    /// The lines of scripts/`name`, and for each of `constants` the indices
+    /// of the lines that set it (those that start with `NAME=`).
+    func lines(_ name: String, setting constants: [String]) throws -> (lines: [String], hits: [String: [Int]]) {
+        let bytes = try Data(contentsOf: Self.folder.appendingPathComponent(name))
+        lock.lock()
+        defer { lock.unlock() }
+        var entry: Kept
+        if let old = kept[name], old.bytes == bytes {
+            entry = old
+        } else {
+            guard let text = String(data: bytes, encoding: .utf8) else { throw NotUTF8(name: name) }
+            entry = Kept(bytes: bytes, lines: text.components(separatedBy: "\n"))
+        }
+        var hits: [String: [Int]] = [:]
+        for constant in constants {
+            let found = entry.hits[constant] ?? entry.lines.indices.filter { entry.lines[$0].hasPrefix("\(constant)=") }
+            entry.hits[constant] = found
+            hits[constant] = found
+        }
+        kept[name] = entry
+        return (entry.lines, hits)
     }
 }
