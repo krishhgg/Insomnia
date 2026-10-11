@@ -30,19 +30,21 @@ closed bag. Its design goals are to:
 
 ## Platform
 
-- macOS 26 on Apple Silicon (built and tested on MacBook Pro M5).
+- macOS 26 on Apple Silicon or Intel (built and tested on MacBook Pro M5;
+  the x86_64 slice is built but not tested on Intel hardware).
 - Swift 6, SwiftUI content hosted in a custom `NSStatusItem`, Swift Package.
   No Xcode project.
 - `build-app.sh` assembles a minimal `Insomnia.app` bundle (`LSUIElement =
-  true`, no Dock icon) with `backstop.sh` sealed under `Contents/Resources`
-  and signs it ad-hoc.
+  true`, no Dock icon) around one universal binary (arm64 and x86_64) with
+  `backstop.sh` sealed under `Contents/Resources` and signs it ad-hoc.
   `install.sh` installs that build, or a prebuilt bundle passed with
   `--app` after verifying its integrity (only with
   `--allow-unverified-origin`, since it cannot verify where a bundle came
   from), to `~/Applications`. The Release workflow
-  packages the same bundle (`docs/releasing.md`), built for arm64 only;
-  `install.sh --app` stops unless `sysctl -n hw.optional.arm64` reads 1
-  (true on Apple Silicon, also under Rosetta). `install.sh` and
+  packages the same bundle (`docs/releasing.md`). `install.sh --app`
+  stops on a bundle without arm64 code where `sysctl -n hw.optional.arm64`
+  reads 1 (Apple Silicon, also under Rosetta), or without x86_64 code
+  elsewhere. `install.sh` and
   `uninstall.sh` take sibling scripts (`build-app.sh`, `backstop.sh`) only
   from a source checkout's `scripts/` folder, with `Package.swift` one level
   up, and never from the folder above their own: the release zip carries

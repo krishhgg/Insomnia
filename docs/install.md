@@ -5,7 +5,7 @@ step and what each one checks. A coding agent can follow
 [skills/install-insomnia](../skills/install-insomnia/SKILL.md), which uses the
 steps on this page.
 
-Requires **macOS 26 or later on an Apple Silicon Mac**.
+Requires **macOS 26 or later**, on an Apple Silicon or Intel Mac.
 
 ## Channels
 
@@ -120,9 +120,9 @@ and asks for administrator access to install a narrowly scoped sudoers rule. It 
 **your user account**, not just Insomnia, passwordless access to four
 power-setting commands. Review that permission before installing.
 
-Release zips are built for arm64 only, and their `install.sh --app` stops on
-an Intel Mac. On Intel, building from source (below) is the only option, and
-it is untested there.
+Release zips are universal (arm64 and x86_64) and install on Apple Silicon
+and Intel Macs. Only Apple Silicon has been tested. On Intel, lid close leaves
+the keyboard backlight alone, and Settings says why.
 
 ## Build from source
 

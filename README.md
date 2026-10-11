@@ -39,7 +39,8 @@
 
 ## Install
 
-Requires macOS 26 or later on an Apple Silicon Mac.
+Requires macOS 26 or later, on an Apple Silicon or Intel Mac. Only Apple
+Silicon has been tested.
 
 Paste this into your coding agent:
 

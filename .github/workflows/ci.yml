@@ -138,8 +138,9 @@ jobs:
 
       - name: Build release
         # docs/release-validation.md cites "no compiler warnings" as evidence,
-        # so a warning fails this build instead of scrolling past.
-        run: swift build -c release -Xswiftc -warnings-as-errors
+        # so a warning fails this build instead of scrolling past. Both
+        # slices build, as in build-app.sh, so an Intel-only warning fails too.
+        run: swift build -c release --arch arm64 --arch x86_64 -Xswiftc -warnings-as-errors
 
       - name: Check the lid simulation is compiled out of the release binary
         # Looks at the binaries, not the compilation condition: the plain

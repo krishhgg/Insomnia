@@ -12,9 +12,9 @@ pass a password to it. When a step needs the administrator password, give the
 user the exact command to run in Terminal and wait for them to say it finished.
 
 1. **Check the Mac.** Insomnia needs macOS 26 or later (`sw_vers -productVersion`).
-   Release zips run only on Apple Silicon: `sysctl -n hw.optional.arm64` prints
-   `1`. On an Intel Mac, use "Build from source" and tell the user that build is
-   untested on Intel.
+   Release zips are universal and install on Apple Silicon and Intel Macs.
+   Only Apple Silicon has been tested. On an Intel Mac, tell the user that,
+   and that lid close leaves the keyboard backlight alone there.
 2. **Pick the channel.** Use the latest stable release unless the user asked
    for the newest nightly. If the release is `v0.1.0`, follow its release notes
    instead of docs/install.md.

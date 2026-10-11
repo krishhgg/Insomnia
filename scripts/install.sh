@@ -16,8 +16,8 @@
 #                                             scripts/ folder (in_checkout)
 #   ./install.sh --app /path/to/Insomnia.app  installs a prebuilt bundle, such
 #                                             as the one in a release zip
-#                                             (arm64 only, so this stops on a
-#                                             Mac without Apple Silicon), after
+#                                             (refused without a slice for
+#                                             this Mac's CPU), after
 #                                             checking its signature, bundle
 #                                             identifier and version. Those
 #                                             show the bundle is intact, not
@@ -299,15 +299,6 @@ WORK="$("$MKTEMP" -d "${TMPDIR:-/tmp}/insomnia-install.XXXXXX")"
 #    changed when this step fails.
 if [[ -n "$PREBUILT" ]]; then
   step "Checking the prebuilt bundle $PREBUILT"
-  # Release bundles are built for arm64 only (the Release workflow runs on
-  # Apple Silicon). hw.optional.arm64 describes the hardware, so a shell
-  # running under Rosetta on an Apple Silicon Mac still reads 1; an Intel
-  # Mac reads 0 or has no such key.
-  arm64="$("$SYSCTL" -n hw.optional.arm64 2>/dev/null || true)"
-  if [[ "$arm64" != 1 ]]; then
-    echo "Release bundles of Insomnia run on Apple Silicon Macs only, and this Mac is not one ('sysctl -n hw.optional.arm64' gave ${arm64:-no value}). Build and install from a source checkout instead (README, Build from source). Nothing was changed." >&2
-    exit 1
-  fi
   if [[ ! -d "$PREBUILT" || ! -f "$PREBUILT/Contents/Info.plist" ]]; then
     echo "$PREBUILT is not an app bundle (no Contents/Info.plist). Nothing was changed." >&2
     exit 1
@@ -329,6 +320,17 @@ if [[ -n "$PREBUILT" ]]; then
   if ! "$CODESIGN" --verify --strict --deep "$CHECKED_APP"; then
     echo "$PREBUILT fails 'codesign --verify --strict --deep': the download is damaged or was modified. Nothing was changed." >&2
     echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
+    exit 1
+  fi
+  # A bundle without code for this Mac's CPU would install and never launch
+  # (releases before the universal build are arm64 only). hw.optional.arm64
+  # describes the hardware, so a shell under Rosetta on an Apple Silicon Mac
+  # still reads 1; an Intel Mac reads 0 or has no such key. codesign, not
+  # lipo, reads the slice: lipo needs the developer tools.
+  arch=x86_64
+  if [[ "$("$SYSCTL" -n hw.optional.arm64 2>/dev/null || true)" == 1 ]]; then arch=arm64; fi
+  if ! "$CODESIGN" -d --arch "$arch" "$CHECKED_APP" 2>/dev/null; then
+    echo "$PREBUILT has no $arch code, so it cannot run on this Mac. Install a newer release or build from source (README). Nothing was changed." >&2
     exit 1
   fi
   PREBUILT_ID="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)"

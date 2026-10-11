@@ -397,15 +397,15 @@ final class ReleaseWorkflowTests: XCTestCase {
         }
     }
 
-    /// Release bundles are arm64 only (no universal build), so the notes'
-    /// first line and the README's Install section say a release needs an
-    /// Apple Silicon Mac. RecoveryScriptTests checks that install.sh --app
-    /// stops on any other Mac.
-    func testTheNotesAndTheReadmeStateTheAppleSiliconRequirement() throws {
+    /// Release bundles are universal (build-app.sh builds arm64 and x86_64),
+    /// so the notes' first line and the README's Install section say a
+    /// release runs on Intel Macs too. RecoveryScriptTests checks that
+    /// install.sh --app stops on a bundle without this Mac's slice.
+    func testTheNotesAndTheReadmeStateTheSupportedMacs() throws {
         for id in ["stable", "nightly"] {
-            XCTAssertTrue(try job(id).joined(separator: "\n").contains(#"echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later."#), "the \(id) notes' first line")
+            XCTAssertTrue(try job(id).joined(separator: "\n").contains(#"echo "Insomnia $VERSION for Apple Silicon and Intel Macs with macOS 26 or later."#), "the \(id) notes' first line")
         }
-        XCTAssertTrue(try readmeInstallSection().contains("Apple Silicon"), "the README's Install section")
+        XCTAssertTrue(try readmeInstallSection().contains("Intel"), "the README's Install section")
     }
 
     /// The README's Install section gives the coding agent prompt for either

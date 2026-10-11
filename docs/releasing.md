@@ -36,18 +36,16 @@ zip's SHA-256. Both files are attached to the GitHub Release, and the zip
 carries a GitHub build provenance attestation that names the repository, the
 ref, the commit and the workflow run that produced it.
 
-The binary is arm64 only, because the build job runs on an Apple Silicon
-runner and no universal build is made. A release therefore runs on Apple
-Silicon Macs only: the release notes and the README say so, and
-`install.sh --app` stops on a Mac where `sysctl -n hw.optional.arm64` does not
-read 1.
+The binary is universal: `build-app.sh` builds an arm64 and an x86_64 slice
+on the Apple Silicon runner, so one zip serves Apple Silicon and Intel Macs.
+Only the arm64 slice has been run on real hardware.
 
 The bundle is the one `scripts/build-app.sh` makes: the release binary,
 `Resources/Info.plist`, the icon, and `backstop.sh` sealed under
 `Contents/Resources` before signing. `install.sh` runs the same script for
 a source install, so a downloaded app and a source-built app have the same
 bundle layout and are both ad-hoc signed. Their contents can still differ,
-because a source build may use another checkout, toolchain or architecture,
+because a source build may use another checkout or toolchain,
 or `INSOMNIA_LID_SIMULATION=1`. The workflow sets `INSOMNIA_LID_SIMULATION`
 empty, so a release never carries the `simulate-lid.sh` watcher.
 
