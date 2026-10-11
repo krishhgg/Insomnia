@@ -5,7 +5,7 @@ step and what each one checks. A coding agent can follow
 [skills/install-insomnia](../skills/install-insomnia/SKILL.md), which uses the
 steps on this page.
 
-Requires **macOS 26 or later on an Apple Silicon Mac**.
+Requires **macOS 15 or later on an Apple Silicon Mac**.
 
 ## Channels
 
@@ -126,7 +126,7 @@ it is untested there.
 
 ## Build from source
 
-Requires **Xcode with Swift 6.2 or later**. Clone the latest stable tag, or a
+Requires **Xcode with Swift 6.1 or later**. Clone the latest stable tag, or a
 nightly tag for the newest code, rather than `main`. If the releases page has
 no release yet, leave out `--branch v<version>` to build `main`:
 

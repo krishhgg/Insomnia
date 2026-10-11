@@ -225,14 +225,24 @@ supervise() { # base command args...
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
 [[ "$(basename "$APP")" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
 
+# Prints plutil's output only when it succeeds. On macOS 15 plutil writes a
+# missing key's error to stdout (and exits 1), so a caller reading stdout
+# would take the error text for a value. Output is passed through byte for
+# byte (the trailing x keeps trailing newlines through the substitution).
+plutil_out() { # plutil args...
+  local out rc=0
+  out="$("$PLUTIL" "$@" 2>/dev/null; rc=$?; printf x; exit "$rc")" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  printf '%s' "${out%x}"
+}
 extract() { # file keypath (raw scalar; non-zero if missing)
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" raw -o - "$1"
 }
 extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" json -o - "$1"
 }
 type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+  plutil_out -type "$2" -o - "$1" || true
 }
 
 # Prints one line per way the app's records about a kept display entry would

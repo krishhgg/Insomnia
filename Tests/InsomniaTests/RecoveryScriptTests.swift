@@ -798,7 +798,7 @@ final class RecoveryScriptTests: XCTestCase {
         for script in [fx.backstop, fx.uninstall] {
             let text = try String(contentsOf: script, encoding: .utf8)
             var functions = ""
-            for name in ["extract", "epoch_of", "epoch_at"] {
+            for name in ["plutil_out", "extract", "epoch_of", "epoch_at"] {
                 let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
                 let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
                 functions += text[start.lowerBound..<end.upperBound]
@@ -2516,6 +2516,12 @@ final class RecoveryScriptTests: XCTestCase {
         ("keptDisplayUnderLowPowerBoot is in the top level of state.json 2 times", #""keptDisplayUnderLowPowerBoot":"boot A","keptDisplayUnderLowPowerBoot":"boot B""#),
     ]
 
+    /// plutil before macOS 26 reads JSON strictly, so a journal in JSON5
+    /// syntax (comments, single quotes, unquoted keys, .5, +1, 1., \x
+    /// escapes) is refused as a whole file before the scripts check any key.
+    /// Nothing is undone either way; only the reason in the log differs.
+    static let plutilIsStrictJSON = ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26
+
     static let keptDisplayRecordKeys = [
         "keptDisplayUnderLowPower", "keptDisplayUnderLowPowerBoot", "keptDisplayReadLit", "displayRestoredUnderLowPower",
     ]
@@ -2539,7 +2545,8 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertEqual(f.calls(), [], "no privileged command for \(json)")
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json, "evidence kept for \(json)")
             XCTAssertTrue(f.exists(f.session), json)
-            XCTAssertTrue(f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
+            let refusedAsAFile = Self.plutilIsStrictJSON && f.log().contains("\(f.state.path): not valid JSON")
+            XCTAssertTrue(refusedAsAFile || f.log().contains("\(f.state.path): \(problem)"), "\(json): \(f.log())")
             XCTAssertTrue(f.log().contains("is unreadable or malformed; nothing undone, evidence kept"), f.log())
         }
     }
@@ -2610,8 +2617,10 @@ final class RecoveryScriptTests: XCTestCase {
             XCTAssertTrue(f.exists(f.sudoers), json)
             XCTAssertTrue(f.exists(f.app), json)
             XCTAssertEqual(try String(contentsOf: f.state, encoding: .utf8), json)
-            XCTAssertTrue(r.stderr.contains("state.json is malformed (unexpected shape)"), "\(json): \(r.stderr)")
-            XCTAssertTrue(r.stderr.contains(problem), "\(json): \(r.stderr)")
+            if !(Self.plutilIsStrictJSON && r.stderr.contains("state.json is unreadable or malformed")) {
+                XCTAssertTrue(r.stderr.contains("state.json is malformed (unexpected shape)"), "\(json): \(r.stderr)")
+                XCTAssertTrue(r.stderr.contains(problem), "\(json): \(r.stderr)")
+            }
             XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), "the app refuses \(json)")
         }
     }
@@ -7433,7 +7442,7 @@ private final class ScriptFixture {
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
-        posix_spawn_file_actions_addchdir(&actions, root.path)
+        posix_spawn_file_actions_addchdir_np(&actions, root.path)
 
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)

@@ -11,7 +11,7 @@ Read that page, then follow these steps. Never run `sudo` yourself and never
 pass a password to it. When a step needs the administrator password, give the
 user the exact command to run in Terminal and wait for them to say it finished.
 
-1. **Check the Mac.** Insomnia needs macOS 26 or later (`sw_vers -productVersion`).
+1. **Check the Mac.** Insomnia needs macOS 15 or later (`sw_vers -productVersion`); release zips from upstream need macOS 26, so on macOS 15 build from source.
    Release zips run only on Apple Silicon: `sysctl -n hw.optional.arm64` prints
    `1`. On an Intel Mac, use "Build from source" and tell the user that build is
    untested on Intel.

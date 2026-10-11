@@ -24,7 +24,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/License-MIT-536D78?style=flat-square"></a>
-  <img alt="macOS 26 or later" src="https://img.shields.io/badge/macOS-26%2B-303336?style=flat-square">
+  <img alt="macOS 15 or later" src="https://img.shields.io/badge/macOS-15%2B-303336?style=flat-square">
   <img alt="Experimental source build" src="https://img.shields.io/badge/Status-experimental-536D78?style=flat-square">
 </p>
 
@@ -39,7 +39,12 @@
 
 ## Install
 
-Requires macOS 26 or later on an Apple Silicon Mac.
+Requires macOS 15 or later on an Apple Silicon Mac.
+
+> **This fork** ports Insomnia to macOS 15 (Sequoia). The private display
+> and keyboard-backlight calls were measured on macOS 15.5 (24F74) and match
+> macOS 26. Release zips from the upstream repository still need macOS 26;
+> on macOS 15, use [Build from source](#build-from-source) with this fork.
 
 Paste this into your coding agent:
 
@@ -57,7 +62,7 @@ differently.
 
 ### Build from source
 
-Needs Xcode with Swift 6.2 or later. Replace `v<version>` with the latest
+Needs Xcode with Swift 6.1 or later. Replace `v<version>` with the latest
 stable tag, or a nightly tag for the newest code:
 
 ```bash

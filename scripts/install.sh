@@ -107,6 +107,16 @@ CANDIDATE=""
 CANDIDATE_DIR=""
 WORK=""
 
+# Prints plutil's output only when it succeeds. On macOS 15 plutil writes a
+# missing key's error to stdout (and exits 1), so a caller reading stdout
+# would take the error text for a value. Output is passed through byte for
+# byte (the trailing x keeps trailing newlines through the substitution).
+plutil_out() { # plutil args...
+  local out rc=0
+  out="$("$PLUTIL" "$@" 2>/dev/null; rc=$?; printf x; exit "$rc")" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  printf '%s' "${out%x}"
+}
 step() { printf '\n==> %s\n' "$*"; }
 usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
 # A command for the user to paste, each word quoted for the shell, so a space,
@@ -331,12 +341,12 @@ if [[ -n "$PREBUILT" ]]; then
     echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
     exit 1
   fi
-  PREBUILT_ID="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  PREBUILT_ID="$(plutil_out -extract CFBundleIdentifier raw -o - "$INFO_PLIST" || true)"
   if [[ "$PREBUILT_ID" != "$BUNDLE_ID" ]]; then
     echo "$PREBUILT has bundle identifier '${PREBUILT_ID:-<none>}', not $BUNDLE_ID. Nothing was changed." >&2
     exit 1
   fi
-  PREBUILT_VERSION="$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  PREBUILT_VERSION="$(plutil_out -extract CFBundleShortVersionString raw -o - "$INFO_PLIST" || true)"
   if [[ ! "$PREBUILT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "$PREBUILT has no usable CFBundleShortVersionString ('${PREBUILT_VERSION:-<none>}'). Nothing was changed." >&2
     exit 1
@@ -617,7 +627,7 @@ done
 # it is not known which of the two it pins.
 plist_pins_previous() {
   local pinned rc
-  pinned="$("$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" 2>/dev/null || true)"
+  pinned="$(plutil_out -extract ProgramArguments.4 raw -o - "$PLIST" || true)"
   [[ -n "$pinned" ]] || return 1
   rc=0
   bounded "$CODESIGN" --verify --strict "-R=$pinned" "$APP" || rc=$?
