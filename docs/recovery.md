@@ -6,7 +6,10 @@ has every case.
 Insomnia records pending changes in a recovery journal. On session end, the app
 attempts to undo them. An independent `launchd` agent checks every minute and
 can attempt recovery after the app exits unexpectedly, once the saved deadline
-has passed. It leaves a valid, unexpired session alone.
+has passed. It leaves a valid, unexpired session alone. It reads the time
+now with a 30 s limit; when that read fails or does not answer, whether the
+session has ended is not known, so that run undoes nothing and the next one
+tries again.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;

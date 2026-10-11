@@ -98,7 +98,11 @@ The files in Application Support/Insomnia and Logs/Insomnia (config, session,
 journal, recovery lock, the record of a power command left running, the two
 logs) are owner-only, mode 0600 with those two directories 0700, and one left
 looser by an older build is tightened the next time the app or the backstop
-opens it. Insomnia sets only these modes and
+opens it. The backstop's `chmod` calls, its `mkdir` of the folder and the
+`mktemp` of its private folder in `TMPDIR` have a 30 s limit: one that does
+not finish stops that run before it takes the recovery lock, and the next
+run tries again. A `mktemp` that ends after that may leave an empty
+`insomnia-backstop.*` folder in `TMPDIR`. Insomnia sets only these modes and
 leaves any access control list (ACL) on these files and folders as it is, so
 an ACL someone added, or one inherited from a parent folder, can still give
 another account access (`ls -le` shows it). The LaunchAgent plist and the installed

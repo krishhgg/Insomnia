@@ -40,5 +40,16 @@ An upgrade is the same steps. The installer asks the running app to quit and
 stops if a session is still waiting to be undone. Then use the
 maintain-insomnia skill to find out why.
 
+The installer also stops, and says why, when the sudoers rule has a line for
+another account or changed while it ran, when an access control list on the
+rule or its folders allows more than reading, or when a process named
+Insomnia that it cannot identify is running. Show the user that message.
+Never edit `/etc/sudoers.d` or an ACL yourself. When it says one of its own
+steps did not finish within 30s, it also says what it installed so far;
+the user reruns the same command once that step has ended. When it says the
+new rule is in place but its copy is still beside it, the install goes on;
+hand the user the `sudo rm` command it printed, since a later install or
+uninstall refuses a rule with two names until that copy is gone.
+
 To build from source, follow "Build from source" on the same page. Its
 `./scripts/install.sh` also needs the password.
