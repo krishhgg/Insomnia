@@ -1,0 +1,1 @@
+Throwaway file for testing the merge gate ruleset. Never merges into main.
