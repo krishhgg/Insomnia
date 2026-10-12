@@ -1139,7 +1139,9 @@ one after another with a short stagger.
 second-resolution countdown next to the icon. Clicking the cup or countdown
 opens inline duration entry for an extension. Hold the end control to end the
 session. The right-click menu contains status lines (lid, watts, Wi-Fi, frozen
-apps, Docker), browser relaunch actions, Settings, and Quit.
+apps, Docker), browser relaunch actions, End session while running, Settings,
+and Quit. End session uses the same journaled restoration as the hold control;
+it leaves the app open.
 
 Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
 `Voltage`) on demand when status is requested. Never continuously polled.

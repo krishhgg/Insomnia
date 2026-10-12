@@ -238,7 +238,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(StatusLines.throttleWarning(["Chrome", "Arc", "Chromium"]), "\u{26A0} Chrome, Arc, and Chromium are throttled")
     }
 
-    func testMenuListsStatusThenSettingsAndQuit() {
+    func testRunningMenuListsStatusThenEndSessionSettingsAndQuit() {
         let items = StatusMenu.items(
             sessionActive: true,
             sleepHeld: true,
@@ -254,6 +254,7 @@ final class UIStatusTests: XCTestCase {
             StatusMenu.Item(title: "\u{26A0} Chrome is throttled", kind: .warning),
             StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
             StatusMenu.Item(title: "", kind: .separator),
+            StatusMenu.Item(title: StatusMenu.endSessionTitle, kind: .endSession),
             StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
             StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
         ])
@@ -303,7 +304,7 @@ final class UIStatusTests: XCTestCase {
         )
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .endSession, .settings, .quit]
         )
         XCTAssertEqual(items[3], StatusMenu.Item(
             title: "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings",
@@ -396,7 +397,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser(Self.arc) }.count, 1)
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .endSession, .settings, .quit]
         )
     }
 
