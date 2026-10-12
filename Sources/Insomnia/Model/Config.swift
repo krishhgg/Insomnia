@@ -60,6 +60,10 @@ struct Config: Codable, Equatable, Sendable {
 
     // Network failover
     var hotspotSSID: String = ""
+    /// Estimate this Mac's configured-hotspot traffic during sessions.
+    var trackHotspotUsage: Bool = false
+    /// Decimal bytes. A budget warns but never disconnects the network.
+    var hotspotBudgetBytes: UInt64 = 1_000_000_000
     /// Seconds of outage after which tmux panes are nudged.
     var nudgeThreshold: TimeInterval = 90
     /// tmux targets as `session:window.pane`. Only a pane carrying the
@@ -160,6 +164,8 @@ struct Config: Codable, Equatable, Sendable {
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
         hotspotSSID = try c.decodeIfPresent(String.self, forKey: .hotspotSSID) ?? d.hotspotSSID
+        trackHotspotUsage = try c.decodeIfPresent(Bool.self, forKey: .trackHotspotUsage) ?? d.trackHotspotUsage
+        hotspotBudgetBytes = try c.decodeIfPresent(UInt64.self, forKey: .hotspotBudgetBytes) ?? d.hotspotBudgetBytes
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter

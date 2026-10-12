@@ -13,6 +13,7 @@ enum StatusMenu {
             case warning
             case separator
             case settings
+            case hotspotUsage
             case quit
             /// Relaunch this browser with the occlusion flags. Carries the
             /// bundle id and name, so the item still names the same browser
@@ -58,7 +59,8 @@ enum StatusMenu {
         commandRunning: String? = nil,
         foreignSleep: String? = nil,
         outputsWaiting: [SavedAudioOutput] = [],
-        lidSimulationBuild: Bool = false
+        lidSimulationBuild: Bool = false,
+        hotspotUsage: HotspotUsageStatus? = nil
     ) -> [Item] {
         var out: [Item] = []
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
@@ -66,6 +68,13 @@ enum StatusMenu {
         }
         if let machine = present(machine) {
             out.append(Item(title: machine, kind: .info))
+        }
+        if let usage = hotspotUsage {
+            out.append(Item(title: usage.summary, kind: .hotspotUsage))
+            if let warning = usage.warning { out.append(Item(title: warning, kind: .warning)) }
+            if let detail = usage.detail {
+                out.append(Item(title: detail, kind: usage.problem == nil ? .info : .warning))
+            }
         }
         if let actions = present(actions) {
             out.append(Item(title: actions, kind: .info))
@@ -129,7 +138,8 @@ enum StatusMenu {
         settings: Selector,
         quit: Selector,
         relaunchBrowser: Selector,
-        stopWaitingForOutput: Selector
+        stopWaitingForOutput: Selector,
+        hotspotUsageSettings: Selector? = nil
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -151,6 +161,8 @@ enum StatusMenu {
                 menu.addItem(entry)
             case .settings:
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))
+            case .hotspotUsage:
+                menu.addItem(action(title: item.title, selector: hotspotUsageSettings ?? settings, key: "", target: target))
             case .quit:
                 menu.addItem(action(title: item.title, selector: quit, key: "q", target: target))
             case let .relaunchBrowser(browser):

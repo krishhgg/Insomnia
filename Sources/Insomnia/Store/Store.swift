@@ -1,6 +1,6 @@
 import Foundation
 
-/// Atomic JSON persistence for the three files Insomnia keeps on disk.
+/// Atomic JSON persistence for Insomnia's local files.
 /// Writes go to a temp file in the same directory and are renamed into place
 /// so a crash mid-write can never leave a truncated session or state file.
 /// The temp file is created mode 0600, so the published file is owner-only

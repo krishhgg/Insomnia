@@ -48,6 +48,7 @@ final class SystemStatus {
 @MainActor
 final class AppServices {
     let status = SystemStatus()
+    let hotspotUsage: HotspotUsageDriver
     let notifier: any Notifying
     let locationPermission: LocationPermission
 
@@ -107,12 +108,14 @@ final class AppServices {
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         keychain: any KeychainStoring = KeychainStore(),
         locationPermission: LocationPermission = LocationPermission(),
+        hotspotUsage: HotspotUsageDriver? = nil,
         browser: BrowserThrottle? = nil,
         idleSeconds: @escaping @Sendable () -> Double = { UserInput.secondsSinceLastInput() },
         lidSimulation: (any LidSimulating)? = LidSimulationBuild.makeWatcher(),
         lidSimulationEnabled: Bool = LidSimulationBuild.isCompiledIn
     ) {
         self.paths = paths
+        self.hotspotUsage = hotspotUsage ?? HotspotUsageDriver(store: HotspotUsageStore(store: Store(paths: paths)), notifier: notifier)
         self.notifier = notifier
         self.audio = audio
         self.display = display
@@ -134,6 +137,7 @@ final class AppServices {
         running = true
         self.manager = manager
         let config = manager.config
+        hotspotUsage.configure(config: config, sessionActive: manager.isActive)
         status.lastGap = nil
         status.hotspotPasswordReport = nil
         status.relaunchProblems = [:]
@@ -193,6 +197,7 @@ final class AppServices {
     }
 
     func stop() {
+        hotspotUsage.stop()
         guard running else { return }
         running = false
         lid.stop()
