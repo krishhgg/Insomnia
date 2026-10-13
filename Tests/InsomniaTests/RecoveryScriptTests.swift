@@ -32,6 +32,33 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - backstop.sh
 
+    func testBundledBackstopResumesWithItsSiblingBinaryAfterAppRelocation() throws {
+        let bundle = fx.root.appendingPathComponent("Shared Applications/Insomnia.app")
+        let script = Paths.backstopScript(inBundle: bundle)
+        let binary = bundle.appendingPathComponent("Contents/MacOS/Insomnia")
+        let fm = FileManager.default
+        try fm.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.copyItem(at: fx.backstop, to: script)
+        try fm.copyItem(at: fx.fakeInsomnia, to: binary)
+        try fm.copyItem(at: fx.appInfo, to: bundle.appendingPathComponent("Contents/Info.plist"))
+        try fm.removeItem(at: fx.fakeInsomnia)
+        try fm.removeItem(at: fx.appInfo)
+        let started = 1_789_388_423
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[{"pid":4242,"startedAt":\(started),"startedAtMicros":17,"bootSession":"\(fx.bootUUID)"}]}
+        """)
+
+        let result = try fx.run(script)
+
+        XCTAssertEqual(result.status, 0, result.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 4242 \(started) 17 \(fx.bootUUID)"])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
     func testPrivilegedCommandFailureExitsNonzeroAndKeepsJournal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false,"extra":"keep"}"#)

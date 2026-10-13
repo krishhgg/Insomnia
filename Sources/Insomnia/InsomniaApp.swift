@@ -13,6 +13,12 @@ struct InsomniaApp: App {
         Settings {
             EmptyView()
         }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { delegate.showSettings() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
+        }
     }
 }
 
@@ -22,14 +28,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let status: any StatusSource
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
-    let loginItem = LoginItem()
+    let loginItem: LoginItem
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
     private var terminating = false
 
     override init() {
+        #if DEBUG
+        if UIPreview.isEnabled {
+            manager = UIPreview.makeManager()
+            secrets = PreviewHotspotSecrets()
+            status = PlaceholderStatus()
+            locationPermission = LocationPermission(authorizationStatus: .notDetermined)
+            loginItem = LoginItem(service: PreviewLoginItem())
+            super.init()
+            return
+        }
+        #endif
         let manager = SessionManager.live()
         self.manager = manager
+        loginItem = LoginItem()
         secrets = KeychainHotspotSecretStore(keychain: KeychainStore()) {
             manager.config.hotspotSSID
         }
@@ -45,14 +63,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        if UIPreview.isEnabled {
+            if CommandLine.arguments.contains("--ui-preview-light") {
+                NSApp.appearance = NSAppearance(named: .aqua)
+            }
+            return
+        }
+        #endif
         // Before launch finishes, so the first notification already shows
         // while Insomnia is frontmost.
         ForegroundNotifications.install()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
+        // The fixture preview is a regular app so native desktop tools can
+        // inspect its windows. The installed app remains menu-bar-only.
+        #if DEBUG
+        NSApp.setActivationPolicy(UIPreview.isEnabled ? .regular : .accessory)
+        #else
         NSApp.setActivationPolicy(.accessory)
+        #endif
         Log.info("launched")
         if LidSimulationBuild.isCompiledIn {
             Log.info(LidSimulationBuild.marker)
@@ -70,20 +101,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Log.error("could not save config after the launch at login check: \(error.localizedDescription)")
             }
         }
-        let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] in
+        let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] navigation in
             AnyView(
                 SettingsView(
                     manager: manager,
                     secrets: secrets,
                     locationPermission: locationPermission,
-                    loginItem: loginItem
+                    loginItem: loginItem,
+                    navigation: navigation
                 )
             )
         }
         settingsWindow = settings
-        statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
-            settings?.show()
+        statusItem = StatusItemController(
+            manager: manager, status: status,
+            showSettings: { [weak settings] in settings?.show() },
+            playSessionSound: { SessionSounds.shared.play($0) }
+        )
+        #if DEBUG
+        if UIPreview.isEnabled {
+            settings.show()
+            if CommandLine.arguments.contains("--ui-preview-menu") {
+                statusItem?.showMenuPreview()
+            }
+            if CommandLine.arguments.contains("--ui-preview-popover") {
+                Task { @MainActor [weak self, manager] in
+                    if CommandLine.arguments.contains("--ui-preview-active") {
+                        await manager.start(duration: manager.config.defaultPreset)
+                    }
+                    // The status item needs its final screen position before anchoring.
+                    try? await Task.sleep(for: .seconds(1))
+                    self?.statusItem?.showQuickMenu()
+                }
+            }
+            return
         }
+        #endif
         Task { await manager.reconcile() }
     }
 
@@ -113,4 +166,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         return .terminateLater
     }
+
+    func showSettings() { settingsWindow?.show() }
 }

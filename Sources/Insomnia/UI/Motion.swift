@@ -10,22 +10,25 @@ import SwiftUI
 /// movement collapses into a short crossfade with no scale.
 @MainActor
 enum Motion {
-    static let baseResponse: TimeInterval = 0.35
-    static let baseDampingFraction = 0.72
+    static let baseResponse: TimeInterval = 0.16
+    static let baseDampingFraction = 0.82
     /// Baseline for layout, pill morphs and the focus ring.
     static let base: Animation = .spring(response: baseResponse, dampingFraction: baseDampingFraction)
     /// Focus bounce and icon taps: snappier, with a slight overshoot.
-    static let snappy: Animation = .spring(response: 0.25, dampingFraction: 0.6)
+    static let snappy: Animation = .spring(response: 0.12, dampingFraction: 0.72)
     /// One digit roll of the 1 Hz countdown; must settle well inside a second.
-    static let tick: Animation = .spring(response: 0.18, dampingFraction: 0.85)
+    static let tick: Animation = .spring(response: 0.085, dampingFraction: 0.9)
     /// How long the end button must be held before the session ends.
     static let holdDuration: TimeInterval = 0.6
     /// Delay between consecutive pills appearing (reversed on collapse).
-    static let stagger: TimeInterval = 0.04
+    static let stagger: TimeInterval = 0.015
     /// Scale a focused pill overshoots to before settling.
     static let overshoot: CGFloat = 1.06
     /// Reduce Motion replacement for every spring.
-    static let reduced: Animation = .easeInOut(duration: 0.15)
+    static let reduced: Animation = .easeInOut(duration: 0.08)
+    static func interface(reduceMotion: Bool = Motion.reduceMotion) -> Animation {
+        .easeOut(duration: reduceMotion ? 0.06 : 0.1)
+    }
 
     /// A close folds the bar shut: each pill travels towards the
     /// eye by its own distance from the first slot (so all three converge
@@ -34,12 +37,12 @@ enum Motion {
     /// all three, `stagger` apart, farthest first. A fixed-duration curve
     /// rather than a spring, so the moment the last pill is gone is known
     /// exactly and the slots can leave right after it.
-    static let collapseDuration: TimeInterval = 0.32
+    static let collapseDuration: TimeInterval = 0.14
     static let collapse: Animation = .easeInOut(duration: collapseDuration)
     static let collapseScale: CGFloat = 0.6
     /// Reduce Motion: opacity only, in place, a little longer than `reduced`
     /// so the pills are seen to leave rather than blink off.
-    static let reducedCollapseDuration: TimeInterval = 0.2
+    static let reducedCollapseDuration: TimeInterval = 0.1
     static let reducedCollapse: Animation = .easeInOut(duration: reducedCollapseDuration)
 
     static func collapse(reduceMotion: Bool = Motion.reduceMotion) -> Animation {
@@ -51,7 +54,7 @@ enum Motion {
     /// that draws the pill at zero opacity has been rendered before the
     /// slot under it is removed. The settle timer starts with the last
     /// pill's step, after its stagger delay, so the delay is already counted.
-    static let collapseSettleMargin: TimeInterval = 0.04
+    static let collapseSettleMargin: TimeInterval = 0.02
     static let retractSettleDuration: TimeInterval = collapseDuration + collapseSettleMargin
     static let reducedRetractSettleDuration: TimeInterval = reducedCollapseDuration + collapseSettleMargin
 
@@ -62,28 +65,28 @@ enum Motion {
     /// The eye's blink. The lid and the pupil run on their own curves, and
     /// each direction has its own, so the lid is seen lifting and the pupil
     /// is seen arriving: long enough to read as a blink, not a flicker.
-    /// Opening: the lid lifts on a slow spring.
-    static let blinkResponse: TimeInterval = 0.95
-    static let blinkDampingFraction = 0.9
+    /// Opening is legible without delaying the menu bar's response.
+    static let blinkResponse: TimeInterval = 0.28
+    static let blinkDampingFraction = 0.86
     static let blink: Animation = .spring(response: blinkResponse, dampingFraction: blinkDampingFraction)
     /// Closing: the lid drops a little quicker and nearer critical damping.
-    static let blinkCloseResponse: TimeInterval = 0.8
-    static let blinkCloseDampingFraction = 0.95
+    static let blinkCloseResponse: TimeInterval = 0.2
+    static let blinkCloseDampingFraction = 0.92
     static let blinkClose: Animation = .spring(response: blinkCloseResponse, dampingFraction: blinkCloseDampingFraction)
     /// Reduce Motion: the lid and the lashes crossfade instead.
-    static let reducedBlinkDuration: TimeInterval = 0.3
+    static let reducedBlinkDuration: TimeInterval = 0.1
     static let reducedBlink: Animation = .easeInOut(duration: reducedBlinkDuration)
 
-    /// The pupil arriving behind the lifting lid: a bouncier spring (peak
-    /// scale about 1.04) that starts once the lid is under way. Keyed on
+    /// The pupil arrives just behind the lifting lid with restrained
+    /// damping. Keyed on
     /// the eye state, so a close during the delay retargets it rather than
     /// letting it run late.
-    static let pupilOpenResponse: TimeInterval = 0.5
-    static let pupilOpenDampingFraction = 0.6
-    static let pupilOpenDelay: TimeInterval = 0.2
+    static let pupilOpenResponse: TimeInterval = 0.16
+    static let pupilOpenDampingFraction = 0.85
+    static let pupilOpenDelay: TimeInterval = 0.025
     static let pupilOpen: Animation = .spring(response: pupilOpenResponse, dampingFraction: pupilOpenDampingFraction).delay(pupilOpenDelay)
     /// The pupil shrinking away as the lid drops: no delay, no bounce.
-    static let pupilCloseDuration: TimeInterval = 0.4
+    static let pupilCloseDuration: TimeInterval = 0.1
     static let pupilClose: Animation = .easeOut(duration: pupilCloseDuration)
     /// The pupil's scale in the closed eye; 1 in the open eye and, since it
     /// never scales, under Reduce Motion.

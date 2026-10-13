@@ -34,13 +34,14 @@ final class LidCloseCopyTests: XCTestCase {
         XCTAssertTrue(note.contains("AirPods or an external mic"), note)
     }
 
-    /// The note sits right under the mute toggle, next to the other
-    /// lid-close options.
-    func testSettingsShowsTheMicrophoneNoteUnderTheMuteToggle() throws {
+    /// The safety note remains directly under mute, inside the compact
+    /// compatibility disclosure used by the redesigned settings.
+    func testSettingsKeepsTheMicrophoneNoteAvailableUnderTheMuteToggle() throws {
         let lid = try lidSection()
-        let toggle = try XCTUnwrap(lid.range(of: #"Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))"#))
+        let toggle = try XCTUnwrap(lid.range(of: #"Toggle("Mute audio", isOn: bind(\.muteOnLidClose))"#))
         let next = lid[toggle.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-        XCTAssertTrue(next.hasPrefix("Text(Self.microphoneNote)"), String(next.prefix(80)))
+        XCTAssertTrue(next.hasPrefix("SettingsDisclosureGroup(\"Microphone compatibility\")"), String(next.prefix(80)))
+        XCTAssertTrue(next.contains("Text(Self.microphoneNote)"))
     }
 
     func testReadmeExplainsTheMicrophone() throws {

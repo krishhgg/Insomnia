@@ -36,7 +36,7 @@
 > [Validation status](docs/release-validation.md) · [Apple's ventilation guidance](https://support.apple.com/en-us/102336)
 
 <p align="center">
-  <img src="docs/assets/session-flow.svg" alt="Illustrated menu-bar controls: enter Days, Hours, and Minutes, watch the countdown, and hold the end control to finish early. Click the eye or countdown to add time. Closing the lid is optional, and incomplete recovery needs attention." width="880">
+  <img src="docs/assets/session-flow.svg" alt="Left-click the eye to start or end the default four-hour session. Watch the countdown in hours and minutes. Right-click the eye or countdown for quick actions. Closing the lid is optional, and incomplete recovery needs attention." width="880">
 </p>
 
 ## Install
@@ -98,15 +98,30 @@ file and explains how upgrades replace them.
 
 ## Using it
 
-1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
-   and press Enter.
-2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
-4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
-   the session first, and it refuses while a change is still waiting to be
-   undone. Saved audio for an output that isn't connected doesn't hold it up.
-   Insomnia restores that output if it reconnects while the app runs, or at
-   the next launch.
+1. **Start or stop.** Left-click the eye to start a session of the default
+   length, four hours at first, or to stop the running one. The eye opens
+   right away while the start is pending. Pick another default in
+   Settings > General.
+2. **Quick actions.** Right-click the eye or the countdown for a 30-minute,
+   one-hour, two-hour, four-hour, six-hour or eight-hour session. During a session these buttons
+   add time.
+3. **End early.** Left-click the eye or timer, or choose End session in quick actions.
+4. **Settings and status.** The same right-click menu opens Settings, Status
+   details and Quit Insomnia. Quit asks Insomnia to undo the session first,
+   and it refuses while a change is still waiting to be undone. Saved audio
+   for an output that isn't connected doesn't hold it up. Insomnia restores
+   that output if it reconnects while the app runs, or at the next launch.
+5. **Move the eye.** Hold Command and drag it to another spot in the menu
+   bar. macOS keeps that spot for later launches.
+
+<p align="center">
+  <img src="docs/assets/ui/menu-dark.png" alt="Quick actions with four duration shortcuts and direct access to Settings" width="240">
+  <img src="docs/assets/ui/settings-dark.png" alt="General settings with a glass sidebar and a four-hour default" width="600">
+</p>
+
+Settings has General, Lid actions and Advanced pages. These screenshots come
+from the UI preview described under [Development](#development). The purple
+title-bar indicator is macOS window sharing, not an Insomnia control.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
@@ -169,8 +184,8 @@ Some things need you:
 - Insomnia only unfreezes a process it can prove it froze. A frozen process
   it can't prove stays frozen until you check it.
 
-If the menu shows a recovery warning, deal with it before you leave the Mac
-alone. [docs/recovery.md](docs/recovery.md) explains each case.
+If Status details shows a recovery warning, deal with it before you leave
+the Mac alone. [docs/recovery.md](docs/recovery.md) explains each case.
 
 ## Optional extras
 
@@ -203,8 +218,8 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
-[browser] unthrottled". It asks first, because relaunching quits the browser,
+`--disable-renderer-backgrounding`, Status details offers "Relaunch [browser]
+unthrottled". It asks first, because relaunching quits the browser,
 and tabs come back only if the browser reopens them on startup. Some web apps
 may still stop with the lid closed.
 [docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
@@ -246,7 +261,14 @@ swift test
 ```
 
 The tests use fakes and temporary folders, so they never change your power
-settings. See [Contributing](CONTRIBUTING.md), [Security reporting](SECURITY.md),
+settings.
+
+For a UI preview, run `./scripts/preview-app.sh`. It builds a separate debug
+app with temporary data and fake services. Its timer doesn't prevent sleep,
+and it doesn't change power settings, processes, login items or Keychain
+entries. Release bundles built by `scripts/build-app.sh` don't include it.
+[docs/ui-refinement.md](docs/ui-refinement.md) has the preview and validation
+notes. See [Contributing](CONTRIBUTING.md), [Security reporting](SECURITY.md),
 [Release validation](docs/release-validation.md) and [Design notes](docs/spec.md).
 
 ## Star history

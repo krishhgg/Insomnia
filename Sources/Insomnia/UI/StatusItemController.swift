@@ -4,14 +4,14 @@ import SwiftUI
 /// Owns the NSStatusItem and drives every state change of the menu bar UI.
 ///
 /// The status bar button hosts a SwiftUI view and the item's length is
-/// written once to whatever that view fits into (`StatusWidthWriter`); there is no
-/// popover, so the status item is the whole interface apart from a
-/// right-click NSMenu.
+/// written once to whatever that view fits into (`StatusWidthWriter`). A
+/// right-click popover contains quick actions; left-click toggles the session.
+/// The detailed status and recovery actions remain in a native NSMenu.
 /// Keyboard input never reaches a text field inside a status bar window, so
 /// a local key monitor routes digits / Tab / Enter / Esc / Delete to the
 /// focused pill while the pills are open.
 @MainActor
-final class StatusItemController: NSObject {
+final class StatusItemController: NSObject, NSPopoverDelegate {
     /// Builds the width writer over `apply` (which sets the item's length);
     /// tests inject one that records every write.
     typealias WidthWriterFactory = @MainActor (_ apply: @escaping (CGFloat) -> Void) -> StatusWidthWriter
@@ -24,6 +24,8 @@ final class StatusItemController: NSObject {
     /// app delegate, which outlives any one status item.
     private let showSettings: () -> Void
     private let makeWidthWriter: WidthWriterFactory?
+    private let playSessionSound: @MainActor (SessionSoundCue) -> Void
+    private var userEndInFlight = false
     /// Asks before a browser is quit for a relaunch; true means go ahead.
     /// Injected so tests never see the NSAlert.
     private let confirmRelaunch: @MainActor (String) -> Bool
@@ -34,6 +36,10 @@ final class StatusItemController: NSObject {
 
     private let statusItem: NSStatusItem
     private var hostingView: StatusHostingView?
+    private var quickPopover: NSPopover?
+    #if DEBUG
+    private var menuPreviewWindow: NSWindow?
+    #endif
     private var widthWriter: StatusWidthWriter?
 
     private var keyMonitor: Any?
@@ -70,7 +76,8 @@ final class StatusItemController: NSObject {
         showSettings: @escaping () -> Void,
         makeWidthWriter: WidthWriterFactory? = nil,
         confirmRelaunch: (@MainActor (String) -> Bool)? = nil,
-        clock: @escaping @Sendable () -> Date = { Date() }
+        clock: @escaping @Sendable () -> Date = { Date() },
+        playSessionSound: @escaping @MainActor (SessionSoundCue) -> Void = { _ in }
     ) {
         self.manager = manager
         self.status = status
@@ -78,6 +85,7 @@ final class StatusItemController: NSObject {
         self.makeWidthWriter = makeWidthWriter
         self.confirmRelaunch = confirmRelaunch ?? Self.askBeforeRelaunch
         self.clock = clock
+        self.playSessionSound = playSessionSound
         Self.seedPreferredPositionIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = Self.autosaveName
@@ -106,14 +114,14 @@ final class StatusItemController: NSObject {
         let root = StatusRootView(
             model: model,
             manager: manager,
-            onTapIcon: { [weak self] in self?.iconTapped() },
+            onTapIcon: { [weak self] in self?.toggleSession() },
             onTapPill: { [weak self] field in self?.focus(field) },
-            onTapCountdown: { [weak self] in self?.customExtend() },
-            onHoldEnd: { [weak self] in self?.holdToEnd() },
-            onWidthChange: { [weak self] w in self?.widthChanged(w) }
+            onTapCountdown: { [weak self] in self?.toggleSession() },
+            onWidthChange: { [weak self] w in self?.widthChanged(w) },
+            onOpenMenu: { [weak self] in self?.showQuickMenu() }
         )
         let host = Self.makeHostingView(root)
-        host.onRightMouseDown = { [weak self] in self?.showMenu() }
+        host.onRightMouseDown = { [weak self] in self?.showQuickMenu() }
         host.translatesAutoresizingMaskIntoConstraints = true
         // The height follows the button; the width is set from the layout
         // (`retargetWidth`) and never from the button, whose width is the
@@ -275,11 +283,105 @@ final class StatusItemController: NSObject {
 
     // MARK: Clicks
 
+    /// Left-click toggles immediately. Pending starts ignore further clicks
+    /// until the journal-backed lifecycle operation answers.
+    func toggleSession() {
+        quickPopover?.close()
+        guard model.phase != .starting else { return }
+        if manager.isActive {
+            endNow()
+        } else {
+            startPreset(manager.config.defaultPreset)
+        }
+    }
+
+    func startPreset(_ duration: TimeInterval) {
+        guard model.phase != .starting, duration > 0 else { return }
+        quickPopover?.close()
+        model.input = DurationInput.from(seconds: duration)
+        run(mode: manager.isActive ? .extend : .start, duration: duration, usesInlineInput: false)
+    }
+
+    /// Right-click opens quick actions. Build the content when the
+    /// panel opens; no popover view or status queries run while it is closed.
+    func showQuickMenu() {
+        guard let button else { return }
+        if let quickPopover, quickPopover.isShown {
+            quickPopover.close()
+            return
+        }
+        status.refreshInstant()
+        status.refreshOnDemand()
+        model.iconBounce += 1
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.appearance = NSApp.appearance
+        popover.delegate = self
+        // The content owns its short entrance animation instead of stacking
+        // it with AppKit's slower default popover animation.
+        popover.animates = false
+        popover.contentViewController = NSHostingController(rootView: quickMenuContent())
+        quickPopover = popover
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func dismissQuickMenu() {
+        quickPopover?.close()
+        #if DEBUG
+        menuPreviewWindow?.close()
+        #endif
+    }
+
+    private func quickMenuContent() -> QuickMenuView {
+        QuickMenuView(
+            manager: manager,
+            model: model,
+            onPreset: { [weak self] in self?.startPreset($0) },
+            onToggle: { [weak self] in self?.toggleSession() },
+            onSettings: { [weak self] in
+                self?.dismissQuickMenu()
+                self?.openSettings()
+                self?.showSettings()
+            },
+            onDetails: { [weak self] in
+                self?.dismissQuickMenu()
+                self?.showMenu()
+            },
+            onQuit: { NSApp.terminate(nil) },
+            onDismiss: { [weak self] in self?.dismissQuickMenu() }
+        )
+    }
+
+    #if DEBUG
+    /// Uses the same content as the status-item popover. A regular preview
+    /// window lets native UI tools inspect it without controlling system UI.
+    func showMenuPreview() {
+        guard UIPreview.isEnabled else { return }
+        let window = NSWindow(contentViewController: NSHostingController(rootView: quickMenuContent()))
+        window.title = "Insomnia Menu Preview"
+        window.styleMask = [.titled, .closable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        menuPreviewWindow = window
+        window.makeKeyAndOrderFront(nil)
+    }
+    #endif
+
+    func popoverDidClose(_ notification: Notification) {
+        guard let closed = notification.object as? NSPopover, closed === quickPopover else { return }
+        quickPopover = nil
+    }
+
     func iconTapped() {
         model.iconBounce += 1
         switch model.phase {
         case .idle:
-            expand(mode: .start)
+            // Seed the retry fields too, so a refused quick start keeps the
+            // duration the user requested. No input panel or key catcher is
+            // needed for the normal one-click path.
+            model.input = DurationInput.from(seconds: manager.config.defaultPreset)
+            run(mode: .start, duration: manager.config.defaultPreset)
         case let .entering(mode):
             if model.pillsCollapsing {
                 // A close is in flight (Esc, a click away): the phase is
@@ -384,7 +486,7 @@ final class StatusItemController: NSObject {
                 }
             } else {
                 // Already shown: just breathe the focus glow in.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
                     guard let self, self.stageGeneration == generation else { return }
                     withAnimation(Motion.base(reduceMotion: reduceMotion)) {
                         self.model.focusVisible = true
@@ -409,7 +511,7 @@ final class StatusItemController: NSObject {
                 if i == count - 1 {
                     if target > 0 {
                         // Let the last pill land, then breathe the focus glow in.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
                             guard let self, self.stageGeneration == generation else { return }
                             withAnimation(Motion.base(reduceMotion: reduceMotion)) {
                                 self.model.focusVisible = true
@@ -488,7 +590,7 @@ final class StatusItemController: NSObject {
         }
     }
 
-    private func run(mode: MenuBarModel.Mode, duration: TimeInterval) {
+    private func run(mode: MenuBarModel.Mode, duration: TimeInterval, usesInlineInput: Bool = true) {
         removeMonitors()
         startGeneration += 1
         let generation = startGeneration
@@ -525,14 +627,20 @@ final class StatusItemController: NSObject {
         withAnimation(Motion.base(reduceMotion: reduceMotion)) {
             model.focusVisible = false
         }
-        retract { [model] in model.phase }
+        if model.slotsPresent {
+            retract { [model] in model.phase }
+        }
 
         Task { @MainActor in
+            let wasActive = manager.isActive
             switch mode {
             case .start: await manager.start(duration: duration)
             case .extend: await manager.extend(by: duration)
             }
             guard generation == startGeneration else { return }
+            if mode == .start, !wasActive, manager.isActive {
+                playSessionSound(.activated)
+            }
             stopPendingTick()
             model.pendingCountdown = nil
             model.pendingProjection = nil
@@ -546,7 +654,17 @@ final class StatusItemController: NSObject {
             } else if model.phase == .starting {
                 // Start refused: bring the pills back with the value intact
                 // and say so. The full reason is in the right-click menu.
-                reopenAfterFailure(mode: .start)
+                if usesInlineInput {
+                    reopenAfterFailure(mode: .start)
+                } else {
+                    // The quick menu owns errors for the new click flow.
+                    // Do not open the legacy inline duration editor.
+                    stageGeneration += 1
+                    model.pillsCollapsing = false
+                    model.slotsPresent = false
+                    model.visiblePills = 0
+                    model.phase = .idle
+                }
             }
         }
     }
@@ -612,8 +730,15 @@ final class StatusItemController: NSObject {
     // MARK: Session actions
 
     private func endNow() {
+        guard !userEndInFlight else { return }
+        userEndInFlight = true
         Task { @MainActor in
-            await manager.end(reason: .user)
+            defer { userEndInFlight = false }
+            let wasActive = manager.isActive
+            let outcome = await manager.end(reason: .user)
+            if wasActive, !manager.isActive, outcome == .restored {
+                playSessionSound(.deactivated)
+            }
         }
     }
 
@@ -631,10 +756,10 @@ final class StatusItemController: NSObject {
         expand(mode: .extend)
     }
 
-    // MARK: Right-click menu
+    // MARK: Detailed status menu
 
-    /// Right-click (or ctrl-click) on the status item. Not assigned to
-    /// `statusItem.menu`, which would swallow the left click the pills need.
+    /// Opened from the quick menu. Not assigned to `statusItem.menu`, which
+    /// would swallow the custom left and right click gestures.
     private func showMenu() {
         guard let button else { return }
         // The lid, the battery and the watts are read right here, so the menu
@@ -687,8 +812,7 @@ final class StatusItemController: NSObject {
             error: manager.lastError,
             commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
-            outputsWaiting: manager.outputsWaitingForRestore,
-            lidSimulationBuild: LidSimulationBuild.isCompiledIn
+            outputsWaiting: manager.outputsWaitingForRestore
         )
     }
 
@@ -849,6 +973,73 @@ final class StatusItemController: NSObject {
 /// on a one-button mouse.
 final class StatusHostingView: NSHostingView<StatusRootView> {
     var onRightMouseDown: (() -> Void)?
+    private var menuMouseMonitor: Any?
+    private var menuMouseButton: Int?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let menuMouseMonitor { NSEvent.removeMonitor(menuMouseMonitor) }
+        menuMouseMonitor = nil
+        menuMouseButton = nil
+        guard window != nil else { return }
+        // SwiftUI has its own event handling below hitTest. Consume the
+        // whole menu gesture before it can reach a descendant Button.
+        menuMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+            .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+            .leftMouseDown, .leftMouseUp, .leftMouseDragged
+        ]) { [weak self] event in
+            let consumed = MainActor.assumeIsolated {
+                guard let self else { return false }
+                return self.filterMenuMouse(event) == nil
+            }
+            return consumed ? nil : event
+        }
+    }
+
+    isolated deinit {
+        if let menuMouseMonitor { NSEvent.removeMonitor(menuMouseMonitor) }
+    }
+
+    /// Nil means that the event belongs solely to the quick-menu gesture.
+    /// Kept at the AppKit boundary so tests can use private, unshown windows.
+    func filterMenuMouse(_ event: NSEvent) -> NSEvent? {
+        if let menuMouseButton, event.buttonNumber == menuMouseButton {
+            switch event.type {
+            case .leftMouseUp, .rightMouseUp:
+                self.menuMouseButton = nil
+                return nil
+            case .leftMouseDragged, .rightMouseDragged:
+                return nil
+            default: break
+            }
+        }
+        guard let window, event.window === window,
+              bounds.contains(convert(event.locationInWindow, from: nil)),
+              !Self.usesSystemDrag(modifiers: event.modifierFlags),
+              Self.handlesMenu(type: event.type, modifiers: event.modifierFlags) else { return event }
+        menuMouseButton = event.buttonNumber
+        onRightMouseDown?()
+        return nil
+    }
+
+    /// Hand Command-drag to NSStatusBarButton. SwiftUI's buttons would
+    /// otherwise consume the down event before macOS can move the item.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let event = NSApp.currentEvent
+        if Self.usesSystemDrag(modifiers: event?.modifierFlags ?? []) { return nil }
+        guard let target = super.hitTest(point) else { return nil }
+        // Keep menu gestures out of SwiftUI's descendant button views.
+        if let event, Self.handlesMenu(type: event.type, modifiers: event.modifierFlags) { return self }
+        return target
+    }
+
+    static func usesSystemDrag(modifiers: NSEvent.ModifierFlags) -> Bool {
+        modifiers.contains(.command)
+    }
+
+    static func handlesMenu(type: NSEvent.EventType, modifiers: NSEvent.ModifierFlags) -> Bool {
+        type == .rightMouseDown || (type == .leftMouseDown && modifiers.contains(.control))
+    }
 
     override func rightMouseDown(with event: NSEvent) {
         onRightMouseDown?()

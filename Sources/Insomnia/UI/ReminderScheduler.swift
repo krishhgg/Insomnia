@@ -15,7 +15,10 @@ final class ReminderScheduler {
     /// Bundled apps only: `UNUserNotificationCenter.current()` traps when
     /// there is no bundle proxy for the process.
     static var canNotify: Bool {
-        Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
+        #if DEBUG
+        if UIPreview.isEnabled { return false }
+        #endif
+        return Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
     }
 
     /// Keep the timer in step with the session deadline.

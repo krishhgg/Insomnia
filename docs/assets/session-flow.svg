@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1130" height="170" viewBox="0 0 1130 170" role="img" aria-labelledby="sb-title sb-desc">
   <title id="sb-title">Insomnia session in the menu bar</title>
-  <desc id="sb-desc">Three menu bar snapshots side by side. Set a duration: clicking the closed eye shows three pills labelled Days, Hours and Minutes, with Hours focused. Watch the countdown: the eye opens, showing its pupil, and a live countdown of 3:59:41 ticks beside it, followed by a small x. Hold to end: pressing and holding the x fills a ring around it while the countdown reads 3:59:40.</desc>
+  <desc id="sb-desc">Left-click the resting eye to start the configured default session, initially four hours. Right-click opens quick actions. The eye opens while the countdown runs in hours and minutes. Left-click the eye or timer to end early.</desc>
   <style>
     svg { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif; }
     .bg { fill: #242628; }
@@ -12,16 +12,12 @@
     .pill-ph { fill: #FFFFFF; fill-opacity: 0.42; }
     .focus { fill: none; stroke: #A6BBC3; stroke-width: 2.7; }
     .count { fill: #FFFFFF; }
-    .track { fill: none; stroke: #FFFFFF; stroke-opacity: 0.14; stroke-width: 2.9; }
-    .prog { fill: none; stroke: #A6BBC3; stroke-width: 2.9; stroke-linecap: round; }
-    .x { fill: none; stroke: #FFFFFF; stroke-opacity: 0.85; stroke-width: 2.6; stroke-linecap: round; }
   </style>
   <defs>
     <!-- EyeMarkGeometry on its 24-unit grid, monochrome. Closed: the lid shades the whole lens, lashes below.
          Open: lid gone, pupil with its highlight bite showing, lashes above. Paths match docs/mockups/menubar-ux.html. -->
     <g id="sb-mark-closed">
-      <path class="mark-fill" d="M1.5 12 C7 4.5 17 4.5 22.5 12 C17 19.5 7 19.5 1.5 12 Z"/>
-      <path class="mark-line" d="M1.5 12 C7 4.5 17 4.5 22.5 12 C17 19.5 7 19.5 1.5 12 Z"/>
+      <path class="mark-line" d="M1.5 12 C7 19.5 17 19.5 22.5 12"/>
       <path class="mark-line" d="M4.5499 17.8023 L3.1442 20.1659 M8.2636 19.3782 L7.5468 22.0332 M12 19.875 L12 22.625 M15.7364 19.3782 L16.4532 22.0332 M19.4501 17.8023 L20.8558 20.1659"/>
     </g>
     <g id="sb-mark-open">
@@ -38,19 +34,13 @@
        captions share the baseline y=50 and are centred over their own strip. -->
 
   <!-- 1. Set a duration: bar 388 x 56 native, 485 x 70 drawn, x 28..513 -->
-  <text class="cap" x="270.5" y="50" font-size="24" font-weight="600" text-anchor="middle">Set a duration</text>
+  <text class="cap" x="270.5" y="50" font-size="24" font-weight="600" text-anchor="middle">Left-click to start</text>
   <g transform="translate(28 72) scale(1.25)">
     <rect class="bar" x="0" y="0" width="388" height="56" rx="12"/>
     <g transform="translate(14 12.7) scale(1.275)">
       <use href="#sb-mark-closed"/>
     </g>
-    <rect class="pill" x="62" y="11" width="80" height="34" rx="12.6"/>
-    <text class="pill-ph" x="102" y="36" font-size="22" text-anchor="middle">Days</text>
-    <rect class="pill" x="154" y="11" width="92" height="34" rx="12.6"/>
-    <rect class="focus" x="155.4" y="12.4" width="89.2" height="31.2" rx="11.2"/>
-    <text class="pill-ph" x="200" y="36" font-size="22" text-anchor="middle">Hours</text>
-    <rect class="pill" x="258" y="11" width="116" height="34" rx="12.6"/>
-    <text class="pill-ph" x="316" y="36" font-size="22" text-anchor="middle">Minutes</text>
+    <text class="count" x="62" y="36" font-size="22" font-weight="500">Default session: 4h</text>
   </g>
 
   <!-- 2. Watch the countdown: bar 210 x 56 native, 262.5 x 70 drawn, x 545..807.5 -->
@@ -60,25 +50,16 @@
     <g transform="translate(14 12.7) scale(1.275)">
       <use href="#sb-mark-open"/>
     </g>
-    <text class="count" x="62" y="36" font-size="24" font-weight="500">3:59:41</text>
-    <g transform="translate(174 28)">
-      <circle class="track" cx="0" cy="0" r="14.5"/>
-      <path class="x" d="M-4.5 -4.5 L4.5 4.5 M4.5 -4.5 L-4.5 4.5"/>
-    </g>
+    <text class="count" x="62" y="36" font-size="24" font-weight="500">4:00</text>
   </g>
 
-  <!-- 3. Hold to end: same strip, x held with the ring about 60% filled clockwise from the top, x 839.5..1102 -->
-  <text class="cap" x="970.75" y="50" font-size="24" font-weight="600" text-anchor="middle">Hold to end</text>
+  <!-- 3. Left-click to end: resting eye, x 839.5..1102 -->
+  <text class="cap" x="970.75" y="50" font-size="24" font-weight="600" text-anchor="middle">Left-click to end</text>
   <g transform="translate(839.5 72) scale(1.25)">
     <rect class="bar" x="0" y="0" width="210" height="56" rx="12"/>
     <g transform="translate(14 12.7) scale(1.275)">
-      <use href="#sb-mark-open"/>
+      <use href="#sb-mark-closed"/>
     </g>
-    <text class="count" x="62" y="36" font-size="24" font-weight="500">3:59:40</text>
-    <g transform="translate(174 28) scale(1.12)">
-      <circle class="track" cx="0" cy="0" r="14.5"/>
-      <path class="prog" d="M0 -14.5 A14.5 14.5 0 1 1 -8.52 11.73"/>
-      <path class="x" d="M-4.5 -4.5 L4.5 4.5 M4.5 -4.5 L-4.5 4.5"/>
-    </g>
+    <text class="count" x="62" y="36" font-size="24" font-weight="500">Off</text>
   </g>
 </svg>

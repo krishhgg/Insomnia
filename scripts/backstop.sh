@@ -188,6 +188,16 @@ STAT=/usr/bin/stat
 # bundle here, copying the binary before Info.plist.
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
+# A signed bundle can live in /Applications or the user's Applications folder.
+# Use the sibling binary of this sealed script, rather than a different install.
+# Checkout/test copies retain the fixed fallback above.
+case "${BASH_SOURCE[0]}" in
+  /*.app/Contents/Resources/backstop.sh)
+    BUNDLED_APP="${BASH_SOURCE[0]%/Contents/Resources/backstop.sh}"
+    INSOMNIA_BIN="$BUNDLED_APP/Contents/MacOS/Insomnia"
+    INSOMNIA_INFO="$BUNDLED_APP/Contents/Info.plist"
+    ;;
+esac
 RESUME_FROZEN_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is
