@@ -290,6 +290,7 @@ below cover what only a real Mac shows.
 - Hotspot permission, association, cancellation, and reconnect
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
+- An open network (a second phone or router, no password) broadcasting the configured hotspot's SSID during an outage: insomnia.log says "hotspot join refused", the Mac does not associate to it, and with the iPhone also on, the join goes to the iPhone
 
 ### Install, upgrade and uninstall
 

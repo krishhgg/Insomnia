@@ -8,7 +8,9 @@ Set **System Settings → Wi-Fi → Ask to join hotspots → Automatically**, th
 enter the hotspot SSID and password in Insomnia Settings. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
 CoreWLAN to find and join that network without putting the password in process
-arguments.
+arguments. It joins only a WPA2 or WPA3 network with that name: an open
+network using the hotspot's name is refused, because it could be someone
+else's lookalike.
 
 The Keychain item's access list names only the build of Insomnia that saved
 it, and Insomnia reads it with Keychain prompts switched off, so a join during

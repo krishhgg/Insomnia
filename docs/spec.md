@@ -655,7 +655,11 @@ provided by the standalone backstop. Performance effects depend on workload.
 
 - `NWPathMonitor` on the Wi-Fi interface. Event-driven.
 - Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
-  scan, then join with `associate(to:password:)`. The password is read from
+  scan, then join the strongest WPA2 or WPA3 Personal result with
+  `associate(to:password:)`. An open, WEP or OWE network with the hotspot's
+  name is refused and logged: it could be a lookalike that never needed the
+  password, so joining it would hand the session's traffic to whoever runs
+  it. The password is read from
   the login Keychain (generic-password service `insomnia-hotspot`, account =
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
