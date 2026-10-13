@@ -99,12 +99,25 @@ The defaults are worth knowing:
   read. One failed read is tolerated, and the level is re-read every 30 s
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
-  session. These rules require the app to be running.
+  session. When one of these rules ends a session with the lid closed,
+  Insomnia also puts the Mac to sleep, unless macOS keeps it awake closed
+  (an external display in clamshell mode). These rules require the app to
+  be running.
   Setting the end floor to 0 turns the battery end off. Otherwise the end
   floor stays below the Low Power Mode floor. The Settings steppers move the
   other floor when the two would cross, and a hand-edited `config.json` with
   the floors out of order is corrected at launch, and logged, by raising the
   Low Power Mode floor.
+- **Heat:** Low Power Mode turned on for a serious thermal state stays on
+  until the state is back to nominal, or until the session ends if it stays
+  at fair. Switched off at fair, it would bring back the load that made the
+  Mac serious, and go on and off as the Mac heats up again. A serious state
+  that lasts 15 minutes without a break ends the session ("End after serious
+  heat for" in Settings, in 5-minute steps up to 60, or Off), since Apple
+  silicon throttles before it reaches critical and a Mac that cannot shed its
+  heat, in a bag say, can stay serious for hours. With the lid closed that
+  end puts the Mac to sleep, as the critical end does. During a session, a
+  floor or a heat setting changed in Settings applies at once.
 
 ## Upgrading from an earlier build
 

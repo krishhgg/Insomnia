@@ -222,6 +222,13 @@ final class UIStatusTests: XCTestCase {
             StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: "", batteryPercent: 82, isCharging: true),
             "Lid: open \u{00B7} 82% charging"
         )
+        // A thermal state above nominal is named; nominal is left out.
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: true, watts: 6.04, wifiSSID: "iPhone", batteryPercent: 64, isCharging: false, thermal: .serious),
+            "Lid: closed \u{00B7} 6.0 W \u{00B7} 64% \u{00B7} Thermal: serious \u{00B7} Wi-Fi: iPhone"
+        )
+        XCTAssertEqual(StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: nil, batteryPercent: nil, isCharging: false, thermal: .fair), "Lid: open \u{00B7} Thermal: fair")
+        XCTAssertEqual(StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: nil, batteryPercent: nil, isCharging: false, thermal: .nominal), "Lid: open")
     }
 
     func testActionsLine() {
@@ -229,6 +236,28 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(StatusLines.actions(frozenCount: 3, dockerPaused: true, lastGap: nil), "3 apps frozen \u{00B7} Docker paused")
         XCTAssertEqual(StatusLines.actions(frozenCount: 1, dockerPaused: false, lastGap: 12.4), "1 app frozen \u{00B7} last gap 12s")
         XCTAssertEqual(StatusLines.actions(frozenCount: 0, dockerPaused: true, lastGap: 0), "Docker paused")
+        XCTAssertEqual(StatusLines.actions(frozenCount: 0, dockerPaused: false, lastGap: nil, lowPower: true), "Low Power Mode set by Insomnia")
+        XCTAssertEqual(StatusLines.actions(frozenCount: 2, dockerPaused: false, lastGap: nil, lowPower: true), "Low Power Mode set by Insomnia \u{00B7} 2 apps frozen")
+    }
+
+    /// The menu reads Low Power Mode from the journal and the thermal state
+    /// from the status source.
+    @MainActor
+    func testMenuShowsInsomniasLowPowerModeAndTheThermalState() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let source = RecordingStatusSource()
+        source.thermalState = .serious
+        XCTAssertTrue(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Lid: open \u{00B7} Thermal: serious"))
+        XCTAssertFalse(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
+
+        await m.setLowPower(true)
+        XCTAssertTrue(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
+
+        await m.end(reason: .user)
+        XCTAssertFalse(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
     }
 
     func testThrottleWarning() {
@@ -1181,6 +1210,7 @@ final class RecordingStatusSource: StatusSource {
     var lidClosed = false
     var batteryPercent: Int? = nil
     var isCharging = false
+    var thermalState: ProcessInfo.ThermalState = .nominal
     var wifiSSID: String? = nil
     var lastGap: TimeInterval? = nil
     var frozenCount = 0

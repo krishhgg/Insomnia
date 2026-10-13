@@ -34,6 +34,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(c.freezeAllApps, "freeze-all is opt in")
         XCTAssertTrue(c.lowPowerOnLidClose)
         XCTAssertTrue(c.thermalRules)
+        XCTAssertEqual(c.seriousThermalLimit, 15 * 60)
         XCTAssertFalse(c.disableAppNapForAgents, "writing other apps' preferences is opt-in")
         XCTAssertEqual(c.hotspotSSID, "")
         XCTAssertEqual(c.tmuxTargets, [])
@@ -150,6 +151,36 @@ final class ConfigTests: XCTestCase {
             XCTAssertNil(c.normalizeFloors(), "\(low)/\(end)")
             XCTAssertEqual([c.lowPowerFloor, c.endFloor], [low, end])
         }
+    }
+
+    // MARK: Serious thermal limit
+
+    /// A config.json without the key gets the 15 minutes; 0 (off) is kept
+    /// as written and round-trips.
+    func testSeriousThermalLimitDecodesTolerantly() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"thermalRules": true}"#.utf8))
+        XCTAssertEqual(legacy.seriousThermalLimit, 15 * 60)
+        let off = try Store.makeDecoder().decode(Config.self, from: Data(#"{"seriousThermalLimit": 0}"#.utf8))
+        XCTAssertEqual(off.seriousThermalLimit, 0)
+        let data = try Store.makeEncoder().encode(off)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), off)
+    }
+
+    func testNormalizeSeriousThermalLimitClampsToTheSettingsRange() {
+        var c = Config()
+        XCTAssertNil(c.normalizeSeriousThermalLimit())
+        c.seriousThermalLimit = -60
+        XCTAssertEqual(c.normalizeSeriousThermalLimit(), "seriousThermalLimit corrected: -60.0 -> 0.0")
+        XCTAssertEqual(c.seriousThermalLimit, 0)
+        c.seriousThermalLimit = 7200
+        XCTAssertEqual(c.normalizeSeriousThermalLimit(), "seriousThermalLimit corrected: 7200.0 -> 3600.0")
+        XCTAssertEqual(c.seriousThermalLimit, 3600)
+    }
+
+    func testSeriousThermalLimitText() {
+        XCTAssertEqual(Config.seriousThermalLimitText(15 * 60), "15 minutes")
+        XCTAssertEqual(Config.seriousThermalLimitText(60), "1 minute")
+        XCTAssertEqual(Config.seriousThermalLimitText(90), "90 s")
     }
 
     func testPartialJSONFillsDefaults() throws {
@@ -402,6 +433,18 @@ final class ConfigLoadTests: XCTestCase {
         let log = log()
         XCTAssertTrue(log.contains("[error] insomnia: config.json: battery floors corrected: lowPowerFloor 40 -> 65, endFloor 60 -> 60; could not save the correction: "), log)
         XCTAssertFalse(log.contains("; saved"), log)
+    }
+
+    func testAHandEditedSeriousThermalLimitIsCorrectedLoggedAndWrittenBack() throws {
+        var bad = Config()
+        bad.seriousThermalLimit = -5
+        try h.store.saveConfig(bad)
+
+        let m = h.makeManager()
+
+        XCTAssertEqual(m.config.seriousThermalLimit, 0)
+        XCTAssertEqual(try h.store.loadConfig(), m.config, "the corrected config was not written back")
+        XCTAssertTrue(log().contains("[info] insomnia: config.json: seriousThermalLimit corrected: -5.0 -> 0.0; saved"), log())
     }
 
     func testOrderedFloorsLoadUnchanged() throws {

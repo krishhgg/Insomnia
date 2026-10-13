@@ -93,6 +93,14 @@ struct SettingsView: View {
         Binding(get: { manager.config.endFloor }, set: { v in update { $0.setEndFloor(v) } })
     }
 
+    /// `seriousThermalLimit` in whole minutes, the stepper's unit.
+    private var seriousThermalMinutes: Binding<Int> {
+        Binding(
+            get: { Int(manager.config.seriousThermalLimit / 60) },
+            set: { minutes in update { $0.seriousThermalLimit = TimeInterval(minutes) * 60 } }
+        )
+    }
+
     // MARK: Sections
 
     private var sessionSection: some View {
@@ -191,9 +199,9 @@ struct SettingsView: View {
             Text(Self.microphoneNote)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            // A floor input: the manager applies a change at once
+            // (`SessionManager.floorInputsChanged`).
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
-                // A floor input: apply it now if the lid is already closed.
-                .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
         } header: {
             Text("Lid-close actions")
         } footer: {
@@ -243,7 +251,14 @@ struct SettingsView: View {
             Text("0 turns the battery end off. The end floor stays below the Low Power Mode floor. Moving one onto the other moves it along.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
+            Toggle("Thermal rules (Low Power Mode when hot, end when too hot)", isOn: bind(\.thermalRules))
+            Stepper(value: seriousThermalMinutes, in: 0...Int(Config.maxSeriousThermalLimit / 60), step: Int(Config.seriousThermalLimitStep / 60)) {
+                LabeledContent("End after serious heat for", value: manager.config.seriousThermalLimit > 0 ? Config.seriousThermalLimitText(manager.config.seriousThermalLimit) : "Off")
+            }
+            .disabled(!manager.config.thermalRules)
+            Text("Low Power Mode turned on for heat stays on until the thermal state is back to nominal. Serious heat that lasts this long ends the session; step down to Off to keep it running. Critical heat ends it at once.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

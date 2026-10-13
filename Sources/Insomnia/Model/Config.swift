@@ -57,6 +57,11 @@ struct Config: Codable, Equatable, Sendable {
     /// `setLowPowerFloor` and `normalizeFloors`.
     var endFloor: Int = 10
     var thermalRules: Bool = true
+    /// Seconds the thermal state may stay serious, without a break, before
+    /// the thermal rules end the session. 0 turns this end off; critical
+    /// still ends it at once. 15 minutes by default, also for a
+    /// config.json without the key.
+    var seriousThermalLimit: TimeInterval = 15 * 60
 
     // Network failover
     var hotspotSSID: String = ""
@@ -159,6 +164,7 @@ struct Config: Codable, Equatable, Sendable {
         lowPowerFloor = try c.decodeIfPresent(Int.self, forKey: .lowPowerFloor) ?? d.lowPowerFloor
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
+        seriousThermalLimit = try c.decodeIfPresent(TimeInterval.self, forKey: .seriousThermalLimit) ?? d.seriousThermalLimit
         hotspotSSID = try c.decodeIfPresent(String.self, forKey: .hotspotSSID) ?? d.hotspotSSID
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
@@ -233,6 +239,21 @@ extension Config {
     /// gets its chance before the end.
     var floorsAreOrdered: Bool { endFloor == 0 || endFloor < lowPowerFloor }
 
+    /// The settings the floor rules read (`FloorRules.evaluate`). A change
+    /// to any of them during a session runs the floors at once
+    /// (`SessionManager.floorInputsChanged`).
+    struct FloorInputs: Equatable {
+        var lowPowerFloor: Int
+        var endFloor: Int
+        var thermalRules: Bool
+        var seriousThermalLimit: TimeInterval
+        var lowPowerOnLidClose: Bool
+    }
+
+    var floorInputs: FloorInputs {
+        FloorInputs(lowPowerFloor: lowPowerFloor, endFloor: endFloor, thermalRules: thermalRules, seriousThermalLimit: seriousThermalLimit, lowPowerOnLidClose: lowPowerOnLidClose)
+    }
+
     /// Sets the end floor (0...`maxEndFloor`) and raises the Low Power Mode
     /// floor one step above it when it would otherwise not be above it.
     mutating func setEndFloor(_ value: Int) {
@@ -265,5 +286,33 @@ extension Config {
         }
         guard (lowPowerFloor, endFloor) != before else { return nil }
         return "battery floors corrected: lowPowerFloor \(before.0) -> \(lowPowerFloor), endFloor \(before.1) -> \(endFloor)"
+    }
+}
+
+// MARK: Serious thermal limit
+
+extension Config {
+    /// Settings step and highest value for `seriousThermalLimit`.
+    static let seriousThermalLimitStep: TimeInterval = 5 * 60
+    static let maxSeriousThermalLimit: TimeInterval = 60 * 60
+
+    /// Clamps `seriousThermalLimit` to the range Settings offers, 0 to 60
+    /// minutes. Returns a description of the change for the log, or nil
+    /// when nothing changed. Run, like `normalizeFloors`, on a config.json
+    /// that Settings did not write.
+    mutating func normalizeSeriousThermalLimit() -> String? {
+        let before = seriousThermalLimit
+        seriousThermalLimit = min(max(seriousThermalLimit, 0), Config.maxSeriousThermalLimit)
+        guard seriousThermalLimit != before else { return nil }
+        return "seriousThermalLimit corrected: \(before) -> \(seriousThermalLimit)"
+    }
+
+    /// A limit in the range Settings offers, as the end notification and
+    /// Settings say it: "15 minutes", "1 minute", or seconds when it is not
+    /// whole minutes.
+    static func seriousThermalLimitText(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds.rounded())
+        guard s >= 60, s % 60 == 0 else { return "\(s) s" }
+        return s == 60 ? "1 minute" : "\(s / 60) minutes"
     }
 }

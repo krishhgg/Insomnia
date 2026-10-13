@@ -10,6 +10,9 @@ enum EndReason: String, Sendable {
     /// while on battery: the end floor could not be applied.
     case batteryUnreadable
     case thermalCritical
+    /// The thermal state stayed serious, without a break, for
+    /// `Config.seriousThermalLimit`.
+    case thermalSustained
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
     /// agent, journal, or hold sleep for it, so it ended the session instead
@@ -19,6 +22,15 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
+
+    /// The floor-rule ends, made for heat or a dying battery. With the lid
+    /// closed they also ask macOS to sleep (`SessionManager.sleepClosedLidIfOwed`).
+    var sleepsAClosedLid: Bool {
+        switch self {
+        case .thermalCritical, .thermalSustained, .batteryFloor, .batteryUnreadable: true
+        case .timer, .user, .quit, .backstop, .recoveryUnavailable, .startFailed: false
+        }
+    }
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -95,7 +107,14 @@ enum TransactionRefusal: Error, Sendable {
 final class SessionManager {
     private(set) var session: Session?
     private(set) var state: RuntimeState
-    var config: Config
+    /// Settings writes every change through here. A change to an input of
+    /// the floor rules calls `floorInputsChanged`, so it applies now rather
+    /// than at the next battery, thermal or lid event.
+    var config: Config {
+        didSet {
+            if config.floorInputs != oldValue.floorInputs { floorInputsChanged?() }
+        }
+    }
     /// Minute-granularity remaining time for the popover ("2h 14m").
     private(set) var remainingText: String = ""
     /// Live `H:MM:SS` countdown for the status item, updated at 1 Hz.
@@ -374,6 +393,7 @@ final class SessionManager {
     private let appNap: any AppNapPreferencing
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
+    private let closedLidSleep: any ClosedLidSleeping
     private let clock: @Sendable () -> Date
     /// What the process table says a pid is now. Read only, to tell whether
     /// a recorded command is still running (`recordedLockHolder`).
@@ -428,6 +448,11 @@ final class SessionManager {
     /// event once the lid debounce has settled, and runs the floor rules
     /// on the corrected journal. nil in tests that do not wire it.
     var resyncAfterCommand: (@MainActor (_ replayLid: Bool) -> Void)?
+    /// Called when `config` changes a battery floor, the thermal rules, the
+    /// serious heat limit or the lid option (`Config.floorInputs`):
+    /// `AppServices` runs the floors at once (`reevaluateFloors`). nil in
+    /// tests that do not wire it.
+    var floorInputsChanged: (@MainActor () -> Void)?
     /// How far the panel may have drifted from a value written under Low
     /// Power Mode (auto-brightness moves it slowly) and still count as
     /// untouched by the user when the mode ends. A larger difference is a
@@ -441,6 +466,10 @@ final class SessionManager {
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
+    /// Set by a floor-rule end. Cleared once the sleep is asked, the lid
+    /// opens, macOS keeps the closed Mac awake, or a start begins.
+    @ObservationIgnored private var closedLidSleepOwed = false
+    @ObservationIgnored private var closedLidSleepRetry: Timer?
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -463,6 +492,8 @@ final class SessionManager {
     @ObservationIgnored private(set) var pendingEnd: EndReason?
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
+    /// Lifecycle operations queued or running.
+    @ObservationIgnored private var lifecycleOperations = 0
     /// Detail of the last unreadable-journal notification, so a journal
     /// that stays broken is announced once, not on every transaction.
     @ObservationIgnored private var announcedCorruption: String?
@@ -541,6 +572,7 @@ final class SessionManager {
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
+        closedLidSleep: any ClosedLidSleeping = NoopClosedLidSleep(),
         clock: @escaping @Sendable () -> Date = { Date() },
         processLookup: @escaping @Sendable (Int32) -> ProcessLookup = { SignalProcessControl.processTableState(pid: $0) },
         recoveryLockTimeout: TimeInterval = 10,
@@ -562,6 +594,7 @@ final class SessionManager {
         self.appNap = appNap
         self.notifier = notifier
         self.clamshell = clamshell
+        self.closedLidSleep = closedLidSleep
         self.clock = clock
         self.processLookup = processLookup
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
@@ -591,6 +624,7 @@ final class SessionManager {
             // Settings keeps the end floor below the Low Power Mode floor; a
             // hand-edited config.json may not. Fix it here and write it back.
             var corrections = c.normalizeFloors().map { [$0] } ?? []
+            if let limit = c.normalizeSeriousThermalLimit() { corrections.append(limit) }
             // Once for a config.json an earlier build saved: written back
             // with the mark, so a setting the user turns back stays back.
             let earlierBuild = !c.lidCloseDefaultsApplied
@@ -642,7 +676,8 @@ final class SessionManager {
             display: display,
             keyboard: keyboard,
             appNap: CFAppNapPreferences(),
-            notifier: notifier
+            notifier: notifier,
+            closedLidSleep: IOKitClosedLidSleep()
         )
         let services = AppServices(
             paths: paths,
@@ -692,6 +727,8 @@ final class SessionManager {
     /// the refusal itself, before the caller resumes: the command can exit
     /// and its holder settle in between, and must find the work then.
     private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
+        lifecycleOperations += 1
+        defer { lifecycleOperations -= 1 }
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
@@ -1191,6 +1228,8 @@ final class SessionManager {
             Log.info("start abandoned: an end was requested first")
             return
         }
+        // The person wants the Mac awake now.
+        closedLidSleepOwed = false
         let now = clock()
         let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A
@@ -1313,6 +1352,7 @@ final class SessionManager {
     func end(reason: EndReason) async -> EndOutcome {
         endTicket += 1
         if reason == .quit { quitRequested = true }
+        if reason.sleepsAClosedLid { closedLidSleepOwed = true }
         retryTimer?.invalidate()
         retryTimer = nil
         let outcome: EndOutcome
@@ -1348,7 +1388,51 @@ final class SessionManager {
             // are refused and quit is deferred until then.
             break
         }
+        switch outcome {
+        case .restored, .incomplete, .sessionRetained: sleepClosedLidIfOwed()
+        // Nothing was undone yet. The end that runs later asks.
+        case .locked, .journalUnreadable, .privilegedCommandRunning: break
+        }
         return outcome
+    }
+
+    /// macOS asks for a closed lid's sleep once, at the close, and the sleep
+    /// guard refuses it. Turning the guard off does not make macOS ask
+    /// again, so a floor-rule end asks here (spec section 6). macOS refuses
+    /// while sleep is still disabled, as after a failed `disablesleep 0`
+    /// that the recovery agent retries, so a refusal asks again later.
+    private func sleepClosedLidIfOwed(retrying: Bool = false) {
+        closedLidSleepRetry?.invalidate()
+        closedLidSleepRetry = nil
+        guard closedLidSleepOwed, session == nil else { return }
+        // Never in the middle of a start, an end or a live `sudo pmset`.
+        guard lifecycleOperations == 0, unfinishedCommand?.isRunning != true else {
+            return askForClosedLidSleepLater()
+        }
+        // False with an external display in clamshell mode.
+        guard clamshell() == true, closedLidSleep.lidCloseCausesSleep() == true else {
+            Log.info("floor-rule end: the lid is open, or macOS keeps this closed Mac awake, so no sleep is requested")
+            closedLidSleepOwed = false
+            return
+        }
+        do {
+            try closedLidSleep.requestSleep()
+            closedLidSleepOwed = false
+            Log.info("floor-rule end with the lid closed: sleep requested")
+        } catch {
+            if !retrying {
+                Log.error("floor-rule end with the lid closed: sleep request refused, asking again every \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            }
+            askForClosedLidSleepLater()
+        }
+    }
+
+    private func askForClosedLidSleepLater() {
+        let timer = Timer(timeInterval: recoveryRetryDelay, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.sleepClosedLidIfOwed(retrying: true) }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        closedLidSleepRetry = timer
     }
 
     private func performEnd(reason: EndReason) async -> EndOutcome {
@@ -3180,6 +3264,10 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
+        // The limit may have been turned off between a refused end and its retry.
+        case .thermalSustained: config.seriousThermalLimit > 0
+            ? "Thermal state stayed serious for \(Config.seriousThermalLimitText(config.seriousThermalLimit)). Sleep is back to normal."
+            : "Thermal state stayed serious too long. Sleep is back to normal."
         case .backstop: outputsWaiting
             ? "A previous session left changes behind. Sleep is back to normal."
             : "A previous session left changes behind; everything has been undone."
