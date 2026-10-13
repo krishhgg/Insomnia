@@ -205,3 +205,28 @@ enum DurationParser {
         return TimeInterval(total)
     }
 }
+
+/// Saved by name ("days", "hours", "minutes") so config.json stays readable
+/// and does not depend on the order of the cases.
+extension DurationInput.Field: Codable {
+    private var name: String {
+        switch self {
+        case .days: "days"
+        case .hours: "hours"
+        case .minutes: "minutes"
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let name = try decoder.singleValueContainer().decode(String.self)
+        guard let field = Self.allCases.first(where: { $0.name == name }) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "unknown field \(name)"))
+        }
+        self = field
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(name)
+    }
+}

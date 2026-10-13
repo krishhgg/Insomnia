@@ -1057,7 +1057,8 @@ small settings window. Like `session.json`, `state.json` and the recovery
 lock it is created mode 0600 in a 0700 directory, and a looser file from an
 older build is tightened when the app reads it:
 
-- presets, default preset
+- presets, default preset, default field (the pill focused when the pills open:
+  days, hours or minutes; hours by default)
 - freeze list (bundle ids), freeze every other app on/off (default off),
   Docker rule on/off, mute on lid close on/off (default on). Under the mute
   toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
@@ -1128,7 +1129,8 @@ one after another with a short stagger.
   Seconds are meaningless for keeping a laptop awake and days are needed.
   (Flip this in one line if you want the reference exactly.)
 - Each pill is a numeric field. Placeholder text is the unit name; typing
-  replaces it with the number and the pill grows to fit. Tab and Shift-Tab
+  replaces it with the number and the pill grows to fit. The pills open on
+  the default field from Settings (hours unless changed). Tab and Shift-Tab
   move between pills, Enter starts the session, Esc collapses.
 - The "?" badge on each pill is a help affordance: hover shows a tooltip
   ("Up to 30 days" etc.). It is not an input.

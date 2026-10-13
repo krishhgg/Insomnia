@@ -128,6 +128,12 @@ struct SettingsView: View {
                     Text(chipLabel(for: manager.config.defaultPreset)).tag(manager.config.defaultPreset)
                 }
             }
+            Picker("Default field", selection: bind(\.defaultFocusField)) {
+                ForEach(DurationInput.Field.allCases, id: \.self) { field in
+                    Text(field.placeholder).tag(field)
+                }
+            }
+            .help("The pill that is focused when the pills open")
             LabeledContent("Maximum session") {
                 Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
             }
