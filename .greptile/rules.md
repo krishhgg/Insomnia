@@ -89,8 +89,16 @@ The app and the script serialize on one `flock(2)` lock,
 (`RecoveryLock.swift`; `lockf` on fd 9 in the scripts). `uninstall.sh`
 takes the lock, runs the backstop with `--force` under it, and refuses to
 remove the recovery machinery while anything is still journaled. Battery
-and thermal floors run only while the app is alive; the backstop does not
-provide them.
+and thermal end rules also run in the backstop for sessions carrying
+`safetyCheckVersion: 1`: it requires `InsomniaSafetyCheckVersion: 1` before
+calling the signed bundle's read-only `--check-safety 5` mode, which arms its
+own lifetime before reading anything and inherits fd 9. Only an exact
+`continue` line with exit 0 honors the future deadline. Cutoffs or unavailable
+checks expire the saved deadline before restoring the journal, so failed
+undo is retried after the hazard recedes. Legacy sessions without the key
+keep deadline-only recovery. The app synchronizes every 30 seconds and before
+Extend so it cannot recreate a session the backstop ended. Reconcile never
+reapplies a monitored session's owned sleep setting after it was released.
 
 ## Deliberate designs, do not flag
 

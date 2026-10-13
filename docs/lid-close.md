@@ -101,8 +101,11 @@ The defaults are worth knowing:
   thermal state requests Low Power Mode with the lid open; critical thermal
   state ends the session. "End closed-lid sessions when hot" is on by default
   and ends at serious thermal pressure, even if the other thermal rules are
-  off. Turning it off keeps the existing Low Power Mode rule. These rules
-  require the app to be running. Use a ventilated surface: thermal pressure
+  off. Turning it off keeps the existing Low Power Mode rule. The app reacts
+  to events; the recovery agent also checks the end rules once a minute for
+  new sessions, even if the app exits. An unavailable check ends the session.
+  Older active sessions keep deadline-only recovery until they end.
+  Use a ventilated surface: thermal pressure
   is not a temperature guarantee, and these rules do not make running in a
   backpack safe.
   Setting the end floor to 0 turns the battery end off. Otherwise the end

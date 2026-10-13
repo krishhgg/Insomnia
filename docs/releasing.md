@@ -234,6 +234,7 @@ below cover what only a real Mac shows.
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
 - Battery/thermal event behavior on supported hardware
 - Closed-lid serious thermal event ends the session and restores owned sleep and Low Power Mode; exercise with injected thermal events rather than heating the Mac, and check the open-lid and opted-out behavior separately
+- Independent safety check: a new session records safetyCheckVersion 1; after force-quit, the loaded agent invokes the signed bundle's --check-safety 5 and applies configured battery/thermal end rules before the deadline. Inject cutoffs and helper failure rather than draining or heating the Mac; verify owned sleep settings restore, failed undo stays journaled, and the app clears its cached session after cleanup without Extend recreating it
 - A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits
 - The same command with the app force-quit: the backstop does not take the lock until the command exits; the relaunch names the pid from `unfinished-command.json`, and at its next retry after the command exits (retries start 30 s after each refusal) resumes the session with its battery floors
 - A left-running `disablesleep 0` that exits 0: the end finishes without running it again
