@@ -9,6 +9,8 @@ struct SettingsView: View {
     let locationPermission: LocationPermission
     /// Launch at login as macOS reports it, not as config.json remembers it.
     let loginItem: LoginItem
+    var page: ControlPage? = nil
+    @State private var saveError: String?
 
     @State private var newPreset = ""
     @State private var presetError: String?
@@ -24,16 +26,21 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            sessionSection
-            lidSection
-            agentSection
-            powerSection
-            networkSection
-            appSection
+            if page == nil || page == .general { sessionSection }
+            if page == nil || page == .lid { lidSection }
+            if page == nil || page == .apps { agentSection }
+            if page == nil || page == .battery { powerSection }
+            if page == nil || page == .network { networkSection }
+            if page == nil || page == .general { appSection }
+            if let saveError {
+                Section("Could not save settings") {
+                    Text(saveError).foregroundStyle(.red).textSelection(.enabled)
+                    Button("Retry saving") { save() }
+                }
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 520)
-        .frame(minHeight: 560, idealHeight: 720)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             loadPassword()
             refreshWouldFreeze()
@@ -70,7 +77,9 @@ struct SettingsView: View {
     private func save() {
         do {
             try manager.store.saveConfig(manager.config)
+            saveError = nil
         } catch {
+            saveError = error.localizedDescription
             Log.error("could not save config: \(error.localizedDescription)")
         }
     }
@@ -197,7 +206,7 @@ struct SettingsView: View {
         } header: {
             Text("Lid-close actions")
         } footer: {
-            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps such as Zoom, Teams, Webex, Wispr Flow, Granola, Otter, OBS and Loom). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
+            Text("Selected apps pause while the lid is closed and resume when it opens. Protected apps keep running. Automatic freezing is off by default. Screen and keyboard darkening work only where supported; use brightness keys if needed.")
         }
     }
 
@@ -211,7 +220,7 @@ struct SettingsView: View {
                 remove: { id in update { $0.agentList.removeAll { $0 == id } } }
             )
             Toggle("Turn App Nap off for these apps during a session", isOn: bind(\.disableAppNapForAgents))
-            Text("Writes NSAppSleepDisabled = YES into each listed app's preferences when a session starts and puts the previous value back when it ends.")
+            Text("Prevents macOS App Nap from slowing these apps during a session. Their previous preferences are restored when the session ends.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         } header: {
@@ -276,34 +285,36 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Stepper(value: nudgeSeconds, in: 10...900, step: 10) {
-                LabeledContent("Nudge tmux after", value: "\(Int(manager.config.nudgeThreshold)) s offline")
-            }
-            Text("After that long offline, Insomnia types \"continue\" into each pane listed below. Only a pane you have marked with this tmux command is nudged. Mark a dedicated pane, not one you type in.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(TmuxNudge.markCommand())
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-            Toggle("Press Enter after continue", isOn: bind(\.tmuxNudgePressesEnter))
-            Text("Enter submits whatever is already typed in that pane, including a line that was never finished. When off, \"continue\" is typed and nothing submits it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            ForEach(manager.config.tmuxTargets, id: \.self) { t in
-                HStack {
-                    Text(t).font(.system(.body, design: .monospaced))
-                    Spacer()
-                    removeButton {
-                        update { $0.tmuxTargets.removeAll { $0 == t } }
+            DisclosureGroup("Advanced: terminal session recovery") {
+                Stepper(value: nudgeSeconds, in: 10...900, step: 10) {
+                    LabeledContent("Nudge tmux after", value: "\(Int(manager.config.nudgeThreshold)) s offline")
+                }
+                Text("After that long offline, Insomnia types \"continue\" into each pane listed below. Only a pane you have marked with this tmux command is nudged. Mark a dedicated pane, not one you type in.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(TmuxNudge.markCommand())
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                Toggle("Press Enter after continue", isOn: bind(\.tmuxNudgePressesEnter))
+                Text("Enter submits whatever is already typed in that pane, including a line that was never finished. When off, \"continue\" is typed and nothing submits it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(manager.config.tmuxTargets, id: \.self) { t in
+                    HStack {
+                        Text(t).font(.system(.body, design: .monospaced))
+                        Spacer()
+                        removeButton {
+                            update { $0.tmuxTargets.removeAll { $0 == t } }
+                        }
                     }
                 }
-            }
-            HStack {
-                TextField("tmux target (session:window.pane)", text: $newTmuxTarget)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(addTmuxTarget)
-                Button("Add", action: addTmuxTarget)
-                    .disabled(newTmuxTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                HStack {
+                    TextField("tmux target (session:window.pane)", text: $newTmuxTarget)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(addTmuxTarget)
+                    Button("Add", action: addTmuxTarget)
+                        .disabled(newTmuxTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
             }
         } header: {
             Text("Network failover")
@@ -552,7 +563,7 @@ struct SettingsView: View {
                 }
             }
             HStack {
-                TextField("Bundle identifier", text: newValue)
+                TextField("Bundle identifier (advanced)", text: newValue)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit {
                         let v = newValue.wrappedValue.trimmingCharacters(in: .whitespaces)
