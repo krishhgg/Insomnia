@@ -136,7 +136,7 @@ final class PowerMonitor {
         Self.readInstantWatts()
     }
 
-    static func name(_ t: ProcessInfo.ThermalState) -> String {
+    nonisolated static func name(_ t: ProcessInfo.ThermalState) -> String {
         switch t {
         case .nominal: "nominal"
         case .fair: "fair"

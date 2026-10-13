@@ -95,7 +95,14 @@ enum TransactionRefusal: Error, Sendable {
 final class SessionManager {
     private(set) var session: Session?
     private(set) var state: RuntimeState
-    var config: Config
+    /// Settings writes every change through here. A change to an input of
+    /// the floor rules calls `floorInputsChanged`, so it applies now rather
+    /// than at the next battery, thermal or lid event.
+    var config: Config {
+        didSet {
+            if config.floorInputs != oldValue.floorInputs { floorInputsChanged?() }
+        }
+    }
     /// Minute-granularity remaining time for the popover ("2h 14m").
     private(set) var remainingText: String = ""
     /// Live `H:MM:SS` countdown for the status item, updated at 1 Hz.
@@ -428,6 +435,10 @@ final class SessionManager {
     /// event once the lid debounce has settled, and runs the floor rules
     /// on the corrected journal. nil in tests that do not wire it.
     var resyncAfterCommand: (@MainActor (_ replayLid: Bool) -> Void)?
+    /// Called when `config` changes a battery floor, the thermal rules or
+    /// the lid option (`Config.floorInputs`): `AppServices` runs the floors
+    /// at once (`reevaluateFloors`). nil in tests that do not wire it.
+    var floorInputsChanged: (@MainActor () -> Void)?
     /// How far the panel may have drifted from a value written under Low
     /// Power Mode (auto-brightness moves it slowly) and still count as
     /// untouched by the user when the mode ends. A larger difference is a
