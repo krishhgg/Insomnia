@@ -43,6 +43,32 @@ OUTPUT="$(cd "$OUTPUT" && pwd)"
 
 step() { printf '\n==> %s\n' "$*"; }
 
+# The Swift that wrote a .swiftinterface, from its first header line.
+interface_compiler() {
+  local line
+  line="$(grep -m 1 '^// swift-compiler-version: ' "$1" 2>/dev/null)" || return 0
+  printf '%s\n' "${line#// swift-compiler-version: }"
+}
+
+# SwiftPM's PackageDescription and PackagePlugin interfaces that an older
+# Swift wrote, one path per line: a .private.swiftinterface whose writer is
+# not the writer of the .swiftinterface beside it. An update of the Command
+# Line Tools or Xcode that does not delete files its new version no longer
+# ships leaves them there, and the compiler reads a .private.swiftinterface
+# first, so Package.swift is compiled against the old API. Looked up only
+# after a failed build, in the toolchain this script's swift reports.
+stale_package_interfaces() {
+  local resources f
+  resources="$("$SWIFT" -print-target-info 2>/dev/null | sed -n 's|^ *"runtimeResourcePath": "\(.*\)",*$|\1|p')" || return 0
+  [[ -n "$resources" ]] || return 0
+  for f in "$resources"/pm/*/*.swiftmodule/*.private.swiftinterface; do
+    [[ -f "$f" && -f "${f%.private.swiftinterface}.swiftinterface" ]] || continue
+    if [[ "$(interface_compiler "$f")" != "$(interface_compiler "${f%.private.swiftinterface}.swiftinterface")" ]]; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
 # 1. Build -------------------------------------------------------------------
 step "Building (release)"
 cd "$ROOT"
@@ -59,7 +85,32 @@ if [[ "${INSOMNIA_LID_SIMULATION:-}" == 1 ]]; then
 fi
 # ${arr[@]+"${arr[@]}"}: an empty array expands to nothing under set -u on
 # the bash 3.2 that ships with macOS.
-"$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}
+build_rc=0
+"$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} || build_rc=$?
+if (( build_rc != 0 )); then
+  stale="$(stale_package_interfaces)"
+  if [[ -n "$stale" ]]; then
+    listed="" remove=""
+    while IFS= read -r f; do
+      listed+="  $f"$'\n'"    written by $(interface_compiler "$f")"$'\n'
+      remove+=" $(printf '%q' "$f")"
+    done <<< "$stale"
+    cat >&2 <<STALE
+
+The build failed. The Swift toolchain it used also holds package interfaces
+written by an older Swift than the ones beside them:
+$listed
+Swift reads a .private.swiftinterface before the .swiftinterface beside it, so
+Package.swift is compiled against that older PackageDescription. An error above
+such as "reference to member 'v26' cannot be resolved" or "has no member
+'swiftLanguageMode'" comes from them. An update of the Command Line Tools or
+Xcode that did not delete the previous version's files leaves them behind.
+Delete them (or reinstall the Command Line Tools or Xcode), then rerun:
+  sudo rm$remove
+STALE
+  fi
+  exit "$build_rc"
+fi
 BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bin-path)/Insomnia"
 [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
