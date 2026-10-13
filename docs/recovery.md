@@ -5,8 +5,25 @@ has every case.
 
 Insomnia records pending changes in a recovery journal. On session end, the app
 attempts to undo them. An independent `launchd` agent checks every minute and
-can attempt recovery after the app exits unexpectedly, once the saved deadline
-has passed. It leaves a valid, unexpired session alone.
+can attempt recovery after the app exits unexpectedly. For new sessions, it
+checks the battery and thermal end rules before honoring a future deadline,
+using a read-only `Insomnia --check-safety 5` process that exits before
+AppKit starts. The helper's own five-second lifetime bounds its reads and
+the recovery lock it inherits. A cutoff, unreadable configuration, unavailable
+laptop lid reading, missing helper, timeout or unexpected answer ends the
+session from its journal. Older session files without `safetyCheckVersion`
+keep deadline-only recovery until they end; start a new session to enable
+the checks. The installed bundle declares `InsomniaSafetyCheckVersion` so
+the backstop cannot launch an older app instead of a one-shot check.
+
+Before undoing a safety cutoff, the agent expires the saved deadline. If an
+undo fails, the next run retries recovery even after the Mac cools down.
+Extend cannot overwrite that expired deadline. Relaunch also ends a monitored
+session whose owned sleep setting has already been released.
+
+The running app checks for backstop cleanup every 30 seconds and finishes
+app-only restoration. Extend checks under the recovery lock too, so it
+cannot recreate a session the backstop ended.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
@@ -24,8 +41,10 @@ app keeps trying it and will not quit until the file is gone.
 `uninstall.sh --purge` removes the renamed copies that are regular files;
 without `--purge` they stay.
 
-**Recovery is not "everything always gets undone."** The backstop does not
-monitor battery or temperature. Saved audio needs the app to reopen, and
+**Recovery is not "everything always gets undone."** Battery and thermal
+cutoffs are polled once a minute, not continuously, and are not a guarantee
+of safe temperature. Keep the Mac on a ventilated surface. Saved audio
+needs the app to reopen, and
 unconfirmed process freezes may need manual inspection. If a warning remains,
 resolve it before leaving the Mac unattended. Each release's real-Mac crash,
 reboot and installation checks are in [release validation](release-validation.md).

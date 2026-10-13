@@ -1,7 +1,8 @@
 #!/bin/bash
 # Insomnia backstop: restore the machine from the JSON journal alone.
 # Runs from launchd (RunAtLoad + StartInterval 60, installed by install.sh)
-# and from install.sh / uninstall.sh. Needs no Insomnia process and no Swift.
+# and from install.sh / uninstall.sh. Needs no menu app process or compiler;
+# one-shot modes in the signed app provide power reads and process checks.
 #
 # Where it lives: install.sh copies this file into the app bundle at
 # Insomnia.app/Contents/Resources/backstop.sh before signing the bundle, so
@@ -27,7 +28,10 @@
 # the lock file's inode.
 #
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json valid (endsAt in the future) and no --force: new sessions
+#     require an independent battery/thermal check; exit 0 only when it
+#     answers continue. Legacy sessions without safetyCheckVersion keep
+#     their existing deadline-only recovery.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0. Entries in
 #     savedAudioOutputs alone count as clean (see below).
@@ -180,6 +184,7 @@ MKTEMP=/usr/bin/mktemp
 # BSD stat: GNU coreutils stat, first on PATH in many Homebrew setups, reads
 # -f as --file-system, so `-f %i` and `-f %z` print no inode or size.
 STAT=/usr/bin/stat
+CMP=/usr/bin/cmp
 # The installed app binary, for the microsecond identity check of
 # frozenProcesses entries (see above), and the bundle's Info.plist, which
 # must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
@@ -189,6 +194,8 @@ STAT=/usr/bin/stat
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
 RESUME_FROZEN_VERSION=1
+SAFETY_CHECK_VERSION=1
+SAFETY_CHECK_SECONDS=5
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is
 # sent SIGTERM, and how long it then gets to exit before this run fails closed.
@@ -426,7 +433,7 @@ supervise_command() { # base command args...
   log info "'$*' (pid $cpid), left running after SIGTERM, has exited (wait status $rc); its supervisor now lets go of the recovery lock, and the next run will retry"
 }
 
-# Run the app binary's --resume-frozen check (see resume_via_app) with the
+# Run a one-shot app binary check (see resume_via_app and check_session_safety) with the
 # same time limit, standard input from app_answer_dir/in and standard output
 # to app_answer_dir/out. This shell starts the binary as its own background
 # job and is the only process that signals it; no supervisor stands between
@@ -483,15 +490,15 @@ run_app_bounded() { # command args...
   signal_job TERM "$cpid" || true
   if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
     wait "$cpid" || rc=$?
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s; sent SIGTERM, and it ended (wait status $rc)"
     return 124
   fi
   signal_job KILL "$cpid" || true
   if wait_for_job "$cpid" "$KILL_GRACE_SECONDS"; then
     wait "$cpid" || rc=$?
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and was still running ${KILL_GRACE_SECONDS}s after SIGTERM; sent SIGKILL, and it ended (wait status $rc)"
   else
-    log error "'$1 --resume-frozen' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
+    log error "'$1 $2' (pid $cpid) did not answer within ${COMMAND_TIMEOUT_SECONDS}s and has not exited ${KILL_GRACE_SECONDS}s after SIGKILL; it runs no further code, and it keeps the recovery lock until the kernel ends it"
   fi
   return 124
 } 2>/dev/null
@@ -839,6 +846,81 @@ session_shape_problems() { # file
       i=$((i + 1))
     done
   fi
+  t="$(type_of "$f" safetyCheckVersion)"
+  if [[ -n "$t" && "$t" != null ]]; then
+    if [[ "$t" != integer && "$t" != float ]]; then
+      echo "safetyCheckVersion is a JSON $t, not an integer"
+    elif [[ ! "$(extract "$f" safetyCheckVersion || true)" =~ ^-?[0-9]+([.]0+)?$ ]]; then
+      echo "safetyCheckVersion is not a whole number"
+    fi
+  fi
+}
+
+# A signed bundle declares the one-shot protocol before we invoke it.
+# Only an exact, single-line answer can keep a new session awake. Missing
+# code, failed reads, unexpected output and timeouts instead undo the
+# journal. The helper has its own 5 s lifetime and inherits fd 9.
+safety_reason=""
+check_session_safety() {
+  local declared="" rc=0 answer=""
+  if [[ -f "$INSOMNIA_INFO" ]]; then
+    declared="$(extract "$INSOMNIA_INFO" InsomniaSafetyCheckVersion || true)"
+  fi
+  if [[ ! -x "$INSOMNIA_BIN" || "$declared" != "$SAFETY_CHECK_VERSION" ]]; then
+    safety_reason="independent safety check missing or unsupported"
+    return 1
+  fi
+  "$RM" -rf "$APP_SUPPORT"/.backstop-safety.*
+  if ! app_answer_dir="$("$MKTEMP" -d "$APP_SUPPORT/.backstop-safety.XXXXXX" 2>/dev/null)"; then
+    app_answer_dir=""
+    safety_reason="could not create the independent safety check's output directory"
+    return 1
+  fi
+  if ! : > "$app_answer_dir/in"; then
+    safety_reason="could not prepare the independent safety check"
+  else
+    run_app_bounded "$INSOMNIA_BIN" --check-safety "$SAFETY_CHECK_SECONDS" || rc=$?
+    if (( rc == 0 )) && [[ -f "$app_answer_dir/out" ]] \
+       && IFS= read -r answer < "$app_answer_dir/out" \
+       && "$CMP" -s <(printf '%s\n' "$answer") "$app_answer_dir/out"; then
+      case "$answer" in
+        continue) ;;
+        "end batteryFloor"|"end batteryUnreadable"|"end thermalCritical"|"end thermalSeriousClosedLid"\
+        |"end configuration-unreadable"|"end lid-unreadable"|"end thermal-unreadable")
+          safety_reason="$answer" ;;
+        *) safety_reason="independent safety check returned an unexpected answer" ;;
+      esac
+    else
+      safety_reason="independent safety check unavailable (exit $rc)"
+    fi
+  fi
+  "$RM" -rf "$app_answer_dir"
+  app_answer_dir=""
+  [[ -z "$safety_reason" ]]
+}
+
+# Latch a cutoff before any undo. A failed restore must be retried even
+# after the hazard recedes, and an app relaunch must not resume it.
+# Copy/edit/rename preserves the other session fields and never publishes
+# partial JSON. A write failure is logged, but still attempts the undo:
+# refusing to restore sleep would leave the hot machine awake.
+latch_safety_end() {
+  local tmp="" ok=1
+  if ! tmp="$("$MKTEMP" "$APP_SUPPORT/.session-safety.XXXXXX" 2>/dev/null)"; then
+    return 1
+  fi
+  "$CP" "$SESSION" "$tmp" || ok=0
+  if (( ok == 1 )); then
+    "$PLUTIL" -replace endsAt -string "1970-01-01T00:00:00Z" "$tmp" >/dev/null 2>&1 || ok=0
+  fi
+  if (( ok == 1 )); then
+    [[ -z "$(session_shape_problems "$tmp")" ]] || ok=0
+  fi
+  if (( ok == 1 )); then
+    "$MV" -f "$tmp" "$SESSION" || ok=0
+  fi
+  "$RM" -f "$tmp"
+  (( ok == 1 ))
 }
 
 # --- Read the session --------------------------------------------------------
@@ -872,7 +954,17 @@ if [[ -e "$SESSION" ]]; then
 fi
 
 if [[ "$session_state" == valid ]] && (( force == 0 )); then
-  exit 0
+  safety_type="$(type_of "$SESSION" safetyCheckVersion)"
+  safety_version="$(extract "$SESSION" safetyCheckVersion || true)"
+  if [[ -z "$safety_type" || "$safety_type" == null ]]; then
+    exit 0 # An older build's session has deadline-only recovery.
+  elif [[ "$safety_version" != "$SAFETY_CHECK_VERSION" && "$safety_version" != "$SAFETY_CHECK_VERSION.0" ]]; then
+    safety_reason="unsupported session safety check version"
+  elif check_session_safety; then
+    exit 0
+  fi
+  force=1
+  log warn "$safety_reason; ending future session (endsAt=$ends_at)"
 fi
 
 # --- Read the journal --------------------------------------------------------
@@ -973,6 +1065,16 @@ quarantine_session() {
   fi
   return 1
 }
+
+if [[ -n "$safety_reason" && "$session_state" == valid ]]; then
+  # The journal was validated first: a malformed journal changes nothing.
+  if latch_safety_end; then
+    session_state=expired
+    ends_at="1970-01-01T00:00:00Z"
+  else
+    log error "could not expire the safety-ended session on disk; still attempting owned recovery. Do not relaunch until session.json is removed or expired"
+  fi
+fi
 
 case "$session_state" in
   none)       session_note="no session" ;;
