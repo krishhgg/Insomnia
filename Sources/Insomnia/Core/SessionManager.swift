@@ -122,7 +122,7 @@ final class SessionManager {
     private(set) var lastError: String?
     /// How many times `fail` has run, so an undo can tell a line it put up
     /// from one left by an earlier run.
-    @ObservationIgnored private var failCount = 0
+    @ObservationIgnored private(set) var failCount = 0
     /// Reconcile found SleepDisabled set with no session and no journal
     /// claim: something other than Insomnia disabled sleep. Kept apart from
     /// `lastError` so a restore failure from the same reconcile stays
@@ -691,6 +691,11 @@ final class SessionManager {
     /// Refused while an unfinished command runs, `deferred` is recorded in
     /// the refusal itself, before the caller resumes: the command can exit
     /// and its holder settle in between, and must find the work then.
+    /// Waits for every start, extend and end queued before this call.
+    func waitForQueuedWork() async {
+        await lifecycleTail?.value
+    }
+
     private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
@@ -1167,29 +1172,38 @@ final class SessionManager {
     /// undone from the journal like an end, and the journal keeps the entry
     /// until that undo is confirmed.
     func start(duration: TimeInterval) async {
+        _ = await tryStart(duration: duration)
+    }
+
+    /// `start`, returning whether this call started the session: false when
+    /// it was ignored, refused, abandoned or failed (`SessionCommand`
+    /// reports it).
+    func tryStart(duration: TimeInterval) async -> Bool {
         guard !quitRequested else {
             Log.info("start ignored: quit requested")
-            return
+            return false
         }
         guard pendingEnd == nil else {
             fail("start refused: the previous session is still being ended; retrying shortly")
-            return
+            return false
         }
         let ticket = endTicket
-        _ = await exclusive("start") { await self.performStart(duration: duration, ticket: ticket) }
+        let started = await exclusive("start") { await self.performStart(duration: duration, ticket: ticket) }
         // A start that goes through before a refused launch reconcile runs
         // again drops that reconcile, and takes over its check.
         await settleEarlierCommand()
+        if case .success(true) = started { return true }
+        return false
     }
 
-    private func performStart(duration: TimeInterval, ticket: Int) async {
+    private func performStart(duration: TimeInterval, ticket: Int) async -> Bool {
         guard session == nil else {
             Log.info("start ignored: session already active")
-            return
+            return false
         }
         guard endTicket == ticket, !quitRequested else {
             Log.info("start abandoned: an end was requested first")
-            return
+            return false
         }
         let now = clock()
         let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
@@ -1206,7 +1220,7 @@ final class SessionManager {
             // could not move it aside. It may be a valid session, and a
             // rollback could not put it back.
             fail("start refused, nothing changed: session.json could not be read (\(error.localizedDescription)). Remove it or move it out of \(paths.appSupport.path), then start again")
-            return
+            return false
         }
 
         do {
@@ -1216,7 +1230,7 @@ final class SessionManager {
         } catch {
             fail("could not write session: \(error.localizedDescription)")
             rollBackStart(journal: journalBefore, session: sessionBefore)
-            return
+            return false
         }
 
         // The agent is confirmed loaded before sleep is disabled, so a crash
@@ -1226,12 +1240,12 @@ final class SessionManager {
         } catch {
             rollBackStart(journal: journalBefore, session: sessionBefore)
             fail("could not arm backstop: \(error.localizedDescription)")
-            return
+            return false
         }
         guard endTicket == ticket else {
             rollBackStart(journal: journalBefore, session: sessionBefore)
             Log.info("start abandoned before disabling sleep: end requested meanwhile")
-            return
+            return false
         }
 
         do {
@@ -1242,18 +1256,18 @@ final class SessionManager {
             // written (the backstop honours that deadline if Insomnia dies);
             // the start is undone like an end once the command has exited.
             stopTransaction(for: still, thenEnd: .startFailed)
-            return
+            return false
         } catch {
             fail("could not disable sleep: \(error.localizedDescription)")
             _ = await performEnd(reason: .startFailed)
-            return
+            return false
         }
         guard endTicket == ticket else {
             // Sleep is disabled and journaled as ours. The end that was
             // requested runs next and restores from that journal; the session
             // is never surfaced.
             Log.info("start abandoned after disabling sleep: end requested meanwhile; journal left for it")
-            return
+            return false
         }
 
         session = new
@@ -1266,16 +1280,24 @@ final class SessionManager {
         // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
+        return true
     }
 
     func extend(by extra: TimeInterval) async {
-        guard session != nil else { return }
-        let ticket = endTicket
-        _ = await exclusive("extend") { await self.performExtend(by: extra, ticket: ticket) }
+        _ = await tryExtend(by: extra)
     }
 
-    private func performExtend(by extra: TimeInterval, ticket: Int) async {
-        guard let current = session, endTicket == ticket else { return }
+    /// `extend`, returning whether this call moved the deadline out.
+    func tryExtend(by extra: TimeInterval) async -> Bool {
+        guard session != nil else { return false }
+        let ticket = endTicket
+        let extended = await exclusive("extend") { await self.performExtend(by: extra, ticket: ticket) }
+        if case .success(true) = extended { return true }
+        return false
+    }
+
+    private func performExtend(by extra: TimeInterval, ticket: Int) async -> Bool {
+        guard let current = session, endTicket == ticket else { return false }
         let updated = SessionMath.extended(current, by: extra, now: clock(), maxDuration: config.maxDuration)
         // The agent enforces whatever deadline is on disk; confirm it is
         // still loaded before moving that deadline out.
@@ -1283,22 +1305,23 @@ final class SessionManager {
             try await backstop.arm()
         } catch {
             fail("could not confirm backstop: \(error.localizedDescription)")
-            return
+            return false
         }
         guard endTicket == ticket, session == current else {
             Log.info("extend abandoned: end requested meanwhile")
-            return
+            return false
         }
         do {
             try store.saveSession(updated)
         } catch {
             fail("could not write session: \(error.localizedDescription)")
-            return
+            return false
         }
         session = updated
         lastError = nil
         Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
         await armDeadline(updated.endsAt)
+        return true
     }
 
     /// Full session end: delete the session file first (so a crash here leaves

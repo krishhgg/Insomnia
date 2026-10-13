@@ -223,6 +223,7 @@ below cover what only a real Mac shows.
 ### Sessions and recovery
 
 - Normal end, deadline expiry, and repeated Quit restore live power state
+- `Insomnia --session start 120` from Terminal while the app runs: the menu bar counts the session down and `pmset -g` reads SleepDisabled 1, `--session extend 60` moves the countdown out, and hold-to-end and `--session end` each end the session with SleepDisabled 0; with the app quit, the command prints that Insomnia is not running, and the next launch starts nothing
 - Sleep guard read back: on macOS 26.6.2 (25G83), where `pmset -g` reads SleepDisabled 0 again about 2 s after `pmset -a disablesleep 1`, Start fails after about 5 s with "macOS set SleepDisabled back to 0" and no session runs; on a macOS where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
 - Force-quit followed by launchd deadline recovery and retry after failure
 - Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge
