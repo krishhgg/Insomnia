@@ -1049,7 +1049,7 @@ final class NetworkFailover {
         do {
             let joined = try await hotspotJoiner.join(ssid: ssid, password: password, interfaceName: iface)
             if !joined {
-                Log.error("CoreWLAN scan found no network for hotspot \(ssid); retrying with backoff")
+                Log.error("CoreWLAN found no network it would join for hotspot \(ssid) (none in range, or only unprotected ones); retrying with backoff")
             }
         } catch {
             Log.error("CoreWLAN hotspot join failed: \(error.localizedDescription)")
