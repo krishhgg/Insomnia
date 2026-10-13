@@ -648,9 +648,13 @@ final class StatusItemController: NSObject {
         // Same for the foreign-sleep line: re-read the bit now, and let the
         // next opening drop the line if sleep is enabled again.
         Task { await manager.recheckForeignSleep() }
+        // The time left is read now too: the redraw timer stops while the
+        // lid is closed, and the menu can open then on an external display.
+        manager.refreshCountdown()
         let menu = StatusMenu.menu(
             Self.menuItems(manager: manager, status: status),
             target: self,
+            endSession: #selector(menuEndSession),
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
             relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
@@ -661,8 +665,11 @@ final class StatusItemController: NSObject {
 
     /// The menu's lines from what the session and the status source report
     /// now. Static, so a test can check them without a status item.
+    /// With the menu bar countdown off, the menu carries the time left and
+    /// End Session while a session runs, since the bar shows only the eye.
     static func menuItems(manager: SessionManager, status: any StatusSource) -> [StatusMenu.Item] {
-        StatusMenu.items(
+        let inMenu = manager.isActive && !manager.config.showMenuBarCountdown
+        return StatusMenu.items(
             sessionActive: manager.isActive,
             sleepHeld: manager.state.sleepDisabledByUs,
             machine: StatusLines.machine(
@@ -688,8 +695,16 @@ final class StatusItemController: NSObject {
             commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
             outputsWaiting: manager.outputsWaitingForRestore,
-            lidSimulationBuild: LidSimulationBuild.isCompiledIn
+            lidSimulationBuild: LidSimulationBuild.isCompiledIn,
+            remaining: inMenu ? manager.remainingText : nil,
+            offersEnd: inMenu
         )
+    }
+
+    /// End Session in the menu, which stands in for the hold-to-end ring
+    /// while the menu bar countdown is off.
+    @objc private func menuEndSession() {
+        holdToEnd()
     }
 
     @objc private func menuStopWaitingForOutput(_ sender: NSMenuItem) {

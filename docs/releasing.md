@@ -240,6 +240,7 @@ below cover what only a real Mac shows.
 - `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
+- "Show the countdown in the menu bar" off: a start leaves only the eye, open, with no countdown or end control and the item no wider than idle; the right-click menu leads with the time left and End Session ends the session and closes the eye; clicking the eye still opens the extend pills; turning the setting on or off mid-session changes the bar at once
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
 
 ### Lid close
