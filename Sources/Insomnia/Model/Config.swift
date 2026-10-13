@@ -4,6 +4,25 @@ import Foundation
 /// Decoding tolerates missing keys so configs written by older builds load
 /// with defaults filled in.
 struct Config: Codable, Equatable, Sendable {
+    // Menu bar
+    enum MenuBarMode: String, Codable, CaseIterable, Sendable {
+        case standard
+        case compact
+        case minimal
+    }
+
+    var menuBarMode: MenuBarMode = .standard
+
+    /// Boolean access for Compact-only controls. Turning it off must not
+    /// replace another selected mode, such as Minimal.
+    var compactMode: Bool {
+        get { menuBarMode == .compact }
+        set {
+            if newValue { menuBarMode = .compact }
+            else if menuBarMode == .compact { menuBarMode = .standard }
+        }
+    }
+
     // Session
     /// Preset durations in seconds, shown as chips.
     var presets: [TimeInterval] = Config.defaultPresets
@@ -138,9 +157,19 @@ struct Config: Codable, Equatable, Sendable {
 
     init() {}
 
+    private enum LegacyCodingKeys: String, CodingKey {
+        case compactMode
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Config()
+        if let mode = try c.decodeIfPresent(MenuBarMode.self, forKey: .menuBarMode) {
+            menuBarMode = mode
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            menuBarMode = try legacy.decodeIfPresent(Bool.self, forKey: .compactMode) == true ? .compact : .standard
+        }
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration

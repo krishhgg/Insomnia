@@ -14,6 +14,7 @@ final class ConfigTests: XCTestCase {
 
     func testDefaults() {
         let c = Config()
+        XCTAssertFalse(c.compactMode)
         XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200])
         XCTAssertEqual(c.lowPowerFloor, 40)
         XCTAssertEqual(c.endFloor, 10)
@@ -258,6 +259,32 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(mute.settingsLine, "This update changed a lid-close setting: \"Mute audio on lid close\" is now on. The toggle is below.")
         let freeze = LidCloseDefaultsChange(turnedOffFreezeAll: true, turnedOnMute: false)
         XCTAssertEqual(freeze.changes, "\"Freeze every other app while the lid is closed\" is now off")
+    }
+
+    func testCompactModeDefaultsOffForOlderConfigs() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"presets": [600], "defaultPreset": 600}"#.utf8))
+        XCTAssertFalse(legacy.compactMode)
+        XCTAssertEqual(legacy.presets, [600])
+        XCTAssertEqual(legacy.defaultPreset, 600)
+    }
+
+    func testCompactModePersistsAcrossReloadAndCanBeTurnedOff() throws {
+        let home = TempHome()
+        defer { home.destroy() }
+        let store = Store(paths: home.paths)
+        var config = Config()
+        config.compactMode = true
+        config.hotspotSSID = "iPhone"
+        config.presets = [600]
+        try store.saveConfig(config)
+
+        let reloaded = try XCTUnwrap(Store(paths: home.paths).loadConfig())
+        XCTAssertTrue(reloaded.compactMode)
+        XCTAssertEqual(reloaded, config, "Changing presentation mode preserves the other settings")
+
+        config.compactMode = false
+        try store.saveConfig(config)
+        XCTAssertEqual(try Store(paths: home.paths).loadConfig(), config)
     }
 
     /// A config.json written before the display toggle existed keeps the

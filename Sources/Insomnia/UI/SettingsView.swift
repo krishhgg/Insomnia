@@ -1,6 +1,56 @@
 import AppKit
 import SwiftUI
 
+/// A draft of the shared default preset. Invalid edits stay in the field;
+/// they never replace the duration used by the menu bar's next click.
+struct MinimalDurationSetting {
+    var text: String
+    var error: String?
+    private var originalText: String
+
+    init(seconds: TimeInterval) {
+        text = Self.label(for: seconds)
+        originalText = text
+    }
+
+    /// Returns true only when a valid edit changed the config and needs saving.
+    mutating func apply(to config: inout Config) -> Bool {
+        guard text != originalText else {
+            error = nil
+            return false
+        }
+        guard let duration = DurationParser.seconds(from: text) else {
+            error = "Enter a duration greater than zero, such as 30m or 1h30m."
+            return false
+        }
+        guard duration <= config.maxDuration else {
+            error = "The duration cannot exceed \(Self.label(for: config.maxDuration))."
+            return false
+        }
+        error = nil
+        text = Self.label(for: duration)
+        originalText = text
+        guard config.defaultPreset != duration else { return false }
+        config.defaultPreset = duration
+        return true
+    }
+
+    /// Unlike a short countdown label, preserve the minutes of multi-day
+    /// durations. Merely focusing an existing value never rewrites it.
+    static func label(for seconds: TimeInterval) -> String {
+        guard seconds.isFinite, seconds >= 0, seconds / 60 < Double(Int.max) else { return "" }
+        let totalMinutes = Int((seconds / 60).rounded(.up))
+        let days = totalMinutes / 1440
+        let hours = totalMinutes % 1440 / 60
+        let minutes = totalMinutes % 60
+        var parts: [String] = []
+        if days > 0 { parts.append("\(days)d") }
+        if hours > 0 { parts.append("\(hours)h") }
+        if minutes > 0 { parts.append("\(minutes)m") }
+        return parts.isEmpty ? "0m" : parts.joined(separator: " ")
+    }
+}
+
 /// The settings window (spec 10). Every change is written straight through
 /// `manager.config` to config.json.
 struct SettingsView: View {
@@ -12,6 +62,8 @@ struct SettingsView: View {
 
     @State private var newPreset = ""
     @State private var presetError: String?
+    @State private var minimalDuration = MinimalDurationSetting(seconds: Config().defaultPreset)
+    @FocusState private var minimalDurationFocused: Bool
     @State private var newFreezeBundle = ""
     @State private var newAgentBundle = ""
     @State private var newTmuxTarget = ""
@@ -24,6 +76,7 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            menuBarSection
             sessionSection
             lidSection
             agentSection
@@ -35,6 +88,7 @@ struct SettingsView: View {
         .frame(width: 520)
         .frame(minHeight: 560, idealHeight: 720)
         .onAppear {
+            minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
             loadPassword()
             refreshWouldFreeze()
             // The user may have approved or removed the item in System
@@ -50,6 +104,14 @@ struct SettingsView: View {
         // The preview depends on the toggle, both lists and what is running:
         // recompute on any config change and whenever an app launches or quits.
         .onChange(of: manager.config) { refreshWouldFreeze() }
+        .onChange(of: manager.config.defaultPreset) {
+            if !minimalDurationFocused {
+                minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
+            }
+        }
+        .onChange(of: minimalDurationFocused) {
+            if !minimalDurationFocused { commitMinimalDuration() }
+        }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in refreshWouldFreeze() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in refreshWouldFreeze() }
     }
@@ -95,41 +157,88 @@ struct SettingsView: View {
 
     // MARK: Sections
 
+    private var menuBarSection: some View {
+        Section {
+            Picker("Mode", selection: bind(\.menuBarMode)) {
+                Text("Default").tag(Config.MenuBarMode.standard)
+                Text("Compact").tag(Config.MenuBarMode.compact)
+                Text("Minimal").tag(Config.MenuBarMode.minimal)
+            }
+            if manager.config.menuBarMode == .minimal {
+                TextField("Timer duration", text: $minimalDuration.text, prompt: Text("1d 2h 30m"))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($minimalDurationFocused)
+                    .onSubmit(commitMinimalDuration)
+                    .onChange(of: minimalDuration.text) { minimalDuration.error = nil }
+                    .onDisappear(perform: commitMinimalDuration)
+                    .help("Use days, hours, and minutes, such as 1d 2h 30m. Press Return to save.")
+                if let error = minimalDuration.error {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            }
+        } header: {
+            Text("Menu bar")
+        } footer: {
+            switch manager.config.menuBarMode {
+            case .standard:
+                Text("Show duration controls and the countdown in the menu bar.")
+            case .compact:
+                Text("Keep only the eye icon in the menu bar. Duration controls and the countdown appear in its dropdown.")
+            case .minimal:
+                Text("Click the eye to start a timer or add this duration. Hold to end it. The ring shows time remaining. Right-click for Settings.")
+            }
+        }
+    }
+
+    private func commitMinimalDuration() {
+        var config = manager.config
+        guard minimalDuration.apply(to: &config) else { return }
+        manager.config = config
+        save()
+    }
+
     private var sessionSection: some View {
         Section("Session") {
-            ForEach(manager.config.presets, id: \.self) { p in
-                HStack {
-                    Text(chipLabel(for: p))
-                        .monospacedDigit()
-                    Spacer()
-                    if p == manager.config.defaultPreset {
-                        Text("default").font(.caption).foregroundStyle(.secondary)
-                    }
-                    removeButton {
-                        update { $0.presets.removeAll { $0 == p } }
-                    }
-                }
-            }
-            HStack {
-                TextField("Add preset (30m, 2h, 1h30m, 3d)", text: $newPreset)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(addPreset)
-                Button("Add", action: addPreset)
-                    .disabled(DurationParser.seconds(from: newPreset) == nil)
-            }
-            if let presetError {
-                Text(presetError).font(.caption).foregroundStyle(.red)
-            }
-            Picker("Default preset", selection: bind(\.defaultPreset)) {
-                ForEach(manager.config.presets, id: \.self) { p in
-                    Text(chipLabel(for: p)).tag(p)
-                }
-                if !manager.config.presets.contains(manager.config.defaultPreset) {
-                    Text(chipLabel(for: manager.config.defaultPreset)).tag(manager.config.defaultPreset)
-                }
+            if manager.config.menuBarMode != .minimal {
+                presetControls
             }
             LabeledContent("Maximum session") {
                 Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var presetControls: some View {
+        ForEach(manager.config.presets, id: \.self) { p in
+            HStack {
+                Text(chipLabel(for: p))
+                    .monospacedDigit()
+                Spacer()
+                if p == manager.config.defaultPreset {
+                    Text("default").font(.caption).foregroundStyle(.secondary)
+                }
+                removeButton {
+                    update { $0.presets.removeAll { $0 == p } }
+                }
+            }
+        }
+        HStack {
+            TextField("Add preset (30m, 2h, 1h30m, 3d)", text: $newPreset)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(addPreset)
+            Button("Add", action: addPreset)
+                .disabled(DurationParser.seconds(from: newPreset) == nil)
+        }
+        if let presetError {
+            Text(presetError).font(.caption).foregroundStyle(.red)
+        }
+        Picker("Default preset", selection: bind(\.defaultPreset)) {
+            ForEach(manager.config.presets, id: \.self) { p in
+                Text(chipLabel(for: p)).tag(p)
+            }
+            if !manager.config.presets.contains(manager.config.defaultPreset) {
+                Text(chipLabel(for: manager.config.defaultPreset)).tag(manager.config.defaultPreset)
             }
         }
     }

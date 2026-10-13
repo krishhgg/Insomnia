@@ -211,17 +211,26 @@ final class UIStatusTests: XCTestCase {
 
     func testMachineLine() {
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: true, watts: 4.12, wifiSSID: "iPhone", batteryPercent: nil, isCharging: false),
-            "Lid: closed \u{00B7} 4.1 W \u{00B7} Wi-Fi: iPhone"
+            StatusLines.machine(lidClosed: true, watts: 4.12, batteryPercent: nil, isCharging: false),
+            "Lid: closed \u{00B7} 4.1 W"
         )
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: nil, batteryPercent: nil, isCharging: false),
+            StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: nil, isCharging: false),
             "Lid: open"
         )
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: "", batteryPercent: 82, isCharging: true),
+            StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: 82, isCharging: true),
             "Lid: open \u{00B7} 82% charging"
         )
+    }
+
+    func testNetworkLinePreservesStatusAndOmitsUnknownNames() {
+        XCTAssertEqual(StatusLines.network(wifiSSID: "iPhone"), "Wi-Fi: iPhone")
+        let hiddenName = WiFiStatusName.display(ssid: nil, locationAuthorized: false)
+        XCTAssertEqual(StatusLines.network(wifiSSID: hiddenName), "Wi-Fi: on (name hidden until Location is allowed)")
+        XCTAssertNil(StatusLines.network(wifiSSID: nil))
+        XCTAssertNil(StatusLines.network(wifiSSID: ""))
+        XCTAssertNil(StatusLines.network(wifiSSID: " \n "))
     }
 
     func testActionsLine() {
@@ -243,6 +252,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: true,
             sleepHeld: true,
             machine: "Lid: closed \u{00B7} 82%",
+            network: "Wi-Fi: iPhone",
             actions: "3 apps frozen",
             throttledBrowsers: [Self.chrome],
             error: nil
@@ -250,6 +260,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items, [
             StatusMenu.Item(title: "Sleep held per journal \u{2014} not verified live", kind: .info),
             StatusMenu.Item(title: "Lid: closed \u{00B7} 82%", kind: .info),
+            StatusMenu.Item(title: "Wi-Fi: iPhone", kind: .info),
             StatusMenu.Item(title: "3 apps frozen", kind: .info),
             StatusMenu.Item(title: "\u{26A0} Chrome is throttled", kind: .warning),
             StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
@@ -259,11 +270,90 @@ final class UIStatusTests: XCTestCase {
         ])
     }
 
+    @MainActor
+    func testScreenshotStatusUsesSeparateNativeMenuRows() throws {
+        let items = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: StatusLines.machine(lidClosed: false, watts: 0, batteryPercent: 100, isCharging: true),
+            network: StatusLines.network(wifiSSID: WiFiStatusName.display(ssid: nil, locationAuthorized: false)),
+            actions: nil,
+            throttledBrowsers: [ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome")],
+            error: nil
+        )
+        XCTAssertEqual(items, [
+            StatusMenu.Item(title: "Lid: open \u{00B7} 0.0 W \u{00B7} 100% charging", kind: .info),
+            StatusMenu.Item(title: "Wi-Fi: on (name hidden until Location is allowed)", kind: .info),
+            StatusMenu.Item(title: "\u{26A0} Google Chrome is throttled", kind: .warning),
+            StatusMenu.Item(title: "Relaunch Google Chrome unthrottled", kind: .relaunchBrowser(ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))),
+            StatusMenu.Item(title: "", kind: .separator),
+            StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
+            StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
+        ])
+
+        let menu = StatusMenu.menu(
+            items,
+            target: nil,
+            settings: NSSelectorFromString("settings"),
+            quit: NSSelectorFromString("quit"),
+            relaunchBrowser: NSSelectorFromString("relaunch:"),
+            stopWaitingForOutput: NSSelectorFromString("stopWaiting:")
+        )
+        XCTAssertEqual(menu.items.map { $0.accessibilityLabel() ?? $0.title }, items.map(\.title))
+        XCTAssertFalse(menu.autoenablesItems)
+        for entry in menu.items.prefix(2) {
+            XCTAssertFalse(entry.isEnabled)
+            XCTAssertNil(entry.action)
+            let row = try XCTUnwrap(entry.view as? StatusMenuLabel)
+            XCTAssertEqual(row.label.stringValue, entry.accessibilityLabel())
+            XCTAssertFalse(row.label.stringValue.contains("\n"))
+        }
+        XCTAssertEqual(menu.items[3].representedObject as? ThrottledBrowser, ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))
+        XCTAssertTrue(menu.items[3].isEnabled)
+        XCTAssertTrue(menu.items[4].isSeparatorItem)
+        XCTAssertEqual(menu.items[5].keyEquivalent, ",")
+        XCTAssertEqual(menu.items[6].keyEquivalent, "q")
+
+        let combined = StatusMenu.menu(
+            [StatusMenu.Item(title: items[0].title + " \u{00B7} " + items[1].title, kind: .info)] + Array(items.dropFirst(2)),
+            target: nil,
+            settings: NSSelectorFromString("settings"),
+            quit: NSSelectorFromString("quit"),
+            relaunchBrowser: NSSelectorFromString("relaunch:"),
+            stopWaitingForOutput: NSSelectorFromString("stopWaiting:")
+        )
+        menu.update()
+        combined.update()
+        XCTAssertLessThan(menu.size.width, combined.size.width, "Separate status rows reduce the native menu's width")
+    }
+
+    func testMenuOmitsAbsentOrEmptyNetworkRows() {
+        let networks: [String?] = [nil, "", " \n "]
+        for network in networks {
+            let items = StatusMenu.items(
+                sessionActive: false,
+                sleepHeld: false,
+                machine: "Lid: open",
+                network: network,
+                actions: nil,
+                throttledBrowsers: [],
+                error: nil
+            )
+            XCTAssertEqual(items, [
+                StatusMenu.Item(title: "Lid: open", kind: .info),
+                StatusMenu.Item(title: "", kind: .separator),
+                StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
+                StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
+            ])
+        }
+    }
+
     func testIdleMenuIsJustSettingsAndQuitWithNoLeadingSeparator() {
         let items = StatusMenu.items(
             sessionActive: false,
             sleepHeld: false,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [],
             error: ""
@@ -280,6 +370,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: false,
             sleepHeld: false,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [],
             error: "sudo: a password is required"
@@ -388,6 +479,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: true,
             sleepHeld: true,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [Self.chrome, Self.arc],
             error: nil
@@ -771,9 +863,13 @@ final class UIStatusTests: XCTestCase {
             StatusRootView.countdownText(pending: controller.model.pendingCountdown, live: lab.manager.countdownText, phase: controller.model.phase),
             controller.model.pendingCountdown
         )
-        try? await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .starting), "the width snaps once, after the slots left")
+        // Removing the slots retargets the eye; its reserved native width
+        // remains until that return animation finishes, then releases once.
+        let widthSettle = Motion.itemResizeDuration + Motion.collapseSettleMargin
+        try? await Task.sleep(for: .seconds(widthSettle + 0.1))
+        XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .starting), "the width retargets once, after the slots left")
         XCTAssertEqual(lab.probe.applied.count, written + 1)
+        XCTAssertEqual(lab.probe.applied.last, controller.widthTarget, "the native reservation releases after the eye arrives")
         XCTAssertEqual(lab.probe.writesWhileFolding, 0, lab.probe.foldingWrites.joined(separator: "; "))
 
         await gate.open()
@@ -961,7 +1057,16 @@ final class UIStatusTests: XCTestCase {
         await lab.settleClose()
         XCTAssertFalse(controller.model.slotsPresent)
         XCTAssertNil(controller.model.startError, "cleared with the slots")
+        // The layout reports after the slots leave, then the eye's return
+        // animation releases its native reservation. Observe that write;
+        // the fold's fixed wait alone cannot prove both callbacks ran.
+        let widthBy = Date().addingTimeInterval(5)
+        while (lab.probe.applied.count == written || lab.probe.applied.last != controller.widthTarget), Date() < widthBy {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(lab.probe.applied.count, written + 1, "one write, after the slots left")
+        XCTAssertEqual(lab.probe.applied.last, controller.widthTarget, "the native reservation reached the reported width")
+        XCTAssertEqual(lab.probe.slotsAtWrite.last, false, "the write happened after the slots left")
         XCTAssertEqual(lab.probe.writesWhileFolding, 0, lab.probe.foldingWrites.joined(separator: "; "))
         let confirmBy = Date().addingTimeInterval(2)
         while controller.model.phase != .running, Date() < confirmBy {
