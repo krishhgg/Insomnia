@@ -3,6 +3,7 @@ import Observation
 
 enum EndReason: String, Sendable {
     case timer
+    case agentsFinished
     case user
     case quit
     case batteryFloor
@@ -155,6 +156,21 @@ final class SessionManager {
     }
 
     var isActive: Bool { session != nil }
+    /// Nil outside an actual start transaction; otherwise its intended mode.
+    /// Journal ownership is written before arming, not proof of a live hold.
+    private(set) var startingSessionIsAuto: Bool?
+    var agentAuto: AgentAutoController?
+    /// Auto cannot disable the unattended-work safety floors. Stronger
+    /// user battery thresholds remain effective; timed sessions are unchanged.
+    var floorConfig: Config {
+        guard session?.agentAuto == true else { return config }
+        var safe = config
+        safe.thermalRules = true
+        safe.endFloor = max(10, safe.endFloor)
+        safe.lowPowerFloor = max(safe.lowPowerFloor, safe.endFloor + Config.floorStep)
+        return safe
+    }
+    @ObservationIgnored private var lastSessionEndFloor = 10
 
     /// Journal edits owed by a freeze that `LidActions` undid because the
     /// write confirming it failed (`clearUndoneFreeze`).
@@ -460,7 +476,7 @@ final class SessionManager {
     @ObservationIgnored private(set) var quitRequested = false
     /// An end that could not complete (lock busy, or dirty with no agent to
     /// retry). Retried in process; new starts wait until it is resolved.
-    @ObservationIgnored private(set) var pendingEnd: EndReason?
+    private(set) var pendingEnd: EndReason?
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
     /// Detail of the last unreadable-journal notification, so a journal
@@ -1166,7 +1182,11 @@ final class SessionManager {
     /// setting may have been applied before the error or timeout), so it is
     /// undone from the journal like an end, and the journal keeps the entry
     /// until that undo is confirmed.
-    func start(duration: TimeInterval) async {
+    func start(duration: TimeInterval, agentAuto: Bool = false) async {
+        if !agentAuto {
+            guard session?.agentAuto != true else { return }
+            self.agentAuto?.suspend(reason: .user)
+        }
         guard !quitRequested else {
             Log.info("start ignored: quit requested")
             return
@@ -1176,13 +1196,13 @@ final class SessionManager {
             return
         }
         let ticket = endTicket
-        _ = await exclusive("start") { await self.performStart(duration: duration, ticket: ticket) }
+        _ = await exclusive("start") { await self.performStart(duration: duration, ticket: ticket, agentAuto: agentAuto) }
         // A start that goes through before a refused launch reconcile runs
         // again drops that reconcile, and takes over its check.
         await settleEarlierCommand()
     }
 
-    private func performStart(duration: TimeInterval, ticket: Int) async {
+    private func performStart(duration: TimeInterval, ticket: Int, agentAuto: Bool) async {
         guard session == nil else {
             Log.info("start ignored: session already active")
             return
@@ -1191,8 +1211,14 @@ final class SessionManager {
             Log.info("start abandoned: an end was requested first")
             return
         }
+        startingSessionIsAuto = agentAuto
+        defer { startingSessionIsAuto = nil }
         let now = clock()
-        let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        guard !agentAuto || duration > 0 else { return }
+        var new = agentAuto
+            ? Session(startedAt: now, endsAt: now.addingTimeInterval(min(duration, AgentJob.leaseSeconds)))
+            : SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        new.agentAuto = agentAuto ? true : nil
         // What was on disk before this attempt, read under the lock. A
         // rollback puts exactly this back: an entry an earlier failed restore
         // left behind is evidence, not something this start may clear.
@@ -1268,8 +1294,29 @@ final class SessionManager {
         // PR3: schedule "5 minutes left" notification.
     }
 
+    /// Only Auto may renew its lease, and never farther than 90 seconds.
+    func renewAgentDeadline(_ deadline: Date) async {
+        let ticket = endTicket
+        _ = await exclusive("renew agent lease") {
+            guard var current = self.session, current.agentAuto == true,
+                  self.endTicket == ticket, self.pendingEnd == nil else { return }
+            do {
+                try await self.backstop.arm()
+                guard self.endTicket == ticket, self.session == current else { return }
+                current.endsAt = min(deadline, self.clock().addingTimeInterval(AgentJob.leaseSeconds))
+                try self.store.saveSession(current)
+                self.session = current
+                await self.armDeadline(current.endsAt)
+            } catch {
+                self.fail("could not renew agent lease: \(error.localizedDescription)")
+                self.agentAuto?.suspend(reason: .recoveryUnavailable)
+                _ = await self.performEnd(reason: .recoveryUnavailable)
+            }
+        }
+    }
+
     func extend(by extra: TimeInterval) async {
-        guard session != nil else { return }
+        guard session != nil, session?.agentAuto != true else { return }
         let ticket = endTicket
         _ = await exclusive("extend") { await self.performExtend(by: extra, ticket: ticket) }
     }
@@ -1311,6 +1358,7 @@ final class SessionManager {
     /// be read the end changes nothing and waits for a person.
     @discardableResult
     func end(reason: EndReason) async -> EndOutcome {
+        if reason != .agentsFinished { agentAuto?.suspend(reason: reason) }
         endTicket += 1
         if reason == .quit { quitRequested = true }
         retryTimer?.invalidate()
@@ -1353,6 +1401,7 @@ final class SessionManager {
 
     private func performEnd(reason: EndReason) async -> EndOutcome {
         let had = session != nil
+        if had { lastSessionEndFloor = floorConfig.endFloor }
         Log.info("session end (\(reason.rawValue))")
         stopTimers()
         countdownPaused = false
@@ -2610,6 +2659,13 @@ final class SessionManager {
             onDisk = nil
         }
 
+        // Never reapply Auto based on a persisted session. Restore first;
+        // the launch default may arm only after recovery, using live activity.
+        if onDisk?.agentAuto == true {
+            _ = await performEnd(reason: .agentsFinished)
+            return
+        }
+
         if let s = onDisk, !s.isExpired(at: now) {
             // Step 2: valid session. Arm first, then journal, then hold
             // sleep. Any failure ends the session rather than holding sleep
@@ -3175,10 +3231,11 @@ final class SessionManager {
     private func endBody(_ reason: EndReason, outputsWaiting: Bool) -> String {
         switch reason {
         case .timer: "Time is up. Sleep is back to normal."
+        case .agentsFinished: "No registered agent work remains. Sleep is back to normal."
         case .user: "Ended by you. Sleep is back to normal."
         case .quit: "Insomnia quit. Sleep is back to normal."
-        case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
-        case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
+        case .batteryFloor: "Battery fell below \(lastSessionEndFloor)%. Sleep is back to normal."
+        case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(lastSessionEndFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
         case .backstop: outputsWaiting
             ? "A previous session left changes behind. Sleep is back to normal."

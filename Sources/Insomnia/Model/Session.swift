@@ -7,11 +7,14 @@ struct Session: Codable, Equatable, Sendable {
     var endsAt: Date
     /// Every extension applied, in order, in seconds.
     var extensions: [TimeInterval]
+    /// Absent for legacy/timed sessions. Auto deadlines are short job leases.
+    var agentAuto: Bool?
 
-    init(startedAt: Date, endsAt: Date, extensions: [TimeInterval] = []) {
+    init(startedAt: Date, endsAt: Date, extensions: [TimeInterval] = [], agentAuto: Bool? = nil) {
         self.startedAt = startedAt
         self.endsAt = endsAt
         self.extensions = extensions
+        self.agentAuto = agentAuto
     }
 
     /// Seconds left until `endsAt`, never negative.

@@ -14,7 +14,9 @@ Insomnia is a menu bar app for timed awake sessions on a MacBook, used on a
 stable, well-ventilated surface. It must not be used to keep a Mac awake in a
 closed bag. Its design goals are to:
 
-1. Prevent lid-close sleep for a fixed, user-chosen duration. Never a toggle.
+1. Prevent lid-close sleep for a fixed duration, or while explicitly registered
+   agent work is active in [Auto mode](auto.md). An armed but idle Auto mode
+   never holds sleep.
 2. Reduce battery waste while the lid is closed without slowing the agents.
 3. Shorten Wi-Fi to hotspot handoffs so agent API retries succeed.
 4. Journal changes and support recovery after interruption, while reporting
@@ -24,8 +26,9 @@ closed bag. Its design goals are to:
 
 - Not a kernel extension, not a signed privileged helper, not a notarized
   download. Built from source, ad-hoc signed, installed by a script.
-- Does not manage or restart the agents themselves. The only agent interaction
-  is an optional "continue" keystroke into tagged tmux panes.
+- Does not manage or restart the agents themselves. Auto accepts explicit
+  activity leases and offers a finite-command terminal wrapper; the optional
+  tmux integration can also send a "continue" keystroke into tagged panes.
 - Does not touch sleep behaviour outside an active session.
 - Prefer OS events for live observations; recovery retries and countdown redraws
   require bounded recurring work.
@@ -93,7 +96,13 @@ recovery; newly written journals use `frozenProcesses`.
 
 ## Features
 
-### 1. Timed sessions (the only way to keep the Mac awake)
+### 1. Timed sessions and Auto
+
+[Auto mode](auto.md) uses the same journaled lifecycle, with `agentAuto: true`
+on the session and short rolling deadlines bounded by explicit job leases.
+It never manually extends, restores instead of re-holding after relaunch,
+and enforces battery/thermal safety even when timed-session rules are off.
+The rules below describe manually timed sessions unless stated otherwise.
 
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
   Enter with empty fields uses the configured default preset. Maximum 30 days.
@@ -1109,6 +1118,15 @@ older build is tightened when the app reads it:
   registered or unregistered at launch.
 
 ### 11. Menu bar UI: inline time entry
+
+**Current UI override:** the inline design below is historical. The current
+PR #63-based quick menu and native Settings are documented in
+[ui-refinement.md](ui-refinement.md). Either click opens the menu without
+changing modes; timer/Auto on-off actions live in that menu. Auto defaults
+on only after clean launch recovery, retains manual/safety pauses within a
+run, and shows an icon-only open eye with a three-second open pause between
+full close/reopen transitions. See [auto.md](auto.md) for bounded activity
+and recovery semantics.
 
 Reference: the attached screenshot (coffee icon, then three rounded pill
 fields "Hours", "Minutes", "Seconds", each with a small "?" badge, sitting

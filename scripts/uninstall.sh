@@ -550,6 +550,8 @@ session_shape_problems() { # file
     echo "session.json is not a JSON object"
     return 0
   fi
+  t="$(type_of "$f" agentAuto)"
+  [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "agentAuto is a JSON $t, not a bool"
   for key in startedAt endsAt; do
     t="$(type_of "$f" "$key")"
     if [[ -z "$t" ]]; then

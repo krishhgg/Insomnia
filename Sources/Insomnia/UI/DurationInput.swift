@@ -98,7 +98,10 @@ struct DurationInput: Equatable, Sendable {
     /// non-zero has been entered.
     var total: TimeInterval? {
         guard Field.allCases.allSatisfy(isValid) else { return nil }
-        let seconds = TimeInterval((days ?? 0) * 86_400 + (hours ?? 0) * 3_600 + (minutes ?? 0) * 60)
+        let daySeconds = (days ?? 0) * 86_400
+        let hourSeconds = (hours ?? 0) * 3_600
+        let minuteSeconds = (minutes ?? 0) * 60
+        let seconds = TimeInterval(daySeconds + hourSeconds + minuteSeconds)
         return seconds > 0 ? seconds : nil
     }
 

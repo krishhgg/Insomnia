@@ -4,6 +4,117 @@ import XCTest
 
 final class UIStatusTests: XCTestCase {
     @MainActor
+    func testPrimaryClickStartsFourHoursWithoutOpeningInputAndIgnoresPendingClicks() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        let gate = AsyncGate()
+        lab.h.backstop.armGate = gate
+        lab.controller.toggleSession()
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertFalse(lab.model.slotsPresent)
+        XCTAssertEqual(lab.model.pendingCountdown, "4:00:00")
+        await gate.waitUntilStarted()
+        lab.controller.toggleSession()
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertFalse(lab.model.slotsPresent)
+        await gate.open()
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase != .running, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(lab.model.phase, .running)
+        let session = try XCTUnwrap(lab.manager.session)
+        XCTAssertEqual(session.endsAt.timeIntervalSince(session.startedAt), 4 * 3600)
+        XCTAssertFalse(lab.controller.pendingTickArmed)
+        XCTAssertFalse(lab.model.slotsPresent)
+        lab.controller.toggleSession()
+        let endDeadline = Date().addingTimeInterval(2)
+        while lab.manager.isActive, Date() < endDeadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(lab.manager.isActive)
+    }
+
+    @MainActor
+    func testQuickStartUsesTheConfiguredDefault() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.defaultPreset = 1800
+        lab.controller.toggleSession()
+        let deadline = Date().addingTimeInterval(2)
+        while !lab.manager.isActive, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let session = try XCTUnwrap(lab.manager.session)
+        XCTAssertEqual(session.endsAt.timeIntervalSince(session.startedAt), 1800)
+        await lab.manager.end(reason: .user)
+    }
+
+    @MainActor
+    func testRefusedQuickStartReturnsToIdleWithoutOpeningInlineInput() async {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.h.backstop.failArm = true
+        lab.controller.toggleSession()
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase == .starting, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(lab.manager.isActive)
+        XCTAssertEqual(lab.model.phase, .idle)
+        XCTAssertEqual(lab.model.input.total, 4 * 3600)
+        XCTAssertNotNil(lab.manager.lastError)
+        XCTAssertFalse(lab.model.slotsPresent)
+        XCTAssertFalse(lab.controller.pendingTickArmed)
+    }
+
+    @MainActor
+    func testQuickItemExtendsAnActiveSessionWithoutOpeningInlineInput() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        await lab.manager.start(duration: 3600)
+        let end = try XCTUnwrap(lab.manager.session).endsAt
+        lab.controller.startPreset(1800)
+        let deadline = Date().addingTimeInterval(2)
+        while lab.manager.session?.endsAt == end, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(try XCTUnwrap(lab.manager.session).endsAt.timeIntervalSince(end), 1800, accuracy: 0.001)
+        XCTAssertFalse(lab.model.slotsPresent)
+        await lab.manager.end(reason: .user)
+    }
+
+    @MainActor
+    func testCommandDragPassesThroughTheHostToTheSystemStatusButton() {
+        XCTAssertTrue(StatusHostingView.usesSystemDrag(modifiers: .command))
+        XCTAssertTrue(StatusHostingView.usesSystemDrag(modifiers: [.command, .shift]))
+        XCTAssertFalse(StatusHostingView.usesSystemDrag(modifiers: []))
+        XCTAssertFalse(StatusHostingView.usesSystemDrag(modifiers: .control))
+        XCTAssertTrue(StatusHostingView.handlesMenu(type: .rightMouseDown, modifiers: []))
+        XCTAssertTrue(StatusHostingView.handlesMenu(type: .leftMouseDown, modifiers: .control))
+        XCTAssertTrue(StatusHostingView.handlesMenu(type: .leftMouseDown, modifiers: []))
+        XCTAssertFalse(StatusHostingView.handlesMenu(type: .leftMouseDown, modifiers: .command))
+        XCTAssertFalse(StatusHostingView.handlesMenu(type: .rightMouseDown, modifiers: .command))
+    }
+
+    func testFreezePreviewIgnoresUnrelatedSettingsChanges() {
+        let original = Config()
+        var edited = original
+        edited.hotspotSSID = "Other hotspot"
+        edited.defaultPreset = 1800
+        edited.lowPowerOnLidClose.toggle()
+        XCTAssertEqual(FreezePreviewScope(config: original), FreezePreviewScope(config: edited))
+        edited.freezeAllApps.toggle()
+        XCTAssertNotEqual(FreezePreviewScope(config: original), FreezePreviewScope(config: edited))
+        edited = original
+        edited.agentList.append("example.protected")
+        XCTAssertNotEqual(FreezePreviewScope(config: original), FreezePreviewScope(config: edited))
+        edited = original
+        edited.freezeList.append("example.frozen")
+        XCTAssertNotEqual(FreezePreviewScope(config: original), FreezePreviewScope(config: edited))
+    }
+
+    @MainActor
     func testStatusHostUsesIntrinsicSizingAndHasAnIdleFittingSize() {
         let harness = Harness()
         defer { harness.home.destroy() }
@@ -101,19 +212,17 @@ final class UIStatusTests: XCTestCase {
         XCTAssertNotEqual(Motion.tick(reduceMotion: false), Motion.base)
     }
 
-    /// The blink was over in a handful of frames and barely read. It has to
-    /// be slower than the baseline spring so the lid lift and the lash
-    /// hand-over are seen, and slower than the Reduce Motion crossfade too.
+    /// Keep the blink readable while the other controls respond faster.
     @MainActor
     func testTheBlinkIsSlowerThanTheBaseSpring() {
         XCTAssertGreaterThan(Motion.blinkResponse, Motion.baseResponse)
-        XCTAssertEqual(Motion.blink(opening: true, reduceMotion: false), .spring(response: 0.95, dampingFraction: 0.9))
-        XCTAssertEqual(Motion.blink(opening: false, reduceMotion: false), .spring(response: 0.8, dampingFraction: 0.95))
+        XCTAssertEqual(Motion.blink(opening: true, reduceMotion: false), .spring(response: 0.28, dampingFraction: 0.86))
+        XCTAssertEqual(Motion.blink(opening: false, reduceMotion: false), .spring(response: 0.2, dampingFraction: 0.92))
         XCTAssertEqual(Motion.blink(opening: true, reduceMotion: false), Motion.blink)
         XCTAssertNotEqual(Motion.blink, Motion.base)
-        XCTAssertEqual(Motion.blink(opening: true, reduceMotion: true), .easeInOut(duration: 0.3))
-        XCTAssertEqual(Motion.blink(opening: false, reduceMotion: true), .easeInOut(duration: 0.3))
-        XCTAssertGreaterThan(Motion.reducedBlinkDuration, 0.15)
+        XCTAssertEqual(Motion.blink(opening: true, reduceMotion: true), .easeInOut(duration: 0.1))
+        XCTAssertEqual(Motion.blink(opening: false, reduceMotion: true), .easeInOut(duration: 0.1))
+        XCTAssertGreaterThan(Motion.reducedBlinkDuration, 0.08)
     }
 
     /// The extension projection is created at Enter over a live session;
@@ -679,12 +788,12 @@ final class UIStatusTests: XCTestCase {
     /// guarantee.
     @MainActor
     func testTheCollapseCurveIsCoveredByTheRetractSettle() {
-        XCTAssertEqual(Motion.collapse(reduceMotion: false), .easeInOut(duration: 0.32))
-        XCTAssertEqual(Motion.collapse(reduceMotion: true), .easeInOut(duration: 0.2))
+        XCTAssertEqual(Motion.collapse(reduceMotion: false), .easeInOut(duration: 0.14))
+        XCTAssertEqual(Motion.collapse(reduceMotion: true), .easeInOut(duration: 0.1))
         XCTAssertEqual(Motion.collapseScale, 0.6)
         XCTAssertGreaterThan(Motion.retractSettle(reduceMotion: false), Motion.collapseDuration)
         XCTAssertGreaterThan(Motion.retractSettle(reduceMotion: true), Motion.reducedCollapseDuration)
-        XCTAssertGreaterThan(Motion.reducedCollapseDuration, 0.15)
+        XCTAssertGreaterThan(Motion.reducedCollapseDuration, 0.08)
     }
 
     /// Esc / click away: the pills fold shut towards the eye

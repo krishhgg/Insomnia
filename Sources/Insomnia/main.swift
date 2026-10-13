@@ -8,4 +8,11 @@ if let output = ResumeFrozenCommand.run(Array(CommandLine.arguments.dropFirst())
     for line in output.lines { print(line) }
     exit(output.status)
 }
+if let output = AgentActivityCommand.run(Array(CommandLine.arguments.dropFirst())) {
+    if !output.text.isEmpty {
+        if output.status == 0 { print(output.text) }
+        else { FileHandle.standardError.write(Data((output.text + "\n").utf8)) }
+    }
+    exit(output.status)
+}
 InsomniaApp.main()

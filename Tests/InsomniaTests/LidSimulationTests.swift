@@ -92,16 +92,11 @@ final class LidSimulationGateTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: home.paths.simulateLidFile.path))
     }
 
-    /// Such a build says so in the status menu, as a warning line, so it is
-    /// never mistaken for a normal release.
-    func testTheStatusMenuMarksALidSimulationBuild() {
-        let marked = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, lidSimulationBuild: true)
-        XCTAssertEqual(marked.map(\.kind), [.warning, .separator, .settings, .quit])
-        XCTAssertEqual(marked.first?.title, LidSimulationBuild.marker)
-        XCTAssertTrue(LidSimulationBuild.marker.contains("simulate-lid.sh"))
-
-        let plain = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, lidSimulationBuild: false)
+    /// Build diagnostics belong in logs rather than product menus.
+    func testTheStatusMenuContainsOnlyProductActionsWhenIdle() {
+        let plain = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil)
         XCTAssertEqual(plain.map(\.kind), [.settings, .quit])
+        XCTAssertFalse(plain.contains { $0.title.contains("simulation") })
     }
 }
 

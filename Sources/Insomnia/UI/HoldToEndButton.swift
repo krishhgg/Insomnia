@@ -28,14 +28,14 @@ struct HoldToEndButton: View {
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.white.opacity(0.14), lineWidth: lineWidth)
+                .stroke(Color.primary.opacity(0.18), lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: progress)
-                .stroke(Color(brand: BrandPalette.violet), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .stroke(Color.accentColor, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
             Image(systemName: "xmark")
                 .font(.system(size: 7, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.85))
+                .foregroundStyle(.primary)
         }
         .frame(width: ringDiameter, height: ringDiameter)
         .scaleEffect(holding && !reduceMotion ? 1.12 : 1)
@@ -61,6 +61,7 @@ struct HoldToEndButton: View {
         .accessibilityLabel("End session")
         .accessibilityHint("Press and hold")
         .accessibilityAction { action() }
+        .onDisappear { release() }
     }
 
     /// Start drawing the ring and arm the completion.

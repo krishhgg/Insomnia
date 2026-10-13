@@ -36,7 +36,7 @@
 > [Validation status](docs/release-validation.md) · [Apple's ventilation guidance](https://support.apple.com/en-us/102336)
 
 <p align="center">
-  <img src="docs/assets/session-flow.svg" alt="Illustrated menu-bar controls: enter Days, Hours, and Minutes, watch the countdown, and hold the end control to finish early. Click the eye or countdown to add time. Closing the lid is optional, and incomplete recovery needs attention." width="880">
+  <img src="docs/assets/session-flow.svg" alt="Either click opens quick actions. Choose a timer, watch its countdown, and choose End session in the menu. Auto starts enabled after clean recovery. Closing the lid is optional, and incomplete recovery needs attention." width="880">
 </p>
 
 ## Install
@@ -98,19 +98,56 @@ file and explains how upgrades replace them.
 
 ## Using it
 
-1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
-   and press Enter.
-2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
-4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
-   the session first, and it refuses while a change is still waiting to be
-   undone. Saved audio for an output that isn't connected doesn't hold it up.
-   Insomnia restores that output if it reconnects while the app runs, or at
-   the next launch.
+1. **Toggle quick actions.** Left-click, right-click or Control-click the eye
+   or countdown to open the menu; click again to close it. This never changes
+   the running mode.
+2. **Choose a timer.** Pick a 30-minute, one-hour, two-hour, four-hour,
+   six-hour or eight-hour session. Presets replace idle Auto; during a timed
+   session they add time. Settings > General manages the default duration.
+3. **End early.** Choose **End session** or **Disable Auto** in quick actions.
+4. **Settings and status.** The same menu opens Settings, Status
+   details and Quit Insomnia. Quit asks Insomnia to undo the session first,
+   and it refuses while a change is still waiting to be undone. Saved audio
+   for an output that isn't connected doesn't hold it up. Insomnia restores
+   that output if it reconnects while the app runs, or at the next launch.
+5. **Move the eye.** Hold Command and drag it to another spot in the menu
+   bar. macOS keeps that spot for later launches.
+
+<p align="center">
+  <img src="docs/assets/ui/menu-dark.png" alt="Quick actions with four duration shortcuts and direct access to Settings" width="240">
+  <img src="docs/assets/ui/settings-dark.png" alt="General settings with a glass sidebar and a four-hour default" width="600">
+</p>
+
+Settings has General, Lid actions and Advanced pages. These screenshots come
+from the UI preview described under [Development](#development). The purple
+title-bar indicator is macOS window sharing, not an Insomnia control.
+
+### Auto — registered agent work
+
+Auto starts **enabled by default after clean launch recovery**, unless a
+previous timed session is still running. It keeps the Mac awake only while
+explicitly registered agent jobs are running. Auto is **icon-only**: the eye
+rests open for three seconds, briefly closes, then reopens (steadily open with Reduce Motion).
+Hover or open the menu for status: **Auto: idle** permits normal sleep;
+**Auto: working** identifies a live hold. The menu names the jobs.
+Choose **Disable Auto** in the menu to disarm it; either click only opens
+the menu. Timed presets can replace idle Auto, never active or arming work.
+Safety ends keep Auto paused until explicitly enabled again. Timer and Auto
+on/off actions retain their soft sounds; opening the menu stays silent.
+
+```bash
+./scripts/agent-run.sh --name 'Codex task' -- codex exec 'Run the tests'
+./scripts/agent-run.sh --name 'Claude task' -- claude -p 'Review this change'
+```
+
+Use finite commands, not idle interactive shells. Auto enforces thermal
+safety and a battery end floor of at least 10%, even if timed-session safety
+settings are weaker. See [docs/auto.md](docs/auto.md) for leases, explicit
+turn registration, recovery limits and testing.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
-On battery power, Insomnia turns on Low Power Mode below 40% and ends the
+For timed sessions on battery power, Insomnia turns on Low Power Mode below 40% and ends the
 session below 10%. Those are the defaults. You can change both in Settings,
 and an end floor of 0 turns the battery end off. The heat rules turn on Low Power
 Mode when the Mac gets seriously hot and end the session at critical heat.
@@ -169,8 +206,8 @@ Some things need you:
 - Insomnia only unfreezes a process it can prove it froze. A frozen process
   it can't prove stays frozen until you check it.
 
-If the menu shows a recovery warning, deal with it before you leave the Mac
-alone. [docs/recovery.md](docs/recovery.md) explains each case.
+If Status details shows a recovery warning, deal with it before you leave
+the Mac alone. [docs/recovery.md](docs/recovery.md) explains each case.
 
 ## Optional extras
 
@@ -203,8 +240,8 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
-[browser] unthrottled". It asks first, because relaunching quits the browser,
+`--disable-renderer-backgrounding`, Status details offers "Relaunch [browser]
+unthrottled". It asks first, because relaunching quits the browser,
 and tabs come back only if the browser reopens them on startup. Some web apps
 may still stop with the lid closed.
 [docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
@@ -246,7 +283,14 @@ swift test
 ```
 
 The tests use fakes and temporary folders, so they never change your power
-settings. See [Contributing](CONTRIBUTING.md), [Security reporting](SECURITY.md),
+settings.
+
+For a UI preview, run `./scripts/preview-app.sh`. It builds a separate debug
+app with temporary data and fake services. Its timer doesn't prevent sleep,
+and it doesn't change power settings, processes, login items or Keychain
+entries. Release bundles built by `scripts/build-app.sh` don't include it.
+[docs/ui-refinement.md](docs/ui-refinement.md) has the preview and validation
+notes. See [Contributing](CONTRIBUTING.md), [Security reporting](SECURITY.md),
 [Release validation](docs/release-validation.md) and [Design notes](docs/spec.md).
 
 ## Star history

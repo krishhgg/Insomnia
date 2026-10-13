@@ -44,6 +44,23 @@ enum EyeMarkGeometry {
         EyeLensGeometry.eyeOutline(in: rect)
     }
 
+    /// Opens the upper contour from the resting lower lid. At zero the
+    /// two curves coincide, leaving one fine closed-eye arc instead of a
+    /// filled almond. The same path clips the pupil throughout the blink.
+    static func aperture(in rect: CGRect, progress: CGFloat) -> CGPath {
+        let t = EyeLensGeometry.gridTransform(in: rect)
+        let p = min(max(progress, 0), 1)
+        let upper = upperLid, lower = lowerLid
+        let path = CGMutablePath()
+        path.move(to: upper.p0, transform: t)
+        path.addCurve(to: upper.p3,
+                      control1: lerp(lower.c2, upper.c1, p),
+                      control2: lerp(lower.c1, upper.c2, p), transform: t)
+        path.addCurve(to: upper.p0, control1: lower.c1, control2: lower.c2, transform: t)
+        path.closeSubpath()
+        return path
+    }
+
     /// The lid, meant to be filled: the region between the upper edge of the
     /// lens and the lid's lower edge, which runs from the lower lid curve at
     /// progress 0 to the upper lid curve at progress 1 (corners fixed,

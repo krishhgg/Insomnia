@@ -14,6 +14,7 @@ enum StatusMenu {
             case separator
             case settings
             case quit
+            case toggleAuto
             /// Relaunch this browser with the occlusion flags. Carries the
             /// bundle id and name, so the item still names the same browser
             /// after a scan replaces the list.
@@ -129,7 +130,9 @@ enum StatusMenu {
         settings: Selector,
         quit: Selector,
         relaunchBrowser: Selector,
-        stopWaitingForOutput: Selector
+        stopWaitingForOutput: Selector,
+        toggleAuto: Selector? = nil,
+        autoToggleEnabled: Bool = true
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -148,6 +151,11 @@ enum StatusMenu {
                     attributes[.foregroundColor] = NSColor.systemOrange
                 }
                 entry.attributedTitle = NSAttributedString(string: item.title, attributes: attributes)
+                menu.addItem(entry)
+            case .toggleAuto:
+                let entry = NSMenuItem(title: item.title, action: toggleAuto, keyEquivalent: "")
+                entry.target = target
+                entry.isEnabled = toggleAuto != nil && autoToggleEnabled
                 menu.addItem(entry)
             case .settings:
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))

@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Everything drawn inside the status item: the mark, the three pill slots
-/// while entering, or the countdown while a session runs or starts.
+/// while entering or the timed countdown. Auto remains icon-only.
 ///
 /// The layout here changes only on state the controller sets outside any
 /// animation transaction (`slotsPresent`, `phase` and `startError`), and
@@ -18,8 +18,9 @@ struct StatusRootView: View {
     let onTapIcon: () -> Void
     let onTapPill: (DurationInput.Field) -> Void
     let onTapCountdown: () -> Void
-    let onHoldEnd: () -> Void
+    var onHoldEnd: () -> Void = {}
     let onWidthChange: (CGFloat) -> Void
+    var onOpenMenu: () -> Void = {}
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotionEnv
 
@@ -32,6 +33,7 @@ struct StatusRootView: View {
     /// Each slot's laid-out width, for the distance a collapsing pill
     /// travels; a fixed slot's width never changes once measured.
     @State private var pillWidths: [DurationInput.Field: CGFloat] = [:]
+    @State private var autoEyeOpen = true
 
     private var reduceMotion: Bool { reduceMotionEnv || Motion.reduceMotion }
     /// Sleep is held right now (journal-backed), independent of the UI phase.
@@ -48,8 +50,42 @@ struct StatusRootView: View {
     /// A refused start closes it again with the pills coming back.
     private var eyeOpen: Bool { isRunning || model.phase == .starting }
 
-    private var countdownText: String {
-        Self.countdownText(pending: model.pendingCountdown, live: manager.countdownText, phase: model.phase)
+    private var usesAutoPresentation: Bool {
+        manager.agentAuto?.enabled == true || manager.session?.agentAuto == true
+            || (manager.agentAuto?.pauseReason != nil && !manager.isActive)
+            || model.autoActionPending || AutoMenuBarPresentation.isRestoring(manager: manager)
+    }
+
+    private var showsInput: Bool { model.slotsPresent && !usesAutoPresentation }
+    private var loopsAutoEye: Bool {
+        AutoEyeBlink.enabled(armed: manager.agentAuto?.enabled == true, reduceMotion: reduceMotion)
+    }
+
+    private var autoPresentation: AutoMenuBarPresentation {
+        .current(manager: manager, model: model)
+    }
+
+    private var autoHelp: String {
+        var lines = [autoPresentation.title, autoPresentation.detail]
+        if let auto = manager.agentAuto {
+            if autoPresentation == .working || autoPresentation == .checking {
+                lines += auto.jobs.map { "Agent: \($0.name)" }
+            }
+            if let reason = auto.pauseReason { lines.append("Paused: \(reason.rawValue)") }
+            lines += auto.warnings
+        }
+        if let error = manager.lastError { lines.append(error) }
+        return lines.joined(separator: "\n")
+    }
+
+    private var iconHelp: String {
+        let gesture: String
+        if AutoMenuBarPresentation.isRestoring(manager: manager) {
+            gesture = "Sleep restoration pending. Click for recovery details."
+        } else {
+            gesture = "Click or right-click to toggle quick actions."
+        }
+        return (usesAutoPresentation ? autoHelp + "\n" : "") + gesture + " ⌘-drag to move."
     }
 
     /// What the countdown reads. A projection, when there is one, wins over
@@ -64,32 +100,29 @@ struct StatusRootView: View {
     }
 
     var body: some View {
+        GlassEffectContainer(spacing: Self.slotSpacing) {
         HStack(spacing: Self.slotSpacing) {
             icon
             // What comes and goes with the layout carries its own animation
             // on its transition (`Motion.countdownTransition` and friends):
             // the branch switches outside any animation, and an
             // `.animation(_:value:)` on this container did not reach it.
-            if model.slotsPresent {
+            if showsInput {
                 pills
                 if let error = model.startError {
                     startError(error)
                         .opacity(model.startErrorShown ? 1 : 0)
                         .animation(Motion.base(reduceMotion: reduceMotion), value: model.startErrorShown)
                 }
-            } else if showsCountdown {
+            } else if showsCountdown && !usesAutoPresentation {
                 countdown
-                if showsRunningControls {
-                    HoldToEndButton(reduceMotion: reduceMotion, action: onHoldEnd)
-                        .transition(Motion.ringTransition(reduceMotion: reduceMotion))
-                }
             }
         }
         .padding(.leading, 6)
         // Never animated: `slotsPresent` can land in the same transaction as
         // a `withAnimation` (a refused start reopens the pills in one turn),
         // and an interpolated inset would report a width per frame.
-        .animation(nil) { $0.padding(.trailing, model.slotsPresent ? 8 : 6) }
+        .animation(nil) { $0.padding(.trailing, showsInput ? 8 : 6) }
         .frame(height: NSStatusBar.system.thickness)
         .fixedSize()
         .contentShape(Rectangle())
@@ -101,21 +134,34 @@ struct StatusRootView: View {
         // The host is kept as wide as the widest content it has held, so the
         // content must sit at its leading edge rather than centred in it.
         .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
-    /// A closed eye while idle; it opens while sleep is held, so the app
-    /// visibly does something even when Low Power Mode is not showing.
+    /// Auto's repeating blink signals armed mode, not a power assertion.
+    /// Actual work/restore state remains in the tooltip and accessibility value.
     private var icon: some View {
-        EyeMarkView(isRunning: eyeOpen, reduceMotion: reduceMotion)
+        Button(action: onTapIcon) {
+        EyeMarkView(isRunning: AutoEyeBlink.displayOpen(armed: manager.agentAuto?.enabled == true,
+                                                      reduceMotion: reduceMotion, blinkOpen: autoEyeOpen,
+                                                      fallbackOpen: eyeOpen), reduceMotion: reduceMotion)
             .frame(width: 20, height: 20)
             .contentShape(Rectangle())
-            .phaseAnimator([CGFloat(1), reduceMotion ? 1 : 0.86, 1], trigger: model.iconBounce) { content, scale in
+            .phaseAnimator([CGFloat(1), reduceMotion ? 1 : 0.96, 1], trigger: model.iconBounce) { content, scale in
                 content.scaleEffect(scale)
             } animation: { _ in
                 Motion.snappy(reduceMotion: reduceMotion)
             }
-            .onTapGesture(perform: onTapIcon)
-            .accessibilityLabel("Insomnia")
+        }
+        .buttonStyle(.plain)
+        .task(id: loopsAutoEye) {
+            guard loopsAutoEye else { return }
+            // Never reset from a cancelled task: a replacement may have begun.
+            try? await AutoEyeBlink.run { autoEyeOpen = $0 }
+        }
+        .help(iconHelp)
+        .accessibilityLabel("Toggle quick actions")
+        .accessibilityValue(usesAutoPresentation ? autoHelp : eyeOpen ? "Awake" : "Idle")
+        .accessibilityAction(named: Text("Toggle quick actions"), onOpenMenu)
     }
 
     /// All three slots are in the layout whenever they are present;
@@ -182,18 +228,10 @@ struct StatusRootView: View {
     /// is pending: the manager has to arm the recovery agent and disable
     /// sleep first, and either can take seconds. The projection is what the
     /// session will read once confirmed, so the live text replaces it
-    /// without a jump; the hold-to-end ring waits for the confirmation.
+    /// without a jump.
     private var countdown: some View {
-        Text(countdownText)
-            .font(.system(size: 13, weight: .medium, design: .rounded))
-            .monospacedDigit()
-            .contentTransition(.numericText(countsDown: true))
-            .animation(Motion.tick(reduceMotion: reduceMotion), value: countdownText)
-            .padding(.trailing, 1)
+        StatusCountdownView(model: model, manager: manager, reduceMotion: reduceMotion, onTap: onTapCountdown, onOpenMenu: onOpenMenu)
             .transition(Motion.countdownTransition(reduceMotion: reduceMotion))
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onTapCountdown)
-            .accessibilityLabel(model.phase == .starting ? "Starting session" : countdownText)
     }
 
     /// The manager refused the start: say so next to the pills the value is

@@ -15,7 +15,7 @@ it, and Insomnia reads it with Keychain prompts switched off, so a join during
 an outage never raises a dialog. The installer signs each build ad hoc, which
 gives every install a new identity: after a reinstall the saved password is
 unreadable by the new build. Insomnia then skips the join, shows "Hotspot
-password unreadable by this build" in the right-click menu and in Settings,
+password unreadable by this build" in Status details and in Settings,
 and sends one notification per outage. The warning belongs to the SSID it was
 read for. Change the SSID and it goes, and Settings checks the new SSID's
 saved password instead. Enter the password again in Settings and save; the
@@ -66,7 +66,7 @@ pending automation but cannot retract keystrokes already sent.
 Chromium browsers can throttle windows macOS considers occluded, including
 when the lid is closed. Insomnia detects supported running browsers missing
 `--disable-backgrounding-occluded-windows` or `--disable-renderer-backgrounding`
-and offers **Relaunch [browser] unthrottled** in the right-click menu. The item
+and offers **Relaunch [browser] unthrottled** in Status details. The item
 asks first, because the browser is quit and its windows and tabs come back only
 if it is set to reopen them on startup. If the browser has quit by the time you
 confirm, nothing is quit or launched and a notification says so. Insomnia reads the browser's profile
@@ -78,7 +78,7 @@ so: a second copy beside the first would be worse than a throttled one. The
 quit request stands, so a browser that closes later has to be opened again by
 hand. After `open` returns, Insomnia waits up to 5 s for the browser to show up
 as running and notifies if it does not. Each of these reasons also stays in the
-right-click menu as a warning line, one per browser, until that browser's next
+Status details menu as a warning line, one per browser, until that browser's next
 relaunch or the next session, so it is there even with notifications off. A
 relaunch that ends after its session ended, or after a newer relaunch of the
 same browser started, reports nothing. This is not a guarantee that every web

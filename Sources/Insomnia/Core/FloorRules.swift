@@ -106,7 +106,7 @@ struct FloorRuleDriver {
 
     func run(battery: BatteryStatus, isCharging: Bool, thermal: ProcessInfo.ThermalState, lidClosed: Bool) async {
         guard let manager, manager.isActive, !Task.isCancelled else { return }
-        let config = manager.config
+        let config = manager.floorConfig
         let percent = battery.percent
         let actions = FloorRules.evaluate(
             battery: battery,

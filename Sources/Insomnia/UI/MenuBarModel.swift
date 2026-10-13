@@ -9,6 +9,10 @@ import Observation
 @MainActor
 @Observable
 final class MenuBarModel {
+    /// Blocks repeat clicks and quick actions across asynchronous
+    /// arming or restoration, without pretending sleep is already held.
+    var autoActionPending = false
+
     enum Mode: Equatable, Sendable {
         /// Enter starts a new session.
         case start

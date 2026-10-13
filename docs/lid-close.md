@@ -13,6 +13,11 @@ starts right away. **The timer keeps counting down while the lid is
 closed**; only its on-screen redraw pauses, also for a session started with
 the lid already closed.
 
+[Auto mode](auto.md) uses the same actions only while explicitly registered
+agent work holds sleep. With Auto armed but no active work, lid close keeps
+normal macOS sleep behavior. Auto completion is independent of window
+visibility or brief idle gaps, and safety ends pause Auto until re-enabled.
+
 ## Display and keyboard backlight
 
 The display step exists because the sleep guard stops macOS from doing it:
@@ -59,8 +64,8 @@ The defaults are worth knowing:
   managers, local databases, Tailscale, local model servers; JetBrains IDEs by
   bundle-id prefix), so only agents keep running with the lid shut. Menu-bar
   apps are never picked up automatically; add them to the freeze list if you
-  want them paused. Settings shows a "Would freeze now" line listing what the
-  automatic scope would pause at that moment.
+  want them paused. Settings > Lid actions > Paused apps shows which additional
+  apps the automatic scope would pause at that moment.
 - **Meeting, recording and dictation apps:** never frozen by "Freeze every
   other app", with their helper apps: Zoom, Microsoft Teams (new and classic),
   Webex (and the older Webex Meetings app), FaceTime, Wispr Flow, Granola,

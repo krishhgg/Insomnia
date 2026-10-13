@@ -75,7 +75,8 @@ step "Assembling $APP"
 # resource seal covers it. The LaunchAgent install.sh writes verifies the
 # bundle and only then runs this copy; an edited script fails that check.
 "$CP" "$ROOT/scripts/backstop.sh" "$APP/Contents/Resources/backstop.sh"
-"$CHMOD" 755 "$APP/Contents/Resources/backstop.sh"
+"$CP" "$ROOT/scripts/agent-run.sh" "$APP/Contents/Resources/agent-run.sh"
+"$CHMOD" 755 "$APP/Contents/Resources/backstop.sh" "$APP/Contents/Resources/agent-run.sh"
 "$PLUTIL" -lint "$APP/Contents/Info.plist" >/dev/null
 
 # 3. Sign --------------------------------------------------------------------

@@ -319,7 +319,9 @@ final class PackagingTests: XCTestCase {
         for name in ["Info.plist", "AppIcon.icns"] {
             try fm.copyItem(at: Self.repoRoot.appendingPathComponent("Resources/\(name)"), to: checkout.appendingPathComponent("Resources/\(name)"))
         }
-        try fm.copyItem(at: Self.repoRoot.appendingPathComponent("scripts/backstop.sh"), to: checkout.appendingPathComponent("scripts/backstop.sh"))
+        for name in ["backstop.sh", "agent-run.sh"] {
+            try fm.copyItem(at: Self.repoRoot.appendingPathComponent("scripts/\(name)"), to: checkout.appendingPathComponent("scripts/\(name)"))
+        }
         try fm.copyItem(atPath: "/usr/bin/true", toPath: binroot.appendingPathComponent("Insomnia").path)
 
         func fake(_ name: String, _ body: String) throws -> URL {
@@ -372,7 +374,7 @@ final class PackagingTests: XCTestCase {
         XCTAssertEqual(r.status, 0, r.output)
         let bundle = out.appendingPathComponent("Insomnia.app")
         XCTAssertEqual(r.output.components(separatedBy: "\n").filter { !$0.isEmpty }.last, bundle.path, "the bundle path is printed last")
-        for rel in ["Contents/MacOS/Insomnia", "Contents/Info.plist", "Contents/Resources/AppIcon.icns", "Contents/Resources/backstop.sh", "Contents/_CodeSignature/CodeResources"] {
+        for rel in ["Contents/MacOS/Insomnia", "Contents/Info.plist", "Contents/Resources/AppIcon.icns", "Contents/Resources/backstop.sh", "Contents/Resources/agent-run.sh", "Contents/_CodeSignature/CodeResources"] {
             XCTAssertTrue(FileManager.default.fileExists(atPath: bundle.appendingPathComponent(rel).path), rel)
         }
         let perms = try FileManager.default.attributesOfItem(atPath: Paths.backstopScript(inBundle: bundle).path)[.posixPermissions] as? Int
@@ -380,6 +382,15 @@ final class PackagingTests: XCTestCase {
         XCTAssertEqual(try run("/usr/bin/codesign", ["--verify", "--strict", bundle.path]).status, 0)
         XCTAssertTrue(r.output.contains("Signature=adhoc"), r.output)
         XCTAssertTrue(try CodeRequirement.designated(ofCodeAt: bundle).hasPrefix("cdhash H\""))
+
+        let wrapper = bundle.appendingPathComponent("Contents/Resources/agent-run.sh")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: wrapper.path))
+        let originalWrapper = try Data(contentsOf: wrapper)
+        try (originalWrapper + Data("# edited wrapper\n".utf8)).write(to: wrapper)
+        XCTAssertNotEqual(try run("/usr/bin/codesign", ["--verify", "--strict", bundle.path]).status, 0,
+                          "the agent wrapper must be covered by the bundle seal")
+        try originalWrapper.write(to: wrapper)
+        XCTAssertEqual(try run("/usr/bin/codesign", ["--verify", "--strict", bundle.path]).status, 0)
 
         let script2 = Paths.backstopScript(inBundle: bundle)
         try (String(contentsOf: script2, encoding: .utf8) + "# edited\n").write(to: script2, atomically: true, encoding: .utf8)
@@ -475,7 +486,8 @@ final class PackagingTests: XCTestCase {
             "cp \(checkout)/Resources/Info.plist \(app)/Contents/Info.plist",
             "cp \(checkout)/Resources/AppIcon.icns \(app)/Contents/Resources/AppIcon.icns",
             "cp \(checkout)/scripts/backstop.sh \(app)/Contents/Resources/backstop.sh",
-            "chmod 755 \(app)/Contents/Resources/backstop.sh",
+            "cp \(checkout)/scripts/agent-run.sh \(app)/Contents/Resources/agent-run.sh",
+            "chmod 755 \(app)/Contents/Resources/backstop.sh \(app)/Contents/Resources/agent-run.sh",
         ] {
             XCTAssertTrue(recorded.contains(call), "\(call) not in \(recorded)")
         }
