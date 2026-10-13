@@ -35,6 +35,10 @@ struct Config: Codable, Equatable, Sendable {
     /// on lid close and restore them on lid open. With sleep disabled macOS
     /// no longer turns the panel off itself.
     var darkenDisplayOnLidClose: Bool = true
+    /// Lock the screen on lid close, so opening the lid asks for the login
+    /// password. Off by default, and for a config.json without the key. The
+    /// lock is not undone on lid open.
+    var lockScreenOnLidClose: Bool = false
     /// Switch Low Power Mode on while the lid is closed (heat and battery:
     /// with sleep disabled the machine otherwise runs at full speed).
     var lowPowerOnLidClose: Bool = true
@@ -153,6 +157,7 @@ struct Config: Codable, Equatable, Sendable {
         // sees what such a config.json actually did.
         muteOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .muteOnLidClose) ?? (lidCloseDefaultsApplied && d.muteOnLidClose)
         darkenDisplayOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .darkenDisplayOnLidClose) ?? d.darkenDisplayOnLidClose
+        lockScreenOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .lockScreenOnLidClose) ?? d.lockScreenOnLidClose
         lowPowerOnLidClose = try c.decodeIfPresent(Bool.self, forKey: .lowPowerOnLidClose) ?? d.lowPowerOnLidClose
         agentList = try c.decodeIfPresent([String].self, forKey: .agentList) ?? d.agentList
         disableAppNapForAgents = try c.decodeIfPresent(Bool.self, forKey: .disableAppNapForAgents) ?? d.disableAppNapForAgents

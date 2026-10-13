@@ -144,6 +144,7 @@ Quit, or reconcile.
 
 | action | on close | on open |
 |---|---|---|
+| Screen lock (optional, default off) | lock the login session first, before any other action, with `SACLockScreenImmediate` (a private login.framework call); not journaled; a failure shows in the menu and the other actions still run | nothing: the login password unlocks it |
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |

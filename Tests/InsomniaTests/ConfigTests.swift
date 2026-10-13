@@ -260,6 +260,20 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(freeze.changes, "\"Freeze every other app while the lid is closed\" is now off")
     }
 
+    /// Lock-screen-on-close is off for a config.json without the key and
+    /// survives a save and load when on.
+    func testLockScreenOnLidCloseDefaultsOffAndRoundTrips() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"muteOnLidClose": true}"#.utf8))
+        XCTAssertFalse(legacy.lockScreenOnLidClose)
+        XCTAssertFalse(Config().lockScreenOnLidClose)
+        var on = Config()
+        on.lockScreenOnLidClose = true
+        let data = try Store.makeEncoder().encode(on)
+        let back = try Store.makeDecoder().decode(Config.self, from: data)
+        XCTAssertTrue(back.lockScreenOnLidClose)
+        XCTAssertEqual(back, on)
+    }
+
     /// A config.json written before the display toggle existed keeps the
     /// default (on); an explicit false is honoured.
     func testDarkenDisplayDecodesTolerantly() throws {

@@ -166,6 +166,10 @@ struct SettingsView: View {
                     Button("Dismiss") { manager.dismissLidCloseNotice() }
                 }
             }
+            Toggle("Lock the screen", isOn: bind(\.lockScreenOnLidClose))
+            Text("The screen locks when the lid closes during a session, so opening it asks for your login password. Work keeps running.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Turn off the display and keyboard backlight", isOn: bind(\.darkenDisplayOnLidClose))
             ForEach(manager.darkenRefusals, id: \.self) { reason in
                 Text(reason)

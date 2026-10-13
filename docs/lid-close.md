@@ -46,6 +46,20 @@ Insomnia's own Low Power Mode was on while the lid was closed the value is
 written once more when the mode ends. If Insomnia is not running when you open
 the lid, press the brightness-up key.
 
+## Lock the screen
+
+"Lock the screen" in Settings, under Lid-close actions, locks the screen when
+the lid closes during a session, so opening the lid asks for your login
+password. It is off by default, and a config.json from an earlier build keeps
+it off. The Mac stays awake and work keeps running.
+
+The lock calls `SACLockScreenImmediate` in Apple's private login framework,
+the call behind Ctrl+Cmd+Q. A private API can change or disappear with a macOS
+update. If the call cannot be loaded or returns an error, Insomnia logs it and
+shows a line in the menu, and the rest of the lid close still runs. The lock is
+not journaled and has no undo: opening the lid does not unlock anything, you
+sign in.
+
 ## Defaults
 
 The defaults are worth knowing:

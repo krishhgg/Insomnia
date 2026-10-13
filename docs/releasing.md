@@ -245,6 +245,7 @@ below cover what only a real Mac shows.
 ### Lid close
 
 - Lid-close/open and safe recovery of explicitly selected test processes
+- Lock the screen on: a real lid close during a session locks the login session (the open asks for the password), the Mac stays awake (no Sleep in `pmset -g log` between close and open) and insomnia.log says "screen locked on lid close"; with the setting off nothing locks
 - Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched)
 - Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched)
 - Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted
