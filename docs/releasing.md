@@ -294,6 +294,7 @@ below cover what only a real Mac shows.
 ### Install, upgrade and uninstall
 
 - Install/upgrade/uninstall with recoverable failure conditions
+- Settings > App shows the version from the installed bundle's Info.plist, and the launch line in insomnia.log carries the same; "Check for updates" names the newest stable and nightly tags as the releases page shows them and says whether the installed version is behind, and with Wi-Fi off it shows "Could not check" with the reason, the log has the failure line, and nothing else changes
 - Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why
 - Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it
 - Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac

@@ -1107,6 +1107,28 @@ older build is tightened when the app reads it:
   whenever the app becomes active, so an approval or removal made in
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
+- version and update check (Settings > App). The version line shows
+  `CFBundleShortVersionString` and `CFBundleVersion` from the running
+  bundle's Info.plist, and the launch log line carries the same, so a bug
+  report can name the build. A binary from `swift run` has no Info.plist
+  and says so. "Check for updates" sends two unauthenticated GETs to
+  `api.github.com` when clicked, with the installed version as their user
+  agent and nothing else about the Mac, and never on its own:
+  `repos/krishhgg/Insomnia/releases/latest` for the release GitHub marks
+  Latest, the stable channel as docs/install.md defines it (a 404 means
+  none), and the first page of `repos/krishhgg/Insomnia/releases` for the
+  newest nightly, the prerelease there with the latest
+  `nightly-<date>-<commit>` tag. The stable release has its own request
+  because the list is paged newest first and a nightly is published on
+  each day main has new commits, so the stable release can sit behind any
+  number of nightlies. The app compares the installed version with the
+  stable one (newer available, up to date, ahead of it, or no version to
+  compare) and shows both under the button; a failure shows its reason.
+  The result and the failure are logged. "Open releases page" opens the
+  fixed releases URL, never a URL from the answer. Nothing is installed:
+  the upgrade is the installer run again (docs/install.md, Upgrades),
+  because the recovery agent pins the installed build's code requirement
+  and the installer needs the administrator password.
 
 ### 11. Menu bar UI: inline time entry
 
@@ -1211,6 +1233,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
 | hotspot retry | only during an outage | none otherwise |
+| update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |
 
 ## Repository layout
 
@@ -1261,6 +1284,7 @@ Insomnia/
       MenuBarModel.swift
       Motion.swift
       PillView.swift
+      ReleaseCheck.swift
       ReminderScheduler.swift
       StatusMenu.swift
       SettingsView.swift

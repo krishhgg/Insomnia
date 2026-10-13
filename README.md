@@ -55,7 +55,9 @@ on each day it has new commits. They have the newest code and may be broken.
 
 To install a release yourself, follow [docs/install.md](docs/install.md). It
 covers both channels, how to check the download, and `v0.1.0`, which installs
-differently.
+differently. Settings > App shows the installed version, and "Check for
+updates" there tells you whether a newer release exists without installing
+anything.
 
 ### Build from source
 
