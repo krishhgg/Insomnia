@@ -133,8 +133,9 @@ to undo them. The timer keeps counting down while the lid is closed.
   first. With sleep turned off, macOS no longer does this by itself.
 - **Apps on the freeze list are frozen.** Freezing sends an app's processes
   `SIGSTOP`, which pauses them until `SIGCONT` on lid open. The list starts
-  with Slack, WhatsApp and Discord. "Freeze every other app" is off by
-  default. Even when on, it skips meeting, recording and dictation apps: Zoom,
+  with Slack, WhatsApp and Discord. Edit Apps in Settings sets each app to
+  keep running or to freeze, and "All other apps" keeps running by default.
+  Set to freeze, it still skips meeting, recording and dictation apps: Zoom,
   Teams, Webex, FaceTime, Wispr Flow, Granola, Otter, OBS and Loom.
 - **Audio is muted.** Lid open unmutes each output Insomnia muted, even if you
   switched to another one.

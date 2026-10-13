@@ -71,13 +71,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] in
-            AnyView(
-                SettingsView(
-                    manager: manager,
-                    secrets: secrets,
-                    locationPermission: locationPermission,
-                    loginItem: loginItem
-                )
+            SettingsView(
+                manager: manager,
+                secrets: secrets,
+                locationPermission: locationPermission,
+                loginItem: loginItem
             )
         }
         settingsWindow = settings

@@ -5,7 +5,8 @@ import Foundation
 /// with defaults filled in.
 struct Config: Codable, Equatable, Sendable {
     // Session
-    /// Preset durations in seconds, shown as chips.
+    /// Preset durations in seconds, the choices for the default session
+    /// length in Settings.
     var presets: [TimeInterval] = Config.defaultPresets
     var defaultPreset: TimeInterval = 4 * 3600
     /// Hard ceiling on a session, including extensions. 30 days.
@@ -197,25 +198,32 @@ struct LidCloseDefaultsChange: Codable, Equatable, Sendable {
 
     static let title = "Lid-close settings changed"
 
-    /// The changes as one clause, for example: "Mute audio on lid close"
-    /// is now on.
+    /// The changes as one clause, for example: "Mute audio" is now on.
     var changes: String {
         var parts: [String] = []
-        if turnedOffFreezeAll { parts.append("\"Freeze every other app while the lid is closed\" is now off") }
-        if turnedOnMute { parts.append("\"Mute audio on lid close\" is now on") }
+        if turnedOffFreezeAll { parts.append("\"All other apps\" now keep running when the lid closes") }
+        if turnedOnMute { parts.append("\"Mute audio\" is now on") }
         return parts.joined(separator: " and ")
     }
 
     private var both: Bool { turnedOffFreezeAll && turnedOnMute }
 
+    /// Where each change lives in Settings: Mute audio sits under the line,
+    /// All other apps in the Edit Apps sheet.
+    private var places: String {
+        var parts: [String] = []
+        if turnedOnMute { parts.append("Mute audio is under When the lid closes") }
+        if turnedOffFreezeAll { parts.append("All other apps is behind the Edit Apps\u{2026} button") }
+        return parts.joined(separator: ", and ") + "."
+    }
+
     var notificationBody: String {
         "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
-            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions."
+            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon. \(places)"
     }
 
     var settingsLine: String {
-        "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
-            + "\(both ? "Both toggles are" : "The toggle is") below."
+        "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). \(places)"
     }
 }
 
@@ -265,5 +273,50 @@ extension Config {
         }
         guard (lowPowerFloor, endFloor) != before else { return nil }
         return "battery floors corrected: lowPowerFloor \(before.0) -> \(lowPowerFloor), endFloor \(before.1) -> \(endFloor)"
+    }
+
+    /// The levels Settings offers for a floor: 0 (never) and every step up
+    /// to `max`, plus `current` when a hand-edited config.json holds a
+    /// level between steps, so the menu still shows it.
+    static func floorChoices(through max: Int, keeping current: Int) -> [Int] {
+        Set(Array(stride(from: 0, through: max, by: floorStep)) + [current]).sorted()
+    }
+}
+
+// MARK: App rules
+
+/// What Settings does with an app it lists: agent apps keep running (never
+/// frozen or throttled), the others freeze while the lid is closed.
+enum AppRule: Equatable, Sendable {
+    case keepRunning
+    case freeze
+}
+
+extension Config {
+    /// Every app either list names, once, agent apps first.
+    var listedApps: [String] {
+        var seen = Set<String>()
+        return (agentList + freezeList).filter { seen.insert($0).inserted }
+    }
+
+    /// The rule Settings shows for `id`, or nil when neither list names it.
+    /// An id on both lists keeps running, as the freeze planner treats it.
+    func rule(for id: String) -> AppRule? {
+        if agentList.contains(id) { return .keepRunning }
+        return freezeList.contains(id) ? .freeze : nil
+    }
+
+    /// Puts `id` on the list for `rule`, and off the other one; nil takes it
+    /// off both. Settings shows one row per app, so an app is never on the
+    /// list the user didn't pick.
+    mutating func setRule(_ rule: AppRule?, for id: String) {
+        guard self.rule(for: id) != rule else { return }
+        agentList.removeAll { $0 == id }
+        freezeList.removeAll { $0 == id }
+        switch rule {
+        case .keepRunning: agentList.append(id)
+        case .freeze: freezeList.append(id)
+        case nil: break
+        }
     }
 }

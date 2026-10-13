@@ -230,7 +230,7 @@ below cover what only a real Mac shows.
 - Reboot/login with active or dirty journals
 - Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion`
 - Existing Low Power Mode preference and saved audio restoration
-- Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Low Power Mode while the lid is closed" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
+- Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Turn on Low Power Mode" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
 - Battery/thermal event behavior on supported hardware
 - A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits
@@ -239,7 +239,7 @@ below cover what only a real Mac shows.
 - After that command exits: Low Power Mode ownership matches the mode, and a lid open made meanwhile is undone
 - `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
-- Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
+- Settings battery menus keep the end floor below the Low Power Mode floor by moving the other menu
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
 
 ### Lid close
@@ -290,6 +290,12 @@ below cover what only a real Mac shows.
 - Hotspot permission, association, cancellation, and reconnect
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
+
+### Settings
+
+- Settings… from the menu bar icon opens the window in front of the active app; it fits without scrolling in light and dark appearance, with minimize and zoom dimmed. On a screen shorter than the window (a 13-inch MacBook Air with the Dock at the bottom, or a display set to Larger Text), it opens no taller than the screen and the form scrolls to Open at login
+- Edit Apps: an app added from the running-apps menu or with Choose…, including one never opened (just unzipped), shows once with its name and icon, set to Keep running; switching it to Freeze when lid closes moves it from `agentList` to `freezeList` in config.json and the next lid close freezes it; Apple apps and Docker Desktop cannot be set to freeze
+- Hotspot name: the field suggests networks this Mac has joined; typing a straight apostrophe offers an iPhone's curly name, choosing it saves that exact name, and the next outage joins it
 
 ### Install, upgrade and uninstall
 

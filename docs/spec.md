@@ -743,11 +743,10 @@ provided by the standalone backstop. Performance effects depend on workload.
   followed by a fresh read of the item and its keychain.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
-  access when the hotspot is saved or a configured session starts, never at
-  launch. Mac apps have no when-in-use state: a grant settles on
+  access when the hotspot is saved, a configured session starts or the user
+  clicks Allow… in the hotspot settings, never at launch. Mac apps have no when-in-use state: a grant settles on
   `authorizedAlways`, and System Settings records it as Location Services
-  access for Insomnia (the Settings window says so next to the Location
-  row). Insomnia never starts location updates. The real hotspot join still
+  access for Insomnia (Settings says so next to Location access). Insomnia never starts location updates. The real hotspot join still
   must be run on the Mac in the manual test plan below.
 - Log lines naming the SSID, a tmux target or a process reach the unified
   log as private data (`Log.swift`), so `log show` prints `<private>` for
@@ -1053,11 +1052,12 @@ one-time update (section 10, once).
 ### 10. Settings
 
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
-small settings window. Like `session.json`, `state.json` and the recovery
+settings window: one page grouped by what happens (When the lid closes, Apps,
+Battery, If Wi-Fi drops, General), with Edit Apps and the hotspot in sheets. Like `session.json`, `state.json` and the recovery
 lock it is created mode 0600 in a 0700 directory, and a looser file from an
 older build is tightened when the app reads it:
 
-- presets, default preset
+- presets (the choices for the default session length), default preset
 - freeze list (bundle ids), freeze every other app on/off (default off),
   Docker rule on/off, mute on lid close on/off (default on). Under the mute
   toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
@@ -1068,17 +1068,21 @@ older build is tightened when the app reads it:
   `muteOnLidClose` on, the mark set, and is written back. When either value
   changed, the launch reconcile posts one "Lid-close settings changed"
   notification naming each change and where to change it back (Settings,
-  Lid-close actions). It posts before taking the recovery lock, so a busy
+  When the lid closes and Edit Apps). It posts before taking the recovery lock, so a busy
   lock or an unreadable journal does not hold it back, and after the app
   installs its notification delegate. The app keeps the change in `lidCloseDefaultsNotice` so Settings
-  shows the same line at the top of Lid-close actions until dismissed. The
+  shows the same line at the top of When the lid closes until dismissed. The
   mark stays set, so a setting the user turns back is never changed again. A
   missing `muteOnLidClose` in a config without the mark reads as off, as the
   earlier builds read it. A fresh install writes a config.json with the mark
   and the new defaults and shows no notice.
-- agent list (bundle ids), turn App Nap off for them on/off (default off)
+- agent list (bundle ids), turn App Nap off for them on/off (default off).
+  Edit Apps shows the agent list and the freeze list as one list with one
+  rule per app, Keep running or Freeze when lid closes, so an app is on
+  exactly one list; "All other apps" is `freezeAllApps`.
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
-- hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
+- hotspot SSID, picked from the networks this Mac has joined or typed
+  (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
@@ -1264,6 +1268,8 @@ Insomnia/
       ReminderScheduler.swift
       StatusMenu.swift
       SettingsView.swift
+      AppsSheet.swift
+      HotspotSheet.swift
       StatusItemController.swift
       StatusRootView.swift
       StatusSource.swift
@@ -1309,7 +1315,7 @@ git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
 ./scripts/install.sh      # asks for sudo once, for the sudoers file
 ```
 
-Then set the hotspot in Settings, pick a freeze list, and start a session.
+Then set up the hotspot and the app rules in Settings, and start a session.
 
 ## Manual test plan
 
@@ -1391,7 +1397,7 @@ validation record.
 16. **Upgrade notice.** Install over a build whose config.json has
     `freezeAllApps: true` and `muteOnLidClose: false`. First launch → one
     "Lid-close settings changed" notification, the same line at the top of
-    Lid-close actions in Settings, both toggles changed, config.json has
+    When the lid closes in Settings, both settings changed, config.json has
     `lidCloseDefaultsApplied: true`. Turn freeze-all back on, relaunch → no
     notice, still on. Dismiss removes the Settings line. A fresh install
     shows no notice.

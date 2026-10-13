@@ -56,6 +56,57 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
     }
 
+    // MARK: App rules
+
+    /// Edit Apps shows one row per app: a rule puts the app on exactly one
+    /// list, and removing it takes it off both.
+    func testSetRuleKeepsEachAppOnOneList() {
+        var config = Config()
+        config.setRule(.freeze, for: "com.conductor.app")
+        XCTAssertFalse(config.agentList.contains("com.conductor.app"))
+        XCTAssertEqual(config.freezeList.last, "com.conductor.app")
+        XCTAssertEqual(config.rule(for: "com.conductor.app"), .freeze)
+        config.setRule(.keepRunning, for: "com.conductor.app")
+        XCTAssertEqual(config.rule(for: "com.conductor.app"), .keepRunning)
+        XCTAssertFalse(config.freezeList.contains("com.conductor.app"))
+        config.setRule(nil, for: "com.conductor.app")
+        XCTAssertNil(config.rule(for: "com.conductor.app"))
+        XCTAssertFalse(config.listedApps.contains("com.conductor.app"))
+    }
+
+    /// The rule an app already has changes nothing, so the lists keep their
+    /// order and Settings saves nothing.
+    func testSettingTheSameRuleChangesNothing() {
+        var config = Config()
+        let before = config
+        config.setRule(.keepRunning, for: "com.conductor.app")
+        config.setRule(.freeze, for: "com.tinyspeck.slackmacgap")
+        XCTAssertEqual(config, before)
+    }
+
+    /// A hand-edited config.json can name an app on both lists. It keeps
+    /// running, as the freeze planner treats it, is listed once, and a new
+    /// rule leaves it on one list.
+    func testAnAppOnBothListsKeepsRunningUntilARuleIsPicked() {
+        var config = Config()
+        config.freezeList.append("com.conductor.app")
+        XCTAssertEqual(config.rule(for: "com.conductor.app"), .keepRunning)
+        XCTAssertEqual(config.listedApps.filter { $0 == "com.conductor.app" }.count, 1)
+        config.setRule(.freeze, for: "com.conductor.app")
+        XCTAssertFalse(config.agentList.contains("com.conductor.app"))
+        XCTAssertEqual(config.freezeList.filter { $0 == "com.conductor.app" }.count, 1)
+    }
+
+    /// The battery menus offer Never and every step, and keep a level a
+    /// hand-edited config.json holds between steps.
+    func testFloorChoicesOfferEveryStepAndKeepTheCurrentLevel() {
+        XCTAssertEqual(Config.floorChoices(through: 15, keeping: 10), [0, 5, 10, 15])
+        let end = Config.floorChoices(through: Config.maxEndFloor, keeping: 37)
+        XCTAssertEqual(end.filter { $0 > 30 && $0 < 45 }, [35, 37, 40])
+        XCTAssertEqual(end.last, Config.maxEndFloor)
+        XCTAssertEqual(Config.floorChoices(through: 100, keeping: 40).last, 100)
+    }
+
     // MARK: Battery floors
 
     func testDefaultFloorsAreOrdered() {
@@ -251,13 +302,16 @@ final class ConfigTests: XCTestCase {
     func testLidCloseNoticeNamesTheChangesAndWhereToChangeThemBack() {
         let both = LidCloseDefaultsChange(turnedOffFreezeAll: true, turnedOnMute: true)
         XCTAssertEqual(LidCloseDefaultsChange.title, "Lid-close settings changed")
-        XCTAssertEqual(both.notificationBody, "This update changed two lid-close settings: \"Freeze every other app while the lid is closed\" is now off and \"Mute audio on lid close\" is now on. To change them back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions.")
-        XCTAssertEqual(both.settingsLine, "This update changed two lid-close settings: \"Freeze every other app while the lid is closed\" is now off and \"Mute audio on lid close\" is now on. Both toggles are below.")
+        let bothChanges = "\"All other apps\" now keep running when the lid closes and \"Mute audio\" is now on."
+        let bothPlaces = "Mute audio is under When the lid closes, and All other apps is behind the Edit Apps\u{2026} button."
+        XCTAssertEqual(both.notificationBody, "This update changed two lid-close settings: \(bothChanges) To change them back, choose Settings\u{2026} from the Insomnia menu bar icon. \(bothPlaces)")
+        XCTAssertEqual(both.settingsLine, "This update changed two lid-close settings: \(bothChanges) \(bothPlaces)")
         let mute = LidCloseDefaultsChange(turnedOffFreezeAll: false, turnedOnMute: true)
-        XCTAssertEqual(mute.notificationBody, "This update changed a lid-close setting: \"Mute audio on lid close\" is now on. To change it back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions.")
-        XCTAssertEqual(mute.settingsLine, "This update changed a lid-close setting: \"Mute audio on lid close\" is now on. The toggle is below.")
+        XCTAssertEqual(mute.notificationBody, "This update changed a lid-close setting: \"Mute audio\" is now on. To change it back, choose Settings\u{2026} from the Insomnia menu bar icon. Mute audio is under When the lid closes.")
+        XCTAssertEqual(mute.settingsLine, "This update changed a lid-close setting: \"Mute audio\" is now on. Mute audio is under When the lid closes.")
         let freeze = LidCloseDefaultsChange(turnedOffFreezeAll: true, turnedOnMute: false)
-        XCTAssertEqual(freeze.changes, "\"Freeze every other app while the lid is closed\" is now off")
+        XCTAssertEqual(freeze.changes, "\"All other apps\" now keep running when the lid closes")
+        XCTAssertEqual(freeze.settingsLine, "This update changed a lid-close setting: \"All other apps\" now keep running when the lid closes. All other apps is behind the Edit Apps\u{2026} button.")
     }
 
     /// A config.json written before the display toggle existed keeps the
@@ -445,7 +499,7 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual(try h.store.loadConfig(), m.config, "the update and its mark were not written back")
         XCTAssertEqual(h.notifier.posts.map(\.title), [LidCloseDefaultsChange.title])
         XCTAssertEqual(h.notifier.posts.first?.body, change.notificationBody)
-        XCTAssertTrue(log().contains(#"[info] insomnia: config.json: lid-close update: "Freeze every other app while the lid is closed" is now off and "Mute audio on lid close" is now on; saved"#), log())
+        XCTAssertTrue(log().contains(#"[info] insomnia: config.json: lid-close update: "All other apps" now keep running when the lid closes and "Mute audio" is now on; saved"#), log())
 
         await m.reconcile()
         let again = h.makeManager()
