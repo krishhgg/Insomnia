@@ -27,8 +27,6 @@ enum BrandPalette {
 
     /// App icon tile: a mid charcoal grey.
     static let midnight = RGB(hex: 0x303336)
-    /// Pill background in the menu bar: a deep charcoal.
-    static let charcoal = RGB(hex: 0x17191B)
     /// The mark on the app icon: a warm off-white.
     static let moonWhite = RGB(hex: 0xE6E3DD)
     /// Active state: focus and hold rings. The menu bar mark itself stays monochrome.
