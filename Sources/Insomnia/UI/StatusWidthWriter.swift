@@ -10,7 +10,7 @@ import AppKit
 /// no pacing or frame-rate request changes that. So the length is written
 /// exactly once per layout change, as Apple's own items do, and everything
 /// that moves does so inside the item's window: the content is laid out at
-/// its final width and its pills, countdown and mark animate in place.
+/// its final width and its countdown and mark animate in place.
 ///
 /// A repeat of the current width is not written again.
 @MainActor

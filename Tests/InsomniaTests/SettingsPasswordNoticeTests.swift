@@ -123,8 +123,8 @@ final class SettingsPasswordSaveTests: XCTestCase {
     }
 
     /// The SSID changes while the save waits on the keychain. The save
-    /// stores under the SSID it began with and says so, and the button
-    /// does not read "Saved" for the SSID now in the field.
+    /// stores under the SSID it began with and says so, and the field does
+    /// not count as saved for the SSID configured now.
     func testAnSSIDTypedWhileTheSaveWaitsIsNotShownAsSaved() async throws {
         let keychain = BlockingKeychain()
         let ssid = Locked("Phone")
@@ -136,7 +136,7 @@ final class SettingsPasswordSaveTests: XCTestCase {
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         ssid.value = "Other Phone"
-        XCTAssertEqual(field.buttonTitle(ssid: ssid.value), "Saving\u{2026}")
+        XCTAssertFalse(field.isSaved(ssid: ssid.value))
         keychain.release()
         let outcome = await saving.value
         let recheck = field.finishSave(outcome, ssid: ssid.value)
@@ -144,8 +144,8 @@ final class SettingsPasswordSaveTests: XCTestCase {
         XCTAssertEqual(outcome, .stored(.init(ssid: "Phone", password: "pw")))
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "Phone"), "pw")
         XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Other Phone"))
-        XCTAssertEqual(field.buttonTitle(ssid: ssid.value), "Save")
-        XCTAssertEqual(field.buttonTitle(ssid: "Phone"), "Saved")
+        XCTAssertFalse(field.isSaved(ssid: ssid.value))
+        XCTAssertTrue(field.isSaved(ssid: "Phone"))
         XCTAssertEqual(recheck?.ssid, "Other Phone", "the notice is read again for the SSID typed meanwhile")
     }
 
@@ -242,32 +242,54 @@ final class SettingsPasswordSaveTests: XCTestCase {
     }
 }
 
-/// The field's rules without a window: what the button reads, and which
+/// The field's rules without a window: when it counts as saved, and which
 /// keychain answer sets the notice.
 final class HotspotPasswordFieldTests: XCTestCase {
     private let stored = HotspotStoreOutcome.stored(.init(ssid: "Phone", password: "pw"))
     private let refused = HotspotStoreOutcome.failed(notice: "Could not save the hotspot password: User canceled the operation.")
 
-    /// "Saved" only while both fields hold what was stored; an edit to
-    /// either, before or after the save answered, reads "Save" again.
+    /// Saved only while both fields hold what was stored; an edit to
+    /// either, before or after the save answered, needs a save again.
     func testSavedOnlyWhileTheFieldsHoldWhatWasStored() {
         var field = HotspotPasswordField()
         field.edit("pw")
-        XCTAssertEqual(field.buttonTitle(ssid: "Phone"), "Save")
+        XCTAssertFalse(field.isSaved(ssid: "Phone"))
         XCTAssertTrue(field.startSave())
         XCTAssertFalse(field.startSave(), "one save at a time")
-        XCTAssertEqual(field.buttonTitle(ssid: "Phone"), "Saving\u{2026}")
+        XCTAssertFalse(field.isSaved(ssid: "Phone"), "not while the save waits")
         XCTAssertNil(field.finishSave(stored, ssid: "Phone"))
 
-        XCTAssertEqual(field.buttonTitle(ssid: "Phone"), "Saved")
-        XCTAssertEqual(field.buttonTitle(ssid: " Phone "), "Saved", "the store trims the SSID too")
-        XCTAssertEqual(field.buttonTitle(ssid: "Other Phone"), "Save")
+        XCTAssertTrue(field.isSaved(ssid: "Phone"))
+        XCTAssertTrue(field.isSaved(ssid: " Phone "), "the store trims the SSID too")
+        XCTAssertFalse(field.isSaved(ssid: "Other Phone"))
         field.edit("pw2")
-        XCTAssertEqual(field.buttonTitle(ssid: "Phone"), "Save")
+        XCTAssertFalse(field.isSaved(ssid: "Phone"))
+    }
+
+    /// What the load fills in is what the keychain holds, so Save stays
+    /// off until the field or the SSID changes. An empty load (nothing
+    /// saved, or an item this build cannot read) counts too.
+    func testTheLoadedPasswordCountsAsSaved() {
+        var field = HotspotPasswordField()
+        let load = field.startLoad(ssid: "Phone")
+        XCTAssertEqual(field.finishRead(load, ssid: "Phone", password: "pw", notice: nil), .used)
+        XCTAssertTrue(field.isSaved(ssid: "Phone"))
+        XCTAssertFalse(field.isSaved(ssid: "Other Phone"))
+        field.edit("pw2")
+        XCTAssertFalse(field.isSaved(ssid: "Phone"))
+        field.edit("pw")
+        XCTAssertTrue(field.isSaved(ssid: "Phone"), "typing the saved password back needs no save")
+
+        var empty = HotspotPasswordField()
+        let unreadable = empty.startLoad(ssid: "Phone")
+        _ = empty.finishRead(unreadable, ssid: "Phone", password: "", notice: "unreadable")
+        XCTAssertTrue(empty.isSaved(ssid: "Phone"))
+        empty.edit("new")
+        XCTAssertFalse(empty.isSaved(ssid: "Phone"))
     }
 
     /// A failed save may have left the old password or the new one, so
-    /// nothing reads "Saved" after it, not even what an earlier save
+    /// nothing counts as saved after it, not even what an earlier save
     /// stored.
     func testAFailedSaveForgetsWhatWasStored() {
         var field = HotspotPasswordField()
@@ -277,7 +299,7 @@ final class HotspotPasswordFieldTests: XCTestCase {
         _ = field.startSave()
         field.finishSave(refused, ssid: "Phone")
 
-        XCTAssertEqual(field.buttonTitle(ssid: "Phone"), "Save")
+        XCTAssertFalse(field.isSaved(ssid: "Phone"))
         XCTAssertEqual(field.notice, refused.notice)
     }
 
@@ -441,6 +463,30 @@ final class HotspotPasswordFieldTests: XCTestCase {
         field.edit("")
         XCTAssertEqual(field.finishRead(unchanged, ssid: "Phone", password: "old", notice: nil), .used)
         XCTAssertEqual(field.password, "old", "setting the text it already had is not an edit")
+    }
+
+    /// The user types while the load waits. The draft stays, but the load
+    /// still records the saved password, so the status does not say it is
+    /// missing and Save lights up for the draft.
+    func testALoadRecordsTheSavedPasswordUnderAnEditedField() {
+        var field = HotspotPasswordField()
+        let load = field.startLoad(ssid: "Phone")
+        field.edit("draft")
+        XCTAssertEqual(field.finishRead(load, ssid: "Phone", password: "pw", notice: nil), .used)
+        XCTAssertEqual(field.password, "draft")
+        XCTAssertTrue(field.hasSavedPassword(ssid: "Phone"))
+        XCTAssertFalse(field.isSaved(ssid: "Phone"))
+        field.edit("pw")
+        XCTAssertTrue(field.isSaved(ssid: "Phone"), "typing the saved password back needs no save")
+
+        // A load that read before a save began records nothing: the save
+        // may have replaced what it found.
+        var saving = HotspotPasswordField()
+        let early = saving.startLoad(ssid: "Phone")
+        saving.edit("new")
+        XCTAssertTrue(saving.startSave())
+        _ = saving.finishRead(early, ssid: "Phone", password: "pw", notice: nil)
+        XCTAssertFalse(saving.hasSavedPassword(ssid: "Phone"))
     }
 
     /// A field that already held text when the load began keeps it.
@@ -617,5 +663,170 @@ final class BlockingKeychainTests: XCTestCase {
 
         XCTAssertTrue(keychain.gaveUp)
         XCTAssertFalse(keychain.calledOnMainThread)
+    }
+}
+
+/// The hotspot section's one Save button: the name to config.json, then
+/// the password to the keychain under that name.
+@MainActor
+final class HotspotSaveTests: XCTestCase {
+    /// Answers at once from memory.
+    private final class MemoryKeychain: KeychainStoring, @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [String: String]
+        init(items: [String: String] = [:]) { self.items = items }
+        var all: [String: String] { lock.withLock { items } }
+        func get(service: String, account: String) throws -> String? { lock.withLock { items["\(service)/\(account)"] } }
+        func set(service: String, account: String, value: String) throws { lock.withLock { items["\(service)/\(account)"] = value } }
+        func delete(service: String, account: String) throws { _ = lock.withLock { items.removeValue(forKey: "\(service)/\(account)") } }
+    }
+
+    private func loaded(_ password: String, for ssid: String) -> HotspotPasswordField {
+        var field = HotspotPasswordField()
+        let load = field.startLoad(ssid: ssid)
+        _ = field.finishRead(load, ssid: ssid, password: password, notice: nil)
+        return field
+    }
+
+    func testSaveWritesOnlyWhatChanged() {
+        let saved = loaded("pw", for: "Phone")
+        XCTAssertNil(SettingsView.hotspotSave(ssidDraft: nil, savedSSID: "Phone", field: saved), "nothing to write")
+        XCTAssertNil(SettingsView.hotspotSave(ssidDraft: "Phone", savedSSID: "Phone", field: saved), "the name typed back is no change")
+
+        var edited = saved
+        edited.edit("pw2")
+        XCTAssertEqual(SettingsView.hotspotSave(ssidDraft: nil, savedSSID: "Phone", field: edited), .init(name: nil, storesPassword: true))
+
+        XCTAssertEqual(SettingsView.hotspotSave(ssidDraft: "New Phone", savedSSID: "Phone", field: saved), .init(name: "New Phone", storesPassword: true),
+                       "a new name has no password yet, so the saved one is stored under it")
+
+        var cleared = saved
+        cleared.edit("")
+        XCTAssertEqual(SettingsView.hotspotSave(ssidDraft: nil, savedSSID: "Phone", field: cleared), .init(name: nil, storesPassword: true), "an empty field clears")
+
+        var waiting = edited
+        XCTAssertTrue(waiting.startSave())
+        XCTAssertNil(SettingsView.hotspotSave(ssidDraft: "New Phone", savedSSID: "Phone", field: waiting), "one save at a time")
+    }
+
+    /// What a Save press reads and writes: config.json's hotspot name, the
+    /// field, and the Location prompts it asked for.
+    @MainActor
+    private final class SaveRig {
+        var config = Config()
+        var field = HotspotPasswordField()
+        var configWrites = 0
+        var locationRequests = 0
+        let keychain: MemoryKeychain
+        lazy var store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { [unowned self] in self.config.hotspotSSID }
+
+        init(ssid: String, keychain: [String: String]) {
+            config.hotspotSSID = ssid
+            self.keychain = MemoryKeychain(items: keychain)
+        }
+
+        /// The window opens: the field loads what the keychain holds.
+        func load() async throws {
+            let read = field.startLoad(ssid: config.hotspotSSID)
+            let password = try await store.load() ?? ""
+            _ = field.finishRead(read, ssid: config.hotspotSSID, password: password, notice: nil)
+        }
+
+        /// Save is pressed, as the view presses it.
+        func save(ssidDraft: String?) -> SettingsView.HotspotSaveRun? {
+            SettingsView.runHotspotSave(
+                ssidDraft: ssidDraft,
+                field: (get: { self.field }, set: { self.field = $0 }),
+                configuredSSID: { self.config.hotspotSSID },
+                writeSSID: { self.config.hotspotSSID = $0; self.configWrites += 1 },
+                requestLocation: { self.locationRequests += 1 },
+                secrets: store,
+                services: nil
+            )
+        }
+    }
+
+    private static let service = KeychainStore.service
+
+    /// A new name with the loaded password: config.json takes the name,
+    /// the keychain then holds the password under it, the old name's item
+    /// goes, and the field counts as saved for the new name.
+    func testANewNameMovesTheSavedPasswordToIt() async throws {
+        let rig = SaveRig(ssid: "Phone", keychain: ["\(Self.service)/Phone": "pw"])
+        try await rig.load()
+
+        let run = try XCTUnwrap(rig.save(ssidDraft: "New Phone"))
+        XCTAssertEqual(rig.config.hotspotSSID, "New Phone", "the name is written before the password")
+        XCTAssertTrue(rig.field.saving, "Save shows Saving\u{2026} while the keychain answers")
+        XCTAssertNil(rig.save(ssidDraft: nil), "one save at a time")
+        let recheck = try await XCTUnwrap(run.passwordSave).value
+
+        XCTAssertNil(recheck)
+        XCTAssertFalse(rig.field.saving)
+        XCTAssertEqual(rig.configWrites, 1)
+        XCTAssertEqual(rig.locationRequests, 1)
+        XCTAssertEqual(rig.keychain.all, ["\(Self.service)/New Phone": "pw"])
+        XCTAssertTrue(rig.field.isSaved(ssid: "New Phone"))
+        XCTAssertNil(rig.field.notice)
+        XCTAssertNil(rig.save(ssidDraft: nil), "Save goes dark again")
+    }
+
+    /// A new password under the same name: config.json is left alone and
+    /// the keychain item is replaced.
+    func testANewPasswordReplacesTheSavedOne() async throws {
+        let rig = SaveRig(ssid: "Phone", keychain: ["\(Self.service)/Phone": "pw"])
+        try await rig.load()
+        rig.field.edit("pw2")
+
+        let run = try XCTUnwrap(rig.save(ssidDraft: nil))
+        _ = await run.passwordSave?.value
+
+        XCTAssertEqual(rig.configWrites, 0)
+        XCTAssertEqual(rig.keychain.all, ["\(Self.service)/Phone": "pw2"])
+        XCTAssertTrue(rig.field.hasSavedPassword(ssid: "Phone"))
+        XCTAssertTrue(rig.field.isSaved(ssid: "Phone"))
+    }
+
+    /// An emptied field clears the saved password, and the status then
+    /// says it is missing.
+    func testAnEmptiedFieldClearsTheSavedPassword() async throws {
+        let rig = SaveRig(ssid: "Phone", keychain: ["\(Self.service)/Phone": "pw"])
+        try await rig.load()
+        rig.field.edit("")
+
+        let run = try XCTUnwrap(rig.save(ssidDraft: nil))
+        _ = await run.passwordSave?.value
+
+        XCTAssertEqual(rig.keychain.all, [:])
+        XCTAssertFalse(rig.field.hasSavedPassword(ssid: "Phone"))
+        XCTAssertTrue(rig.field.isSaved(ssid: "Phone"))
+    }
+
+    /// Nothing changed: Save writes nothing and asks for nothing.
+    func testSaveWithNothingChangedDoesNothing() async throws {
+        let rig = SaveRig(ssid: "Phone", keychain: ["\(Self.service)/Phone": "pw"])
+        try await rig.load()
+
+        XCTAssertNil(rig.save(ssidDraft: "Phone"))
+        XCTAssertEqual(rig.configWrites, 0)
+        XCTAssertEqual(rig.locationRequests, 0)
+        XCTAssertEqual(rig.keychain.all, ["\(Self.service)/Phone": "pw"])
+    }
+
+    /// The status reads the saved password: typing one does not turn
+    /// failover on until Save stores it.
+    func testATypedPasswordIsNotOnUntilSaved() {
+        var field = HotspotPasswordField()
+        field.edit("pw")
+        XCTAssertFalse(field.hasSavedPassword(ssid: "Phone"))
+        XCTAssertEqual(HotspotSetupStatus.of(ssid: "Phone", passwordEntered: field.hasSavedPassword(ssid: "Phone"), passwordNotice: nil, locationAuthorized: true).level, .incomplete)
+        XCTAssertTrue(field.startSave())
+        XCTAssertNil(field.finishSave(.stored(.init(ssid: "Phone", password: "pw")), ssid: "Phone"))
+        XCTAssertTrue(field.hasSavedPassword(ssid: "Phone"))
+        XCTAssertTrue(field.hasSavedPassword(ssid: " Phone "))
+        XCTAssertFalse(field.hasSavedPassword(ssid: "Other Phone"))
+        field.edit("draft")
+        XCTAssertTrue(field.hasSavedPassword(ssid: "Phone"), "an unsaved edit leaves the saved password in place")
+        XCTAssertFalse(loaded("", for: "Phone").hasSavedPassword(ssid: "Phone"), "an empty load is no password")
     }
 }

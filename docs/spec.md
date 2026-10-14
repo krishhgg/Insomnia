@@ -95,12 +95,16 @@ recovery; newly written journals use `frozenProcesses`.
 
 ### 1. Timed sessions (the only way to keep the Mac awake)
 
-- Time is entered inline in the menu bar as Days / Hours / Minutes pills.
-  Enter with empty fields uses the configured default preset. Maximum 30 days.
-- While active the menu bar shows a second-resolution countdown. The redraw
-  timer runs at 1 Hz and stops while the lid is closed.
-- Click the cup/countdown to enter an extension; hold the end control to end.
-  Right-click opens the status, browser actions, Settings, and Quit menu.
+- Time is entered in the menu bar popover (section 11): a preset chip, or
+  Days / Hours / Minutes fields. Enter with empty fields uses the configured
+  default preset. Maximum 30 days.
+- While active the menu bar eye is open. The time left, at minute
+  resolution, is in the popover's header and the item's accessibility
+  value, not in the bar. The redraw timer runs at 1 Hz and stops while the
+  lid is closed.
+- Click the eye to extend (extend chips or the fields) or hold the end
+  control in the popover to end. The popover also holds the status, browser
+  actions, Settings, and Quit.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
   the backstop is armed. If pmset fails, or `pmset -g` no longer reads
@@ -670,7 +674,7 @@ provided by the standalone backstop. Performance effects depend on workload.
   or a locked keychain; the file-based keychain cannot tell them apart), and
   a missing item with `errSecItemNotFound`. Either skips the join and sets
   a `HotspotPasswordReport`, the `HotspotPasswordProblem` and the SSID it
-  was read for: a warning line in the right-click menu and a notice under
+  was read for: a warning row in the menu bar popover and a notice under
   the password field in Settings, both only while that SSID is the one
   configured, and one notification per outage and hotspot (re-armed on
   recovery, on stop and when the password is saved). Settings checks the
@@ -1108,96 +1112,138 @@ older build is tightened when the app reads it:
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
 
-### 11. Menu bar UI: inline time entry
+### 11. Menu bar UI: the status item and its popover
 
-Reference: the attached screenshot (coffee icon, then three rounded pill
-fields "Hours", "Minutes", "Seconds", each with a small "?" badge, sitting
-directly in the menu bar). Insomnia copies that interaction and the feel.
+The menu bar carries as little as possible; everything else lives in one
+popover that hangs from the icon. The bar never widens while a time is
+being typed. (This replaces the inline Days / Hours / Minutes pills and
+the right-click menu, 2026-10-13.)
 
-**Idle state.** A single coffee-cup status item. Nothing else in the bar.
+**The status item.**
 
-**Entering a time.** Click the icon and the status item *expands in place*
-along the menu bar: three pill fields spring out to the right of the icon,
-one after another with a short stagger.
+- Idle: the eye, closed. Nothing else in the bar.
+- Running: the eye, open. Nothing else in the bar either: the time left
+  ("2h 31m", "45m", "1d 3h", "<1m"; `SessionManager.remainingText`) is in
+  the popover's header and in the item's accessibility value ("Awake, 2h
+  31m left"). While a start is pending (the recovery agent and pmset can
+  take seconds) the eye opens at once; a refused start closes it.
+- The item keeps one width, the eye and its padding
+  (`StatusRootView.width`). `NSStatusItem.length` is written from the width
+  the SwiftUI layout reports (`StatusWidthWriter`), once when the item is
+  installed; a session starting or ending, or the popover, never moves it.
+  Every length write makes Control Center re-lay out the menu bar and
+  blocks the app's next render commit for 8 to 130 ms (see the menu bar
+  smoothness design spec, revision 4), so nothing writes it per frame.
 
-```
-☕  ( Days ? ) ( Hours ? ) ( Minutes ? )
-```
+**The popover.** A click on the item, left or right (ctrl-click too),
+toggles one `NSPopover` (arrow pointing up at the icon). Opening it
+activates the app so its fields take typing, and refreshes the status (lid, battery and watts read
+there and then; the Wi-Fi and browser scans and the foreign-sleep bit
+re-read, filling in as they land). Esc, a click outside, switching apps
+or switching Spaces closes it.
+Every click on the item flips it at once, however fast the clicks come:
+the controller's own open/closed state is the only truth, set the moment
+a click lands. Activating the app would bring its other windows
+forward with it, so a Settings window left behind other apps would come
+back with the popover: each of the app's windows under another app's
+window is taken off screen for the activation and put back under the
+window that was just above it. The popover never animates (AppKit holds an animating
+popover on screen for about half a second and puts off a show during
+it), and it is `.applicationDefined`, closed by the controller's own
+mouse-down monitors rather than by AppKit. On current macOS the menu bar
+is drawn by another process, so a click on the item first reaches the
+app as a click outside it (a global mouse-down, the app resigning
+active) and only then as the item's action; anything at the item's
+frame is left to the action, so that click is not taken as both a close
+and a reopen. A start that completes after the popover was closed and
+opened again leaves the new popover open.
+It is a fixed 300 pt wide: long text wraps and the popover grows
+downwards, never sideways. Top to bottom:
 
-- Days · Hours · Minutes rather than the reference's Hours · Minutes · Seconds.
-  Seconds are meaningless for keeping a laptop awake and days are needed.
-  (Flip this in one line if you want the reference exactly.)
-- Each pill is a numeric field. Placeholder text is the unit name; typing
-  replaces it with the number and the pill grows to fit. Tab and Shift-Tab
-  move between pills, Enter starts the session, Esc collapses.
-- The "?" badge on each pill is a help affordance: hover shows a tooltip
-  ("Up to 30 days" etc.). It is not an input.
-- The current interface uses inline entry, not the preset-popover proposal
-  from the original design. Empty-field Enter starts the default preset.
-
-**Running state.** On Enter the pills collapse and morph into a compact
-second-resolution countdown next to the icon. Clicking the cup or countdown
-opens inline duration entry for an extension. Hold the end control to end the
-session. The right-click menu contains status lines (lid, watts, Wi-Fi, frozen
-apps, Docker), browser relaunch actions, Settings, and Quit.
+1. **Header.** The eye and one line: "Not keeping your Mac awake",
+   "Starting…", or "Awake until 12:40 AM, 2h 31m left" (the weekday is
+   added when the end is on another day).
+2. **Duration.** The popover opens on time buttons alone. Idle: preset
+   chips from `presets` (30m, 1h, 2h, …; a chip starts at once) and a
+   Custom chip, all in one row of equal chips when they fit, otherwise
+   wrapping onto as many rows as they need; a chip never truncates its
+   label. Custom puts out (or away) Days, Hours and Minutes fields with
+   a Start button, and puts the cursor in Hours; the fields are put away
+   again each time the popover opens, unless a refused start left its
+   value in them. Button labels never wrap ("Extend" stays one word on
+   one line). Start (Extend while running) is greyed out, and Enter in a
+   field does nothing, until the fields hold a time: every field in
+   range and the total above zero; it comes alive as the time is typed.
+   With a time typed, Enter in a field starts too. The fields are
+   validated by `DurationInput` (Days up to 30, Hours 0 to 23,
+   Minutes 0 to 59): an out-of-range or non-numeric field gets a red border.
+   Running: extend chips (+30m, +1h) and Custom, which puts out the same
+   fields with an Extend button, and a press-and-hold ring that ends the session
+   only when held for 0.6 s. A confirmed start or extend spends the
+   typed value and puts the fields away, but leaves the popover open on
+   the running session: only the user closes it.
+3. **Start error.** When the manager refuses a start, its reason is shown
+   under the fields in system orange, and the typed value stays in the
+   fields for a retry. The same text is not repeated as a warning row
+   while it shows there. Both survive closing and reopening the popover;
+   the next start, or a session coming up, clears them.
+4. **Status.** Short rows, one fact each, with an SF Symbol: the
+   journal's sleep line, the lid, power (the charge, what the battery is
+   doing, and the time the power source list estimates: "48% · 5.6 W ·
+   2:32 left", "54% · Charging 27 W · 1:10 to full", "Calculating…"
+   while the system is still estimating, as it is for a while
+   after a plug change. Watts carry no sign: the words say which way the
+   power flows, as Stats and `pmset -g batt` do. Under half a watt while
+   charging, as at the charge limit, the draw and the time are left out:
+   "80% · On power adapter"), Wi-Fi (the
+   network name, or "On" when Location is not allowed, with the reason as
+   a tooltip), and only when they apply, frozen apps, paused Docker and
+   the last network gap.
+5. **Warnings.** One row each with an orange triangle: throttled browsers (with a "Relaunch …
+   unthrottled" button per browser, which asks before quitting it), why a
+   relaunch did not happen, the hotspot password problem, a `sudo pmset`
+   left running, the last error, sleep disabled by someone else, and
+   output devices still muted from a lid close (each with a "Stop waiting
+   for …" button). The row order is fixed (`StatusMenu.items`).
+   Errors read as one short line (`ErrorSummary`: a plain-language line
+   for known prefixes such as "Couldn't arm the recovery backstop.
+   Reinstall with scripts/install.sh.", otherwise the first sentence, cut
+   to about two lines). The original text, paths and all, is the row's
+   tooltip and accessibility hint, and a click opens the row to it. The
+   error strings themselves are unchanged in the log and notifications.
+6. **Footer.** Settings… (Cmd-,) and Quit Insomnia (Cmd-Q). A build with
+   the scripts/simulate-lid.sh watcher compiled in also shows a small
+   muted "Lid simulation build" badge here, the full marker as its
+   tooltip, so it is never mistaken for a normal one.
 
 Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
-`Voltage`) on demand when status is requested. Never continuously polled.
+`Voltage`) on demand when the popover opens. Never continuously polled.
 
-**Motion and feel.** This is a hard requirement, not polish.
+**Look.** The popover is native: system text styles, standard controls,
+SF Symbols, the system popover material, light or dark with the system.
+The brand accent (`BrandPalette.accent`, `#A6BBC3`) means "active or
+focused" and nothing else, on dark surfaces only; light surfaces use
+`accentOnLight` (`#536D78`). Warnings and errors use the system orange
+and red, never the accent. Every button answers the pointer the
+same way: one hover state and one pressed state, shown at once with no
+animation (`PopoverButtonStyle`, which draws the buttons itself so no
+AppKit hover is layered under it). Chips and the warning rows' buttons
+have a soft rounded fill that strengthens under the pointer, Start/Extend
+is the accent and lightens, Settings and Quit get a soft fill only under
+the pointer, and the hold-to-end ring gets one behind it. Named sizes and colours live in
+`DesignTokens.swift`; motion lives in `Motion.swift`.
 
-- Everything animates with springs, except the fold that closes the pills
-  (a fixed-duration ease, so the slots can leave the moment the last pill
-  is gone), the pupil shrinking away as the lid drops (a 0.4 s ease-out,
-  no bounce) and the Reduce Motion crossfades.
-  Baseline: `.spring(response: 0.35, dampingFraction: 0.72)`; pill focus
-  bounce and chip taps use a snappier `.spring(response: 0.25,
-  dampingFraction: 0.6)` with a slight scale overshoot (1.0 → 1.06 → 1.0).
-- The status item's width is never animated: `NSStatusItem.length` is
-  written once per layout change (`StatusWidthWriter`), to the width the
-  SwiftUI layout of a custom `NSStatusItem` view reports once per open and
-  once per close, as every Apple item does. (Every length write makes
-  Control Center re-lay out the menu bar and blocks the app's next render
-  commit for 8–130 ms, so any per-frame width animation stutters; see the
-  menu bar smoothness design spec, revision 4.) Layout-changing state (the
-  phase, the pill slots, the error label) is set outside any animation
-  transaction, so the layout is computed once per state; the hosting view
-  is laid out at that width, anchored at the leading edge, and the item's
-  window reveals or clips it. Only scale, offset and opacity animate inside.
-- Each pill is a fixed slot sized by its placeholder at the typed weight and
-  padding, so typing a digit never changes the layout.
-- Pills appear with a staggered scale-and-fade (about 40 ms between pills)
-  inside their slots, which are all in the layout from the first frame.
-- On Esc and on Enter the pills fold toward the eye: each one slides left
-  by the slots before it, shrinks to 0.6 from its leading edge and fades,
-  on one 0.32 s ease curve, farthest pill first, 40 ms apart, sliding under
-  its neighbour. The slots leave in one relayout 0.36 s after the last
-  pill's step, and the width is written then, never across a visible pill.
-  On Enter the eye starts to open at once and the countdown scales in from
-  the leading edge after the slots have left, showing the time the session
-  will read once the manager confirms it and ticking at 1 Hz meanwhile;
-  the hold-to-end ring follows the confirmation. A click on the eye during
-  an Esc fold brings the pills back; during an Enter fold the pending start
-  owns the bar and the click does nothing until the manager answers.
-  Transitions carry their own animation,
-  so they run whatever transaction the layout change lands in.
+**Motion and feel.**
+
 - The eye's blink is a slower spring (response 0.95, damping fraction 0.9
   opening; 0.8 / 0.95 closing) so the lid lift and the lash hand-over are
   seen; the pupil scales in from 0.6 on its own bouncier spring 0.2 s later
   and eases out to 0.6 on close, clipped to the lens.
-- Typing happens in a non-activating key panel: the app in front stays
-  frontmost; only key status moves to the pills while typing, as with
-  Spotlight, and it returns when the pills close.
-- Number changes in the countdown use `.contentTransition(.numericText())`.
-- Focus ring is a soft glow that breathes in, not a hard outline.
+- The fields shake on a rejected value with the snappy spring
+  (`.spring(response: 0.25, dampingFraction: 0.6)`).
 - Respect Reduce Motion: springs become short crossfades (0.15 s; the
-  blink 0.3 s), the fold is opacity only in place (0.2 s), the stagger is
-  zero.
-- Rendering matches the reference: dark rounded pills with a subtle
-  material, system font, SF Symbols icon, no custom images.
-
-Reference for taste: Apple's own Dynamic Island and Control Center
-transitions. If it feels like a web dropdown, it is wrong.
+  blink 0.3 s), and nothing shakes. (The popover never animates, with or
+  without it.)
 
 ## Event sources (complete list)
 

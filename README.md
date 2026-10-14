@@ -98,11 +98,13 @@ file and explains how upgrades replace them.
 
 ## Using it
 
-1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
-   and press Enter.
-2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
-4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
+1. **Start.** Click the eye in the menu bar. In the popover, pick a preset
+   or enter days, hours and minutes, and press Enter.
+2. **Add time.** Click the eye during a session and pick +30m, +1h or a
+   custom time.
+3. **End early.** Press and hold the end control in the popover.
+4. **Settings and status.** The same popover lists the Mac's status and any
+   warnings, with Settings and Quit at the bottom. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.
    Insomnia restores that output if it reconnects while the app runs, or at
@@ -203,7 +205,7 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
+`--disable-renderer-backgrounding`, the menu bar popover offers "Relaunch
 [browser] unthrottled". It asks first, because relaunching quits the browser,
 and tabs come back only if the browser reopens them on startup. Some web apps
 may still stop with the lid closed.

@@ -1125,8 +1125,8 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.audio.volume, 0.6)
         XCTAssertFalse(h.audio.muted)
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.withoutSaveID), [Self.headsetSaved])
-        let lines = StatusItemController.menuItems(manager: m, status: RecordingStatusSource()).map(\.title)
-        XCTAssertTrue(lines.contains("\u{26A0} USB Headset is still muted from a lid close; Insomnia restores it when it reconnects"), "\(lines)")
+        let lines = StatusItemController.statusItems(manager: m, status: RecordingStatusSource()).map(\.title)
+        XCTAssertTrue(lines.contains("USB Headset is still muted from a lid close; Insomnia restores it when it reconnects"), "\(lines)")
         XCTAssertTrue(lines.contains("Stop waiting for USB Headset"), "\(lines)")
 
         // macOS keeps a device's mute, so the headset comes back muted.
@@ -2469,7 +2469,7 @@ final class LidActionsTests: XCTestCase {
         ], "the disk refused every write, so the provisional entries are still there")
         XCTAssertEqual(m.state, after)
         XCTAssertEqual(m.effectiveState.frozenProcesses, [], "the status still counts the undone freeze")
-        XCTAssertNil(StatusLines.actions(frozenCount: m.effectiveState.frozenPids.count, dockerPaused: m.effectiveState.dockerFrozen, lastGap: nil))
+        XCTAssertEqual(StatusLines.actions(frozenCount: m.effectiveState.frozenPids.count, dockerPaused: m.effectiveState.dockerFrozen, lastGap: nil), [])
         let warning = try XCTUnwrap(m.lastError, "the failure is only in the log")
         XCTAssertTrue(warning.contains("could not confirm the freeze of Slack (com.tinyspeck.slackmacgap) in the journal"), warning)
         XCTAssertTrue(warning.contains("resumed 2 of the 2 pid(s) it had just stopped, so this freeze of Slack is undone"), warning)
@@ -2534,7 +2534,7 @@ final class LidActionsTests: XCTestCase {
         let status = m.effectiveState
         XCTAssertFalse(status.dockerFrozen, "Docker runs again but the status says paused")
         XCTAssertEqual(status.frozenPids, [100, 101, 102])
-        XCTAssertEqual(StatusLines.actions(frozenCount: status.frozenPids.count, dockerPaused: status.dockerFrozen, lastGap: nil), "3 apps frozen")
+        XCTAssertEqual(StatusLines.actions(frozenCount: status.frozenPids.count, dockerPaused: status.dockerFrozen, lastGap: nil).map(\.title), ["3 apps frozen"])
         let warning = try XCTUnwrap(m.lastError)
         XCTAssertTrue(warning.contains("so this freeze of Docker is undone"), warning)
     }

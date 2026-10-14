@@ -251,10 +251,10 @@ final class ConfigTests: XCTestCase {
     func testLidCloseNoticeNamesTheChangesAndWhereToChangeThemBack() {
         let both = LidCloseDefaultsChange(turnedOffFreezeAll: true, turnedOnMute: true)
         XCTAssertEqual(LidCloseDefaultsChange.title, "Lid-close settings changed")
-        XCTAssertEqual(both.notificationBody, "This update changed two lid-close settings: \"Freeze every other app while the lid is closed\" is now off and \"Mute audio on lid close\" is now on. To change them back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions.")
+        XCTAssertEqual(both.notificationBody, "This update changed two lid-close settings: \"Freeze every other app while the lid is closed\" is now off and \"Mute audio on lid close\" is now on. To change them back, choose Settings\u{2026} from the Insomnia menu bar icon and open the Lid close pane.")
         XCTAssertEqual(both.settingsLine, "This update changed two lid-close settings: \"Freeze every other app while the lid is closed\" is now off and \"Mute audio on lid close\" is now on. Both toggles are below.")
         let mute = LidCloseDefaultsChange(turnedOffFreezeAll: false, turnedOnMute: true)
-        XCTAssertEqual(mute.notificationBody, "This update changed a lid-close setting: \"Mute audio on lid close\" is now on. To change it back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions.")
+        XCTAssertEqual(mute.notificationBody, "This update changed a lid-close setting: \"Mute audio on lid close\" is now on. To change it back, choose Settings\u{2026} from the Insomnia menu bar icon and open the Lid close pane.")
         XCTAssertEqual(mute.settingsLine, "This update changed a lid-close setting: \"Mute audio on lid close\" is now on. The toggle is below.")
         let freeze = LidCloseDefaultsChange(turnedOffFreezeAll: true, turnedOnMute: false)
         XCTAssertEqual(freeze.changes, "\"Freeze every other app while the lid is closed\" is now off")

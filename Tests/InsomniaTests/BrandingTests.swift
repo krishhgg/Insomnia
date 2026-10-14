@@ -95,7 +95,7 @@ final class BrandingTests: XCTestCase {
         // Half way between the tile and the ink is half coverage, where the
         // expected raster's alpha is also half; a few edge pixels can round
         // either way, nothing more.
-        let halfInk = (luminance(BrandPalette.midnight) + luminance(BrandPalette.moonWhite)) / 2
+        let halfInk = (luminance(BrandPalette.surfaceTile) + luminance(BrandPalette.inkMark)) / 2
         var ink = 0, mismatches = 0
         for y in 0..<pixels {
             for x in 0..<pixels {
@@ -155,7 +155,7 @@ final class BrandingTests: XCTestCase {
             ctx.addPath(EyeMarkGeometry.pupil(in: mark))
             ctx.fillPath()
         }
-        let tileInk = luminance(BrandPalette.midnight), markInk = luminance(BrandPalette.moonWhite)
+        let tileInk = luminance(BrandPalette.surfaceTile), markInk = luminance(BrandPalette.inkMark)
         var mismatches = 0
         var weight: CGFloat = 0, weightedY: CGFloat = 0
         for y in 0..<pixels {

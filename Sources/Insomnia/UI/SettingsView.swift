@@ -1,8 +1,10 @@
 import AppKit
 import SwiftUI
 
-/// The settings window (spec 10). Every change is written straight through
-/// `manager.config` to config.json.
+/// The settings window (spec 10): a sidebar of panes, as System Settings
+/// has, with a search field that lists matching settings and jumps to
+/// them. Every change is written straight through `manager.config` to
+/// config.json.
 struct SettingsView: View {
     let manager: SessionManager
     let secrets: any HotspotSecretStore
@@ -10,30 +12,42 @@ struct SettingsView: View {
     /// Launch at login as macOS reports it, not as config.json remembers it.
     let loginItem: LoginItem
 
-    @State private var newPreset = ""
-    @State private var presetError: String?
-    @State private var newFreezeBundle = ""
-    @State private var newAgentBundle = ""
-    @State private var newTmuxTarget = ""
+    /// The pane showing; the window reopens on the last one used.
+    @AppStorage(SettingsPane.storageKey) private var paneName = SettingsPane.general.rawValue
+    @State private var query = ""
+    /// The search result picked in the sidebar, while the search is on.
+    @State private var pickedResult: String?
+    /// The setting the pane scrolls to and briefly highlights.
+    @State private var reveal: Reveal?
+
     /// The password field, saving, what was saved, and the notice under
     /// the field.
     @State private var hotspot = HotspotPasswordField()
+    /// The hotspot name as typed, until Save writes it to config.json;
+    /// nil while the field shows the saved name.
+    @State private var ssidDraft: String?
     /// Names of the apps the automatic lid-close scope would freeze right
     /// now (the freeze list excluded); refreshed on appear and toggle.
     @State private var wouldFreeze: [String] = []
 
+    /// A jump to one setting. `token` makes picking the same result again
+    /// scroll again.
+    struct Reveal: Equatable {
+        let id: String
+        let token = UUID()
+    }
+
     var body: some View {
-        Form {
-            sessionSection
-            lidSection
-            agentSection
-            powerSection
-            networkSection
-            appSection
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            detail
         }
-        .formStyle(.grouped)
-        .frame(width: 520)
-        .frame(minHeight: 560, idealHeight: 720)
+        // On the split view, not the sidebar: removed from the sidebar
+        // column, it makes the column ignore its width and sit at 144 pt,
+        // which cuts off "Battery & thermal".
+        .toolbar(removing: .sidebarToggle)
+        .frame(minWidth: 680, minHeight: 460)
         .onAppear {
             loadPassword()
             refreshWouldFreeze()
@@ -52,6 +66,123 @@ struct SettingsView: View {
         .onChange(of: manager.config) { refreshWouldFreeze() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in refreshWouldFreeze() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in refreshWouldFreeze() }
+    }
+
+    // MARK: Navigation
+
+    private var pane: SettingsPane {
+        SettingsPane(rawValue: paneName) ?? .general
+    }
+
+    private enum SidebarItem: Hashable {
+        case pane(SettingsPane)
+        case result(String)
+    }
+
+    /// Without a search the sidebar selects a pane; with one it selects a
+    /// result, and picking a result opens its pane and scrolls to it.
+    private var sidebarSelection: Binding<SidebarItem?> {
+        Binding(
+            get: {
+                if query.isEmpty { return .pane(pane) }
+                return pickedResult.map(SidebarItem.result)
+            },
+            set: { item in
+                switch item {
+                case let .pane(p):
+                    paneName = p.rawValue
+                case let .result(id):
+                    pickedResult = id
+                    if let entry = SettingsSearch.entry(id) {
+                        paneName = entry.pane.rawValue
+                        reveal = Reveal(id: id)
+                    }
+                case nil:
+                    break
+                }
+            }
+        )
+    }
+
+    private var sidebar: some View {
+        List(selection: sidebarSelection) {
+            if query.isEmpty {
+                ForEach(SettingsPane.allCases) { p in
+                    paneLabel(p).tag(SidebarItem.pane(p))
+                }
+            } else {
+                let results = SettingsSearch.results(for: query)
+                ForEach(SettingsPane.allCases) { p in
+                    let found = results.filter { $0.pane == p }
+                    if !found.isEmpty {
+                        Section {
+                            ForEach(found) { entry in
+                                Text(entry.title)
+                                    .lineLimit(2)
+                                    .tag(SidebarItem.result(entry.id))
+                            }
+                        } header: {
+                            paneLabel(p)
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .overlay {
+            if !query.isEmpty, SettingsSearch.results(for: query).isEmpty {
+                ContentUnavailableView.search(text: query)
+            }
+        }
+        .searchable(text: $query, placement: .sidebar, prompt: "Search")
+        .onChange(of: query) { pickedResult = nil }
+        .navigationSplitViewColumnWidth(min: 220, ideal: 230, max: 280)
+    }
+
+    private func paneLabel(_ p: SettingsPane) -> some View {
+        Label {
+            Text(p.title)
+        } icon: {
+            PaneIcon(pane: p)
+        }
+    }
+
+    private var detail: some View {
+        ScrollViewReader { proxy in
+            Form {
+                switch pane {
+                case .general: generalPane
+                case .sessions: sessionPane
+                case .lidClose: lidSection
+                case .agents: agentSection
+                case .power: powerSection
+                case .network: networkSection
+                }
+            }
+            .formStyle(.grouped)
+            // A fresh form per pane, so a pane opens at its top.
+            .id(pane)
+            .environment(\.revealedSetting, reveal?.id)
+            .task(id: reveal) {
+                guard let reveal else { return }
+                // Let a pane just switched to lay out before scrolling it.
+                // A newer pick cancels this task; a cancelled sleep throws,
+                // and the task stops there rather than clear the new pick.
+                do { try await Task.sleep(for: .milliseconds(60)) } catch { return }
+                withAnimation(.smooth) { proxy.scrollTo(reveal.id, anchor: .center) }
+                do { try await Task.sleep(for: .seconds(1.6)) } catch { return }
+                if self.reveal == reveal {
+                    withAnimation(.smooth) { self.reveal = nil }
+                }
+            }
+        }
+        .navigationTitle(pane.title)
+    }
+
+    /// Marks rows as the setting `id` names: the search scrolls to them and
+    /// tints them for a moment.
+    private func anchored<Content: View>(_ id: String, @ViewBuilder _ content: () -> Content) -> some View {
+        SettingAnchor(id: id, content: content())
     }
 
     // MARK: Bindings
@@ -93,136 +224,207 @@ struct SettingsView: View {
         Binding(get: { manager.config.endFloor }, set: { v in update { $0.setEndFloor(v) } })
     }
 
-    // MARK: Sections
+    // MARK: Panes
 
-    private var sessionSection: some View {
-        Section("Session") {
-            ForEach(manager.config.presets, id: \.self) { p in
-                HStack {
-                    Text(chipLabel(for: p))
-                        .monospacedDigit()
-                    Spacer()
-                    if p == manager.config.defaultPreset {
-                        Text("default").font(.caption).foregroundStyle(.secondary)
+    @ViewBuilder
+    private var generalPane: some View {
+        Section {
+            anchored("launchAtLogin") {
+                Toggle("Launch at login", isOn: launchAtLogin)
+                loginItemNote
+            }
+        }
+        Section {
+            anchored("configFile") {
+                LabeledContent("Config file") {
+                    Text(manager.paths.configFile.path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+            if LidSimulationBuild.isCompiledIn {
+                Text(LidSimulationBuild.marker)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        } footer: {
+            Text("Every change here is saved to the config file at once.")
+        }
+    }
+
+    @ViewBuilder
+    private var sessionPane: some View {
+        Section {
+            anchored("presets") {
+                EditableList(
+                    manager.config.presets,
+                    searchPrompt: "Search presets",
+                    addHelp: "Add a preset",
+                    emptyText: "No presets",
+                    fields: { [chipLabel(for: $0)] }
+                ) { p in
+                    HStack {
+                        Text(chipLabel(for: p))
+                            .monospacedDigit()
+                        Spacer()
+                        if p == manager.config.defaultPreset {
+                            Text("default").font(.caption).foregroundStyle(.secondary)
+                        }
+                        removeButton {
+                            update { $0.presets.removeAll { $0 == p } }
+                        }
                     }
-                    removeButton {
-                        update { $0.presets.removeAll { $0 == p } }
+                } adder: { done in
+                    TextEntryAdder(
+                        title: "Add a preset",
+                        placeholder: "30m, 2h, 1h30m, 3d",
+                        note: "Up to \(chipLabel(for: manager.config.maxDuration)).",
+                        canAdd: { DurationParser.seconds(from: $0) != nil },
+                        add: addPreset,
+                        done: done
+                    )
+                }
+            }
+        } header: {
+            Text("Presets")
+        } footer: {
+            Text("Presets are the time chips in the menu bar popover.")
+        }
+        Section {
+            anchored("defaultPreset") {
+                Picker("Default preset", selection: bind(\.defaultPreset)) {
+                    ForEach(manager.config.presets, id: \.self) { p in
+                        Text(chipLabel(for: p)).tag(p)
+                    }
+                    if !manager.config.presets.contains(manager.config.defaultPreset) {
+                        Text(chipLabel(for: manager.config.defaultPreset)).tag(manager.config.defaultPreset)
                     }
                 }
             }
-            HStack {
-                TextField("Add preset (30m, 2h, 1h30m, 3d)", text: $newPreset)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(addPreset)
-                Button("Add", action: addPreset)
-                    .disabled(DurationParser.seconds(from: newPreset) == nil)
-            }
-            if let presetError {
-                Text(presetError).font(.caption).foregroundStyle(.red)
-            }
-            Picker("Default preset", selection: bind(\.defaultPreset)) {
-                ForEach(manager.config.presets, id: \.self) { p in
-                    Text(chipLabel(for: p)).tag(p)
+            anchored("maxSession") {
+                LabeledContent("Maximum session") {
+                    Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
                 }
-                if !manager.config.presets.contains(manager.config.defaultPreset) {
-                    Text(chipLabel(for: manager.config.defaultPreset)).tag(manager.config.defaultPreset)
-                }
-            }
-            LabeledContent("Maximum session") {
-                Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
             }
         }
     }
 
-    private func addPreset() {
-        guard let s = DurationParser.seconds(from: newPreset) else { return }
+    /// Adds a preset typed in the + popover, or says why it cannot.
+    private func addPreset(_ text: String) -> String? {
+        guard let s = DurationParser.seconds(from: text) else { return "Type a duration such as 30m, 2h or 1h30m." }
         guard s <= manager.config.maxDuration else {
-            presetError = "Presets cannot exceed \(chipLabel(for: manager.config.maxDuration))."
-            return
+            return "Presets cannot exceed \(chipLabel(for: manager.config.maxDuration))."
         }
-        presetError = nil
         update {
             if !$0.presets.contains(s) {
                 $0.presets.append(s)
                 $0.presets.sort()
             }
         }
-        newPreset = ""
+        return nil
     }
 
     /// Under the mute toggle and in the README. Apple Platform Security,
     /// "Hardware microphone disconnect".
     static let microphoneNote = "On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic."
 
+    @ViewBuilder
     private var lidSection: some View {
-        Section {
-            // The one-time lid-close update, for a user who has
-            // notifications turned off. Stays until dismissed.
-            if let notice = manager.config.lidCloseDefaultsNotice {
+        // The one-time lid-close update, for a user who has
+        // notifications turned off. Stays until dismissed.
+        if let notice = manager.config.lidCloseDefaultsNotice {
+            Section {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(notice.settingsLine)
-                        .font(.callout)
+                    Label {
+                        Text(notice.settingsLine)
+                    } icon: {
+                        Image(systemName: "info.circle.fill").foregroundStyle(.blue)
+                    }
+                    .font(.callout)
                     Spacer()
                     Button("Dismiss") { manager.dismissLidCloseNotice() }
                 }
             }
-            Toggle("Turn off the display and keyboard backlight", isOn: bind(\.darkenDisplayOnLidClose))
-            ForEach(manager.darkenRefusals, id: \.self) { reason in
-                Text(reason)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+        }
+        Section {
+            anchored("darken") {
+                Toggle(isOn: bind(\.darkenDisplayOnLidClose)) {
+                    TitleWithInfo("Turn off the display and keyboard backlight", info: "darken")
+                }
+                ForEach(manager.darkenRefusals, id: \.self) { reason in
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
-            bundleList(
-                title: "Freeze while the lid is closed",
-                items: manager.config.freezeList,
-                newValue: $newFreezeBundle,
-                add: { id in update { if !$0.freezeList.contains(id) { $0.freezeList.append(id) } } },
-                remove: { id in update { $0.freezeList.removeAll { $0 == id } } }
-            )
-            Toggle("Freeze every other app while the lid is closed", isOn: bind(\.freezeAllApps))
-            Text(wouldFreezeText)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Toggle("Pause Docker Desktop when no containers are running", isOn: bind(\.dockerRule))
-            Text("Off by default. When on, Docker Desktop is paused only if a second check right before the pause still finds no running container; a container that starts in that last moment is paused with it.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))
-            Text(Self.microphoneNote)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
-                // A floor input: apply it now if the lid is already closed.
-                .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
         } header: {
-            Text("Lid-close actions")
-        } footer: {
-            Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps such as Zoom, Teams, Webex, Wispr Flow, Granola, Otter, OBS and Loom). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
+            Text("Display")
+        }
+        Section {
+            anchored("freezeList") {
+                appList(
+                    manager.config.freezeList,
+                    add: { id in update { if !$0.freezeList.contains(id) { $0.freezeList.append(id) } } },
+                    remove: { id in update { $0.freezeList.removeAll { $0 == id } } }
+                )
+            }
+            anchored("freezeAll") {
+                Toggle("Freeze every other app while the lid is closed", isOn: bind(\.freezeAllApps))
+                Text(wouldFreezeText)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            anchored("docker") {
+                Toggle(isOn: bind(\.dockerRule)) {
+                    TitleWithInfo("Pause Docker Desktop when no containers are running", info: "docker")
+                }
+            }
+        } header: {
+            TitleWithInfo("Freeze while the lid is closed", info: "freezeList")
+        }
+        Section("Audio") {
+            anchored("mute") {
+                Toggle("Mute audio on lid close", isOn: bind(\.muteOnLidClose))
+                Text(Self.microphoneNote)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        Section("Power") {
+            anchored("lowPowerOnLidClose") {
+                Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
+                    // A floor input: apply it now if the lid is already closed.
+                    .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
+            }
         }
     }
 
+    @ViewBuilder
     private var agentSection: some View {
         Section {
-            bundleList(
-                title: "Never throttle or freeze",
-                items: manager.config.agentList,
-                newValue: $newAgentBundle,
-                add: { id in update { if !$0.agentList.contains(id) { $0.agentList.append(id) } } },
-                remove: { id in update { $0.agentList.removeAll { $0 == id } } }
-            )
-            Toggle("Turn App Nap off for these apps during a session", isOn: bind(\.disableAppNapForAgents))
-            Text("Writes NSAppSleepDisabled = YES into each listed app's preferences when a session starts and puts the previous value back when it ends.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            anchored("agentList") {
+                appList(
+                    manager.config.agentList,
+                    add: { id in update { if !$0.agentList.contains(id) { $0.agentList.append(id) } } },
+                    remove: { id in update { $0.agentList.removeAll { $0 == id } } }
+                )
+            }
         } header: {
-            Text("Agent apps")
-        } footer: {
-            Text("Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that.")
+            TitleWithInfo("Never throttle or freeze", info: "agentList")
+        }
+        Section {
+            anchored("appNap") {
+                Toggle(isOn: bind(\.disableAppNapForAgents)) {
+                    TitleWithInfo("Turn App Nap off for these apps during a session", info: "appNap")
+                }
+            }
         }
     }
 
     private var wouldFreezeText: String {
-        guard manager.config.freezeAllApps else { return "Would freeze now: the list above only" }
+        guard manager.config.freezeAllApps else { return "Would freeze now: the freeze list only" }
         return wouldFreeze.isEmpty ? "Would freeze now: nothing else" : "Would freeze now: \(wouldFreeze.joined(separator: ", "))"
     }
 
@@ -232,84 +434,279 @@ struct SettingsView: View {
         wouldFreeze = FreezePlanner.automaticCandidates(config: manager.config, apps: Freezer.runningApps(), selfBundleId: selfId).map(\.name)
     }
 
+    @ViewBuilder
     private var powerSection: some View {
-        Section("Battery and thermal") {
-            Stepper(value: lowPowerFloor, in: 0...100, step: Config.floorStep) {
-                LabeledContent("Low Power Mode below", value: "\(manager.config.lowPowerFloor)%")
+        Section {
+            anchored("lowPowerFloor") {
+                LabeledContent("Low Power Mode below") {
+                    NumberBox(value: lowPowerFloor, range: 0...100, unit: "%", label: "Low Power Mode below")
+                }
             }
-            Stepper(value: endFloor, in: 0...Config.maxEndFloor, step: Config.floorStep) {
-                LabeledContent("End session below", value: "\(manager.config.endFloor)%")
+            anchored("endFloor") {
+                LabeledContent("End session below") {
+                    NumberBox(value: endFloor, range: 0...Config.maxEndFloor, unit: "%", label: "End session below")
+                }
             }
-            Text("0 turns the battery end off. The end floor stays below the Low Power Mode floor. Moving one onto the other moves it along.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
+        } header: {
+            TitleWithInfo("Battery", info: "endFloor")
+        } footer: {
+            Text("Set End session below to 0% to turn it off.")
+        }
+        Section("Thermal") {
+            anchored("thermal") {
+                Toggle(isOn: bind(\.thermalRules)) {
+                    Text("Thermal rules")
+                    Text("Low Power Mode when the Mac is hot; the session ends when it is critical.")
+                }
+            }
         }
     }
 
+    private var hotspotStatus: HotspotSetupStatus {
+        .of(
+            ssid: manager.config.hotspotSSID,
+            passwordEntered: hotspot.hasSavedPassword(ssid: manager.config.hotspotSSID),
+            passwordNotice: hotspot.notice,
+            locationAuthorized: locationPermission.isAuthorized
+        )
+    }
+
+    private var hotspotStatusRow: some View {
+        let status = hotspotStatus
+        let (symbol, tint): (String, Color) = switch status.level {
+        case .off: ("circle.dashed", .secondary)
+        case .incomplete: ("exclamationmark.circle.fill", .orange)
+        case .ready: ("checkmark.circle.fill", .green)
+        }
+        return Label {
+            Text(status.text)
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(tint)
+        }
+    }
+
+    @ViewBuilder
     private var networkSection: some View {
         Section {
-            TextField("Hotspot SSID", text: bind(\.hotspotSSID))
+            hotspotStatusRow
+            // A grouped form right-aligns the text of a field that carries
+            // its own label, whatever its alignment says. With the label
+            // in LabeledContent and hidden on the field, the alignment
+            // holds and typed text starts at the left.
+            anchored("hotspot") {
+                LabeledContent("Hotspot name") {
+                    TextField("Hotspot name", text: ssidField, prompt: Text("My iPhone"))
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.leading)
+                        .onSubmit(saveHotspot)
+                }
+                Text("Use the name exactly as it appears in the Wi-Fi menu.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            anchored("hotspotPassword") {
+                LabeledContent("Hotspot password") {
+                    SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }), prompt: Text("Password"))
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.leading)
+                        .onSubmit(saveHotspot)
+                }
+                if let notice = hotspot.notice {
+                    Text(notice).font(.caption).foregroundStyle(.orange)
+                }
+            }
+        } header: {
+            TitleWithInfo("Hotspot failover", info: "hotspotPassword")
+        } footer: {
             HStack {
-                SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }))
-                    .onSubmit(savePassword)
-                Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID), action: savePassword)
-                    .disabled(hotspot.password.isEmpty || hotspot.saving)
+                Spacer()
+                Button(hotspot.saving ? "Saving\u{2026}" : "Save", action: saveHotspot)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!hotspotChanged || hotspot.saving)
             }
-            if let notice = hotspot.notice {
-                Text(notice).font(.caption).foregroundStyle(.orange)
-            }
-            VStack(alignment: .leading, spacing: 2) {
+        }
+        Section {
+            anchored("location") {
+                // macOS has no when-in-use grant for Mac apps: the grant is
+                // recorded as Location Services access for Insomnia, as the
+                // ⓘ text says.
                 HStack {
                     Text("Location: \(locationPermission.statusDescription)")
                         .foregroundStyle(.secondary)
+                    InfoButton(for: "location")
                     Spacer()
                     if locationPermission.isDenied {
                         Button("Open Location Services") {
                             locationPermission.openLocationServicesSettings()
                         }
+                    } else if locationPermission.authorizationStatus == .notDetermined,
+                              !HotspotSSID.normalized(manager.config.hotspotSSID).isEmpty {
+                        Button("Allow Location\u{2026}") { locationPermission.requestWhenInUse() }
                     }
                 }
-                // macOS has no when-in-use grant for Mac apps: the grant is
-                // recorded as Location Services access for Insomnia.
-                Text("macOS records this grant as Location Services access for Insomnia. Insomnia uses it only to read Wi-Fi network names and never requests your location.")
+            }
+        } footer: {
+            Text("Failover needs it to see Wi-Fi network names.")
+        }
+        Section {
+            anchored("nudge") {
+                LabeledContent {
+                    NumberBox(value: nudgeSeconds, range: 10...900, unit: "seconds offline", label: "Seconds offline before the nudge")
+                } label: {
+                    TitleWithInfo("Type \u{201C}continue\u{201D} into tmux after", info: "nudge")
+                }
+                Text("Mark a dedicated pane with this command, not one you type in:")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text(TmuxNudge.markCommand())
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
             }
-            Stepper(value: nudgeSeconds, in: 10...900, step: 10) {
-                LabeledContent("Nudge tmux after", value: "\(Int(manager.config.nudgeThreshold)) s offline")
-            }
-            Text("After that long offline, Insomnia types \"continue\" into each pane listed below. Only a pane you have marked with this tmux command is nudged. Mark a dedicated pane, not one you type in.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(TmuxNudge.markCommand())
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-            Toggle("Press Enter after continue", isOn: bind(\.tmuxNudgePressesEnter))
-            Text("Enter submits whatever is already typed in that pane, including a line that was never finished. When off, \"continue\" is typed and nothing submits it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            ForEach(manager.config.tmuxTargets, id: \.self) { t in
-                HStack {
-                    Text(t).font(.system(.body, design: .monospaced))
-                    Spacer()
-                    removeButton {
-                        update { $0.tmuxTargets.removeAll { $0 == t } }
-                    }
+            anchored("pressEnter") {
+                Toggle(isOn: bind(\.tmuxNudgePressesEnter)) {
+                    Text("Press Enter after continue")
+                    Text("Enter also submits anything already typed in that pane.")
                 }
             }
-            HStack {
-                TextField("tmux target (session:window.pane)", text: $newTmuxTarget)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(addTmuxTarget)
-                Button("Add", action: addTmuxTarget)
-                    .disabled(newTmuxTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+            anchored("tmuxTargets") {
+                EditableList(
+                    manager.config.tmuxTargets,
+                    searchPrompt: "Search tmux targets",
+                    addHelp: "Add a tmux target",
+                    emptyText: "No tmux targets",
+                    fields: { [$0] }
+                ) { t in
+                    HStack {
+                        Text(t).font(.system(.body, design: .monospaced))
+                        Spacer()
+                        removeButton {
+                            update { $0.tmuxTargets.removeAll { $0 == t } }
+                        }
+                    }
+                } adder: { done in
+                    TextEntryAdder(
+                        title: "Add a tmux target",
+                        placeholder: "session:window.pane",
+                        monospaced: true,
+                        note: "Only a pane marked with the command above is nudged.",
+                        canAdd: { !$0.trimmingCharacters(in: .whitespaces).isEmpty },
+                        add: addTmuxTarget,
+                        done: done
+                    )
+                }
             }
         } header: {
-            Text("Network failover")
-        } footer: {
-            Text("The password is kept in the login keychain, readable without a prompt only by the build of Insomnia that saved it; after a reinstall, enter it again. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot.")
+            Text("tmux nudge")
         }
+    }
+
+    /// The name field: the draft while there is one, else the saved name.
+    private var ssidField: Binding<String> {
+        Binding(
+            get: { ssidDraft ?? manager.config.hotspotSSID },
+            set: { ssidDraft = $0 }
+        )
+    }
+
+    /// Whether Save has anything to do: a name typed that differs from
+    /// the saved one, or a password field that differs from what the
+    /// keychain holds for the saved name.
+    private var hotspotChanged: Bool {
+        if let ssidDraft, ssidDraft != manager.config.hotspotSSID { return true }
+        return !hotspot.isSaved(ssid: manager.config.hotspotSSID)
+    }
+
+    /// Saves the section: the name to config.json first, so the keychain
+    /// store files the password under it, then the password, or a clear
+    /// for an empty field, whenever the keychain does not already hold it
+    /// for that name. A new name with the same password moves the
+    /// password to it.
+    private func saveHotspot() {
+        guard let run = Self.runHotspotSave(
+            ssidDraft: ssidDraft,
+            field: (get: { hotspot }, set: { hotspot = $0 }),
+            configuredSSID: { manager.config.hotspotSSID },
+            writeSSID: { name in update { $0.hotspotSSID = name } },
+            requestLocation: { locationPermission.requestWhenInUse() },
+            secrets: secrets,
+            services: manager.services
+        ) else { return }
+        ssidDraft = nil
+        if let passwordSave = run.passwordSave {
+            Task {
+                if let recheck = await passwordSave.value { recheckPassword(recheck) }
+            }
+        }
+    }
+
+    /// A Save press under way: the password save, when it stores one,
+    /// answering with the recheck to run for the hotspot configured then.
+    struct HotspotSaveRun {
+        let passwordSave: Task<HotspotPasswordField.Read?, Never>?
+    }
+
+    /// The whole Save press, which the view runs and tests run the same
+    /// way: the name to config.json (`writeSSID`) first, then the password
+    /// to the keychain under it, or a clear for an empty field. While the
+    /// keychain answers, the field says it is saving ("Saving..." on the
+    /// button; one save at a time). The answer goes to the field and then to
+    /// the failover's report, so a recheck reads the report as the save
+    /// left it. nil when there is nothing to save.
+    static func runHotspotSave(
+        ssidDraft: String?,
+        field: (get: @MainActor () -> HotspotPasswordField, set: @MainActor (HotspotPasswordField) -> Void),
+        configuredSSID: @escaping @MainActor () -> String,
+        writeSSID: (String) -> Void,
+        requestLocation: () -> Void,
+        secrets: any HotspotSecretStore,
+        services: AppServices?
+    ) -> HotspotSaveRun? {
+        guard let save = hotspotSave(ssidDraft: ssidDraft, savedSSID: configuredSSID(), field: field.get()) else { return nil }
+        if let name = save.name { writeSSID(name) }
+        guard save.storesPassword else { return HotspotSaveRun(passwordSave: nil) }
+        var started = field.get()
+        guard started.startSave() else { return HotspotSaveRun(passwordSave: nil) }
+        field.set(started)
+        if !HotspotSSID.normalized(configuredSSID()).isEmpty {
+            requestLocation()
+        }
+        let password = started.password
+        let set = field.set, get = field.get
+        let task = Task { @MainActor in
+            let outcome = await storePassword(password, in: secrets)
+            var answered = get()
+            let recheck = answered.finishSave(outcome, ssid: configuredSSID())
+            set(answered)
+            passwordStored(outcome, configuredSSID: configuredSSID(), services: services)
+            return recheck
+        }
+        return HotspotSaveRun(passwordSave: task)
+    }
+
+    /// What one press of the hotspot section's Save writes.
+    struct HotspotSave: Equatable {
+        /// The name to write to config.json; nil when the field holds the
+        /// saved one.
+        let name: String?
+        /// Whether the password field goes to the keychain (a clear when it
+        /// is empty), filed under the name Save leaves configured.
+        let storesPassword: Bool
+    }
+
+    /// The Save press apart from the view: the name first, so the keychain
+    /// store files the password under it, then the password whenever the
+    /// keychain does not already hold the field's text for that name. A
+    /// new name with the saved password therefore stores it again, which
+    /// moves it to the new name. nil when there is nothing to write, or
+    /// while a save waits on the keychain.
+    static func hotspotSave(ssidDraft: String?, savedSSID: String, field: HotspotPasswordField) -> HotspotSave? {
+        guard !field.saving else { return nil }
+        let name = ssidDraft.flatMap { $0 == savedSSID ? nil : $0 }
+        let storesPassword = !field.isSaved(ssid: name ?? savedSSID)
+        guard name != nil || storesPassword else { return nil }
+        return HotspotSave(name: name, storesPassword: storesPassword)
     }
 
     private var nudgeSeconds: Binding<Int> {
@@ -422,24 +819,6 @@ struct SettingsView: View {
         return await loadedPassword(reread).notice
     }
 
-    /// Saves, or clears for an empty field. The button shows "Saving..."
-    /// until the keychain answers; one save at a time.
-    private func savePassword() {
-        guard hotspot.startSave() else { return }
-        if !HotspotSSID.normalized(manager.config.hotspotSSID).isEmpty {
-            locationPermission.requestWhenInUse()
-        }
-        let password = hotspot.password
-        Task {
-            let outcome = await Self.storePassword(password, in: secrets)
-            let recheck = hotspot.finishSave(outcome, ssid: manager.config.hotspotSSID)
-            // The failover's report first, so the recheck reads it as the
-            // save left it.
-            Self.passwordStored(outcome, configuredSSID: manager.config.hotspotSSID, services: manager.services)
-            if let recheck { recheckPassword(recheck) }
-        }
-    }
-
     /// A save or clear answered. The failover's report goes, and the next
     /// outage notifies afresh, unless the report is about the hotspot
     /// configured now and the save neither stored for it nor removed its
@@ -468,29 +847,11 @@ struct SettingsView: View {
         }
     }
 
-    private func addTmuxTarget() {
-        let t = newTmuxTarget.trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty else { return }
+    private func addTmuxTarget(_ text: String) -> String? {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return "Type a target such as main:0.1." }
         update { if !$0.tmuxTargets.contains(t) { $0.tmuxTargets.append(t) } }
-        newTmuxTarget = ""
-    }
-
-    private var appSection: some View {
-        Section("App") {
-            Toggle("Launch at login", isOn: launchAtLogin)
-            loginItemNote
-            LabeledContent("Config") {
-                Text(manager.paths.configFile.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            if LidSimulationBuild.isCompiledIn {
-                Text(LidSimulationBuild.marker)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-        }
+        return nil
     }
 
     /// The switch shows what macOS has on file (`LoginItem.isRegistered`:
@@ -530,54 +891,29 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: Bundle id lists
+    // MARK: App lists
 
-    private func bundleList(
-        title: String,
-        items: [String],
-        newValue: Binding<String>,
+    /// A list of bundle ids, each shown with its app's icon and name. The
+    /// list's title is its section's header.
+    private func appList(
+        _ items: [String],
         add: @escaping (String) -> Void,
         remove: @escaping (String) -> Void
     ) -> some View {
-        Group {
-            Text(title).font(.headline)
-            ForEach(items, id: \.self) { id in
-                HStack {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(RunningApps.displayName(for: id))
-                        Text(id).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    removeButton { remove(id) }
-                }
-            }
+        EditableList(
+            items,
+            searchPrompt: "Search apps",
+            addHelp: "Add an app",
+            emptyText: "No apps",
+            fields: { [InstalledApps.displayName(for: $0), $0] }
+        ) { id in
             HStack {
-                TextField("Bundle identifier", text: newValue)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit {
-                        let v = newValue.wrappedValue.trimmingCharacters(in: .whitespaces)
-                        guard !v.isEmpty else { return }
-                        add(v)
-                        newValue.wrappedValue = ""
-                    }
-                Button("Add") {
-                    let v = newValue.wrappedValue.trimmingCharacters(in: .whitespaces)
-                    guard !v.isEmpty else { return }
-                    add(v)
-                    newValue.wrappedValue = ""
-                }
-                .disabled(newValue.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty)
-                Menu("Add running app…") {
-                    let apps = RunningApps.candidates(excluding: items)
-                    if apps.isEmpty {
-                        Text("No other apps running")
-                    }
-                    ForEach(apps, id: \.bundleID) { app in
-                        Button(app.name) { add(app.bundleID) }
-                    }
-                }
-                .fixedSize()
+                AppLabel(bundleID: id)
+                Spacer()
+                removeButton { remove(id) }
             }
+        } adder: { done in
+            AppPicker(added: items, add: add, done: done)
         }
     }
 
@@ -588,41 +924,5 @@ struct SettingsView: View {
         }
         .buttonStyle(.plain)
         .help("Remove")
-    }
-}
-
-/// Running apps offered by "Add running app…": everything with a bundle id
-/// that is not Apple's own.
-@MainActor
-enum RunningApps {
-    struct Entry: Hashable {
-        let bundleID: String
-        let name: String
-    }
-
-    static func candidates(excluding: [String]) -> [Entry] {
-        let me = Bundle.main.bundleIdentifier
-        var seen = Set<String>()
-        var out: [Entry] = []
-        for app in NSWorkspace.shared.runningApplications {
-            guard let id = app.bundleIdentifier, !id.hasPrefix("com.apple."), id != me,
-                  app.activationPolicy != .prohibited,
-                  !excluding.contains(id), !seen.contains(id) else { continue }
-            seen.insert(id)
-            out.append(Entry(bundleID: id, name: app.localizedName ?? id))
-        }
-        return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-    }
-
-    /// Name of a running app for a bundle id, or the last path component.
-    static func displayName(for bundleID: String) -> String {
-        if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }),
-           let name = app.localizedName {
-            return name
-        }
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return url.deletingPathExtension().lastPathComponent
-        }
-        return bundleID.split(separator: ".").last.map(String.init) ?? bundleID
     }
 }

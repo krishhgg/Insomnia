@@ -30,15 +30,25 @@ final class SettingsWindow {
         window.makeKeyAndOrderFront(nil)
     }
 
+    /// A sidebar window as System Settings draws it: the sidebar runs up
+    /// under the title bar, the toolbar holds the pane's title (SwiftUI
+    /// bridges `navigationTitle` into the window), and there is no
+    /// minimize or zoom button, as the HIG asks of a settings window.
     private func make() -> NSWindow {
         let host = NSHostingController(rootView: content())
+        host.sceneBridgingOptions = [.title, .toolbars]
         let window = NSWindow(contentViewController: host)
-        window.title = "Insomnia Settings"
-        window.styleMask = [.titled, .closable, .miniaturizable]
+        // The bridged `navigationTitle` names the pane from the first
+        // switch on; the pane the window opens on is named here.
+        window.title = SettingsPane.stored.title
+        window.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
+        window.toolbarStyle = .unified
+        window.standardWindowButton(.zoomButton)?.isEnabled = false
         // Closing settings must not deallocate the window: the status item
         // keeps a reference and reopens the same one.
         window.isReleasedWhenClosed = false
-        window.setContentSize(host.view.fittingSize)
+        window.setContentSize(NSSize(width: 740, height: 580))
+        window.contentMinSize = NSSize(width: 680, height: 460)
         window.isRestorable = false
         return window
     }

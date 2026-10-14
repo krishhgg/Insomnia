@@ -150,10 +150,10 @@ final class IntegrationWiringTests: XCTestCase {
 
         let reason = "Chrome quit but could not be relaunched: LSOpenURLsWithRole() failed with error -10810. Open it yourself."
         XCTAssertEqual(source.relaunchProblems, [reason])
-        let items = StatusItemController.menuItems(manager: h.makeManager(), status: source)
+        let items = StatusItemController.statusItems(manager: h.makeManager(), status: source)
         // The scan after the relaunch lists whatever browsers this Mac is
         // running, so only the line itself is checked.
-        XCTAssertTrue(items.contains(StatusMenu.Item(title: "\u{26A0} \(reason)", kind: .warning)), "\(items.map(\.title))")
+        XCTAssertTrue(items.contains(StatusMenu.Item(title: reason, kind: .warning)), "\(items.map(\.title))")
     }
 
     /// The failover's report about the hotspot password is a menu line
@@ -177,7 +177,7 @@ final class IntegrationWiringTests: XCTestCase {
         services.status.hotspotPasswordReport = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
         // A debug build also has the lid simulation line.
         func warnings() -> [String] {
-            StatusItemController.menuItems(manager: manager, status: source).map(\.title).filter { $0.contains("Hotspot") }
+            StatusItemController.statusItems(manager: manager, status: source).map(\.title).filter { $0.contains("Hotspot") }
         }
 
         XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
@@ -479,12 +479,14 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(try keychain.get(service: KeychainStore.service, account: "New Phone"), "replacement")
     }
 
+    /// With the name hidden the row just says the Wi-Fi is on, and the
+    /// reason is its tooltip, so the popover row stays short.
     func testWiFiStatusNameExplainsLocationRedaction() {
-        XCTAssertEqual(
-            WiFiStatusName.display(ssid: nil, locationAuthorized: false),
-            "on (name hidden until Location is allowed)"
-        )
-        XCTAssertEqual(WiFiStatusName.display(ssid: "Office", locationAuthorized: false), "Office")
+        let hidden = WiFiStatusName.display(ssid: nil, locationAuthorized: false)
+        XCTAssertEqual(hidden?.text, "On")
+        XCTAssertEqual(hidden?.help, WiFiStatusName.hiddenHelp)
+        XCTAssertTrue(WiFiStatusName.hiddenHelp.contains("Location"))
+        XCTAssertEqual(WiFiStatusName.display(ssid: "Office", locationAuthorized: false), WiFiStatusName.Display(text: "Office", help: nil))
         XCTAssertNil(WiFiStatusName.display(ssid: nil, locationAuthorized: true))
     }
 

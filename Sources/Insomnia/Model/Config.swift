@@ -210,7 +210,7 @@ struct LidCloseDefaultsChange: Codable, Equatable, Sendable {
 
     var notificationBody: String {
         "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
-            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions."
+            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon and open the Lid close pane."
     }
 
     var settingsLine: String {

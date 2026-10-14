@@ -1,30 +1,27 @@
 import Foundation
 import Observation
 
-/// UI state for the status item. The controller mutates it; the views only
-/// read it. Content state (`visiblePills`, `focusVisible`, `focused`,
-/// `input`) is set inside `withAnimation` blocks; layout state (`phase`,
-/// `slotsPresent`, `startError`) outside any animation, so the status item
-/// changes width once per open and once per close instead of on every frame.
+/// UI state for the status item and its popover. The controller mutates it;
+/// the views only read it, apart from the duration fields, which the
+/// popover's text fields write through `texts`.
 @MainActor
 @Observable
 final class MenuBarModel {
     enum Mode: Equatable, Sendable {
         /// Enter starts a new session.
         case start
-        /// Enter extends the running session (reached by clicking the mark or
-        /// the countdown while a session is running).
+        /// Enter extends the running session.
         case extend
     }
 
-    /// What Enter does with the pills as they stand.
+    /// What Enter does with the fields as they stand.
     enum CommitAction: Equatable {
         case run(TimeInterval)
-        /// Nothing to act on: shake the focused pill.
+        /// Nothing to act on: shake the fields.
         case reject
     }
 
-    /// Bare Enter with every pill empty starts the default preset, so the
+    /// Bare Enter with every field empty starts the default preset, so the
     /// common case is one keystroke. While extending there is no sensible
     /// default duration, so it shakes instead.
     static func commitAction(mode: Mode, typed: TimeInterval?, defaultPreset: TimeInterval) -> CommitAction {
@@ -35,69 +32,58 @@ final class MenuBarModel {
 
     enum Phase: Equatable, Sendable {
         case idle
-        case entering(Mode)
-        /// Enter was pressed on the start pills and the manager has not yet
-        /// confirmed a session (the recovery agent can take seconds to
-        /// answer, or refuse). Shows the projected countdown
-        /// (`pendingCountdown`) and nothing that acts on a session.
+        /// A start was asked for and the manager has not yet confirmed a
+        /// session (the recovery agent can take seconds to answer, or
+        /// refuse). The bar shows the projected countdown
+        /// (`pendingCountdown`); nothing that acts on a session is offered.
         case starting
         case running
 
-        var isEntering: Bool {
-            if case .entering = self { return true }
-            return false
-        }
-
-        /// The countdown and the hold-to-end ring belong to a confirmed
+        /// The countdown and the hold-to-end control belong to a confirmed
         /// session only; a pending start must not draw them.
         var showsRunningControls: Bool { self == .running }
     }
 
-    /// What the item reads while a start is pending and there is no
-    /// projected countdown to show.
+    /// What the bar and the popover header read while a start is pending
+    /// and there is no projected countdown to show.
     static let startingText = "Starting\u{2026}"
-    /// What the item reads next to the pills after the manager refused a
-    /// start. Short on purpose: the full reason is in the right-click menu.
+    /// What the popover says when the manager refused a start and left no
+    /// reason of its own.
     static let startFailedText = "Couldn\u{2019}t start"
 
     var phase: Phase = .idle
-    /// Concise start failure shown beside the pills; cleared on the next
-    /// commit, open or collapse.
+    /// Why the last start was refused, shown in the popover in
+    /// `DesignTokens.Status.warning`. Cleared by the next start or extend,
+    /// and when a session comes up.
     var startError: String?
-    /// The label is drawn only while the pills are up: a retry (Enter)
-    /// hides it at once but keeps its text, and so its room in the layout,
-    /// until the slots leave, so the bar is written once, then.
-    var startErrorShown: Bool { startError != nil && phase.isEntering }
-    var input = DurationInput()
-    var focused: DurationInput.Field = .hours
-    /// The three pill slots are in the layout. Set outside any animation, so
-    /// the status item widens once when they arrive and narrows once when the
-    /// last one has retracted; `visiblePills` animates the content inside them.
-    var slotsPresent: Bool = false
-    /// How many pill slots show their content right now (0...3); stepped for
-    /// the stagger. Scale and opacity only: the slots themselves stay put.
-    var visiblePills: Int = 0
-    /// A close is folding the pills shut: a hidden pill travels
-    /// towards the eye, shrinks and fades instead of retracting in place.
-    /// Set when the retract begins; cleared when the slots leave, and by a
-    /// reopen or a refused start, which bring the pills back.
-    var pillsCollapsing: Bool = false
-    /// Focus glow fades in once the pills have landed.
-    var focusVisible: Bool = false
-    /// Countdown text shown while the manager is still starting the session.
+    /// What is typed into the Days, Hours and Minutes fields, as typed.
+    var texts: [DurationInput.Field: String] = [:]
+    /// The popover is on screen.
+    var popoverShown = false
+    /// The Days, Hours and Minutes fields are out (the Custom button). The
+    /// popover opens on the time buttons alone, so this is closed on every
+    /// open unless a refused start left its value in the fields.
+    var customShown = false
+    /// Short countdown the bar shows while the manager is still starting
+    /// (or extending) the session, at minute resolution like the live one.
     var pendingCountdown: String?
     /// The session a pending start will become; the controller ticks
-    /// `pendingCountdown` off it at 1 Hz while the phase is `.starting`.
+    /// `pendingCountdown` off it while the phase is `.starting`.
     var pendingProjection: StartProjection?
 
-    // Animation triggers. Views run a bounce whenever one of these changes.
-    var iconBounce: Int = 0
-    var focusBounce: Int = 0
+    /// Animation trigger: the fields shake whenever this changes.
     var rejectBounce: Int = 0
+    /// Bumped each time the popover opens, so the view can put the cursor
+    /// in the Hours field when the fields are out.
+    var focusRequest: Int = 0
 
-    var mode: Mode? {
-        if case let .entering(m) = phase { return m }
-        return nil
+    /// The typed fields read through `DurationInput`, which owns the
+    /// validation: a field over its ceiling or not a number is invalid,
+    /// and `total` is nil until something non-zero and valid is typed.
+    var input: DurationInput { DurationInput(texts: texts) }
+
+    func clearFields() {
+        texts = [:]
     }
 
     /// The session a start pressed at some moment will become, reduced to
@@ -108,9 +94,15 @@ final class MenuBarModel {
         let endsAt: Date
         let shape: CountdownShape
 
-        /// What the countdown reads at `now`.
+        /// The full countdown (seconds included) at `now`.
         func countdown(at now: Date) -> String {
             SessionMath.formatCountdown(remaining: SessionMath.remaining(until: endsAt, at: now), shape: shape)
+        }
+
+        /// The bar's countdown at `now`, at minute resolution like
+        /// `SessionManager.remainingText`.
+        func shortCountdown(at now: Date) -> String {
+            SessionMath.formatRemaining(SessionMath.remaining(until: endsAt, at: now))
         }
     }
 
@@ -121,7 +113,7 @@ final class MenuBarModel {
         return StartProjection(endsAt: session.endsAt, shape: session.countdownShape)
     }
 
-    /// The countdown a start pressed at `now` reads at that moment.
+    /// The full countdown a start pressed at `now` reads at that moment.
     static func projectedStartCountdown(now: Date, duration: TimeInterval, maxDuration: TimeInterval) -> String {
         projectedStart(now: now, duration: duration, maxDuration: maxDuration).countdown(at: now)
     }

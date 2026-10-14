@@ -188,15 +188,15 @@ enum HotspotPasswordProblem: Equatable, Sendable {
         }
     }
 
-    /// The right-click menu's warning line.
+    /// The popover's warning line. No warning sign: the row draws one.
     var menuLine: String {
         switch self {
         case .missing:
-            "\u{26A0} Hotspot password not saved: enter it in Settings"
+            "Hotspot password not saved: enter it in Settings"
         case .unreadable:
-            "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings"
+            "Hotspot password unreadable by this build: enter it again in Settings"
         case let .error(message):
-            "\u{26A0} Hotspot password unreadable: \(message)"
+            "Hotspot password unreadable: \(message)"
         }
     }
 

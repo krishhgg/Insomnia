@@ -100,12 +100,12 @@ enum AppIconArtwork {
     static func draw(in ctx: CGContext, scale: CGFloat, lashes: Bool) {
         let corner = tile.width * cornerShare
         ctx.addPath(CGPath(roundedRect: tile, cornerWidth: corner, cornerHeight: corner, transform: nil))
-        ctx.setFillColor(BrandPalette.midnight.cgColor)
+        ctx.setFillColor(BrandPalette.surfaceTile.cgColor)
         ctx.fillPath()
 
         let square = lashes ? mark : markWithoutLashes
         let stroke = max(EyeLensGeometry.lineWidth(for: square.width), minimumStrokePixels / scale)
-        ctx.setStrokeColor(BrandPalette.moonWhite.cgColor)
+        ctx.setStrokeColor(BrandPalette.inkMark.cgColor)
         ctx.setLineWidth(stroke)
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
@@ -115,7 +115,7 @@ enum AppIconArtwork {
             ctx.addPath(EyeMarkGeometry.lashes(in: square, side: .above))
             ctx.strokePath()
         }
-        ctx.setFillColor(BrandPalette.moonWhite.cgColor)
+        ctx.setFillColor(BrandPalette.inkMark.cgColor)
         ctx.addPath(EyeMarkGeometry.pupil(in: square))
         ctx.fillPath()
     }
@@ -129,14 +129,14 @@ enum AppIconArtwork {
     static func svg() -> String {
         let grid = CGRect(x: 0, y: 0, width: EyeLensGeometry.designSize, height: EyeLensGeometry.designSize)
         let scale = mark.width / EyeLensGeometry.designSize
-        let ink = hex(BrandPalette.moonWhite)
+        let ink = hex(BrandPalette.inkMark)
         let strokeAttributes = "fill=\"none\" stroke=\"\(ink)\" stroke-width=\"\(number(EyeLensGeometry.strokeUnits))\" stroke-linecap=\"round\" stroke-linejoin=\"round\""
         return """
         <svg xmlns="http://www.w3.org/2000/svg" width="112" height="112" viewBox="\(number(tile.minX)) \(number(tile.minY)) \(number(tile.width)) \(number(tile.height))" role="img" aria-labelledby="eo-title eo-desc">
           <title id="eo-title">Insomnia</title>
           <desc id="eo-desc">The Insomnia mark: an open almond-shaped eye with a round pupil and five lashes above the upper lid, drawn in moon-white on a charcoal rounded tile.</desc>
           <!-- scripts/generate-app-icon.sh writes this file from AppIconArtwork, and PackagingTests fails if the two differ, so edit the Swift drawing and rerun the script. The layout matches the app icon: an \(number(tile.width))-unit tile inset \(number(tileInset)) units in a \(number(canvas)) canvas, corners at \(number(cornerShare * 100))% of the tile, the 24-unit mark grid at \(number(markShare * 100))% of the tile side. -->
-          <rect x="\(number(tile.minX))" y="\(number(tile.minY))" width="\(number(tile.width))" height="\(number(tile.height))" rx="\(number(tile.width * cornerShare))" fill="\(hex(BrandPalette.midnight))"/>
+          <rect x="\(number(tile.minX))" y="\(number(tile.minY))" width="\(number(tile.width))" height="\(number(tile.height))" rx="\(number(tile.width * cornerShare))" fill="\(hex(BrandPalette.surfaceTile))"/>
           <!-- EyeMarkGeometry at progress 1 on its 24-unit grid. The paths are the lens, closed by two cubic lids, then the pupil with the highlight cut as a notch from its upper right edge, then the five lashes above the upper lid. -->
           <g transform="translate(\(number(mark.minX)) \(number(mark.minY))) scale(\(number(scale)))">
             <path d="\(pathData(EyeMarkGeometry.lens(in: grid)))" \(strokeAttributes)/>

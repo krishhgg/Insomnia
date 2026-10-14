@@ -112,7 +112,7 @@ Upgrading from an earlier build changes two of these once. On the first
 launch of this version, a config.json saved by an earlier build gets "Freeze
 every other app" turned off and "Mute audio on lid close" turned on, and
 Insomnia posts a notification naming what changed. Settings shows the same
-line at the top of Lid-close actions until you dismiss it, for anyone with
+line at the top of the Lid close pane until you dismiss it, for anyone with
 notifications off. The toggles are right below it. config.json records that
 the update ran (`lidCloseDefaultsApplied`), so a setting you turn back stays
 the way you set it. A fresh install starts with the new defaults and no
