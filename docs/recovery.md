@@ -5,8 +5,17 @@ has every case.
 
 Insomnia records pending changes in a recovery journal. On session end, the app
 attempts to undo them. An independent `launchd` agent checks every minute and
-can attempt recovery after the app exits unexpectedly, once the saved deadline
-has passed. It leaves a valid, unexpired session alone.
+can attempt recovery after the app exits unexpectedly. For timed sessions,
+it waits until the saved deadline has passed. For unlimited sessions, it
+attempts recovery once it detects that the recorded owning app process is
+gone; it leaves an unlimited session alone only while its owner identity
+still matches. These checks are periodic, not an instantaneous crash response.
+Relaunching the app cleans up an interrupted unlimited session rather than
+resuming it. Normal Quit ends both timed and unlimited sessions. Unlimited
+owner checks compare the recorded executable path, user, running state, and
+boot/start identity. The shell's process start-time comparison has one-second
+resolution, so it cannot rule out same-second PID reuse by the same executable;
+this is not an unconditional ownership guarantee.
 
 The app and backstop use the same lock so they do not restore and rewrite the
 journal over one another. Failed restoration keeps the relevant entries;
@@ -82,8 +91,9 @@ reboot and installation checks are in [release validation](release-validation.md
   only while that pid still has the recorded start time and boot session;
   otherwise it says the command has exited, since the pid may now belong
   to another process. The relaunch tries again 30 s after each refusal.
-  Once the command has exited, it resumes a session that has not expired,
-  with its battery floors, and checks Low Power Mode the way it does after
+  Once the command has exited, it resumes a timed session that has not expired,
+  with its battery floors; an interrupted unlimited session is cleaned up,
+  not resumed. It checks Low Power Mode the way it does after
   its own command exits, described below. A session the user starts
   before that next try gets the same check. Until the command exits,
   Insomnia refuses to quit or start a session, and records any end or lid

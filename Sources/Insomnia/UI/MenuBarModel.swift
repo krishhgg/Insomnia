@@ -105,12 +105,13 @@ final class MenuBarModel {
     /// manager will use, so the live text replaces the projection without a
     /// jump.
     struct StartProjection: Equatable, Sendable {
-        let endsAt: Date
+        let endsAt: Date?
         let shape: CountdownShape
 
         /// What the countdown reads at `now`.
         func countdown(at now: Date) -> String {
-            SessionMath.formatCountdown(remaining: SessionMath.remaining(until: endsAt, at: now), shape: shape)
+            guard let endsAt else { return "∞" }
+            return SessionMath.formatCountdown(remaining: SessionMath.remaining(until: endsAt, at: now), shape: shape)
         }
     }
 

@@ -786,6 +786,41 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(controller.model.pillsCollapsing)
     }
 
+    @MainActor
+    func testUnlimitedActionFoldsAtAFixedWidthThenShowsInfinityWithoutAnEndRingUntilConfirmed() async {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        let gate = AsyncGate()
+        lab.h.backstop.armGate = gate
+        lab.controller.expand(mode: .start)
+        await lab.settleOpen()
+        let entryWidth = lab.controller.widthTarget
+        let written = lab.probe.applied.count
+
+        lab.controller.unlimitedTapped()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(lab.controller.widthTarget, entryWidth)
+        XCTAssertEqual(lab.model.pendingCountdown, "∞")
+        XCTAssertFalse(lab.model.phase.showsRunningControls)
+        await lab.settleClose()
+        XCTAssertFalse(lab.model.slotsPresent)
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertEqual(lab.controller.widthTarget, lab.widthWithoutSlots(phase: .starting))
+        XCTAssertEqual(lab.probe.applied.count, written + 1)
+        XCTAssertEqual(lab.probe.writesWhileFolding, 0)
+        let pendingWidth = lab.controller.widthTarget
+
+        await gate.open()
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase != .running, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(lab.model.phase, .running)
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertGreaterThan(lab.controller.widthTarget, pendingWidth, "confirmation adds the existing hold-to-end ring")
+        XCTAssertEqual(lab.probe.writesWhileFolding, 0)
+    }
+
     /// Reopened while the pills are still folding: the fold is
     /// dropped, the slots never left, the pills stagger back in, and the
     /// dropped collapse's completion never takes the slots out.

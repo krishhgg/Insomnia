@@ -110,7 +110,8 @@ final class StatusItemController: NSObject {
             onTapPill: { [weak self] field in self?.focus(field) },
             onTapCountdown: { [weak self] in self?.customExtend() },
             onHoldEnd: { [weak self] in self?.holdToEnd() },
-            onWidthChange: { [weak self] w in self?.widthChanged(w) }
+            onWidthChange: { [weak self] w in self?.widthChanged(w) },
+            onTapUnlimited: { [weak self] in self?.unlimitedTapped() }
         )
         let host = Self.makeHostingView(root)
         host.onRightMouseDown = { [weak self] in self?.showMenu() }
@@ -488,7 +489,14 @@ final class StatusItemController: NSObject {
         }
     }
 
-    private func run(mode: MenuBarModel.Mode, duration: TimeInterval) {
+    /// The infinity action ignores numeric input and commits immediately.
+    func unlimitedTapped() {
+        guard let mode = model.mode, keyCatcher != nil else { return }
+        guard manager.session?.isUnlimited != true else { return }
+        run(mode: mode, duration: nil)
+    }
+
+    private func run(mode: MenuBarModel.Mode, duration: TimeInterval?) {
         removeMonitors()
         startGeneration += 1
         let generation = startGeneration
@@ -498,14 +506,17 @@ final class StatusItemController: NSObject {
         // in the layout until the slots leave, so the bar is written once,
         // then, and never under the folding pills.
         let now = clock()
-        if mode == .extend, let s = manager.session {
+        if duration == nil {
+            model.pendingProjection = nil
+            model.pendingCountdown = "∞"
+        } else if let duration, mode == .extend, let s = manager.session {
             // The session is live, so the countdown stays up. Project the
             // session so the countdown already has the final shape while the
             // manager catches up (pmset takes a moment).
             let projected = SessionMath.extended(s, by: duration, now: now, maxDuration: manager.config.maxDuration)
             model.pendingProjection = nil
             model.pendingCountdown = SessionMath.formatCountdown(remaining: projected.remaining(at: now), shape: projected.countdownShape)
-        } else {
+        } else if let duration {
             // No session yet: the manager has to arm the recovery agent and
             // disable sleep first, and either can take seconds or refuse. Show
             // the countdown the session will read the moment it is confirmed,
@@ -521,16 +532,18 @@ final class StatusItemController: NSObject {
         // leave in one relayout and the countdown scales in. Enter during
         // the open stagger folds whatever is up.
         model.phase = mode == .extend && manager.isActive ? .running : .starting
-        if model.phase == .starting { armPendingTick() } else { stopPendingTick() }
+        if model.phase == .starting, model.pendingProjection != nil { armPendingTick() } else { stopPendingTick() }
         withAnimation(Motion.base(reduceMotion: reduceMotion)) {
             model.focusVisible = false
         }
         retract { [model] in model.phase }
 
         Task { @MainActor in
-            switch mode {
-            case .start: await manager.start(duration: duration)
-            case .extend: await manager.extend(by: duration)
+            switch (mode, duration) {
+            case let (.start, .some(duration)): await manager.start(duration: duration)
+            case let (.extend, .some(duration)): await manager.extend(by: duration)
+            case (.start, .none): await manager.startUnlimited()
+            case (.extend, .none): await manager.makeUnlimited()
             }
             guard generation == startGeneration else { return }
             stopPendingTick()
@@ -627,7 +640,7 @@ final class StatusItemController: NSObject {
     /// Clicking the mark or the countdown while a session runs: reopen the
     /// pills, this time to extend. Ignored while a start is still in flight.
     func customExtend() {
-        guard manager.isActive else { return }
+        guard manager.isActive, manager.session?.isUnlimited != true, model.pendingCountdown != "∞" else { return }
         expand(mode: .extend)
     }
 
@@ -837,6 +850,7 @@ final class StatusItemController: NSObject {
         case "d": focus(.days); return true
         case "h": focus(.hours); return true
         case "m": focus(.minutes); return true
+        case "u", "∞": unlimitedTapped(); return true
         default:
             // Swallow stray printable keys so nothing beeps while typing a time.
             return ch.isLetter || ch.isPunctuation || ch == " "
