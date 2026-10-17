@@ -766,7 +766,10 @@ provided by the standalone backstop. Performance effects depend on workload.
     the user (`tmux set-option -p -t <target> @insomnia-nudge on`) gets
     `tmux send-keys -t %N continue`, followed by `Enter` only when
     `tmuxNudgePressesEnter` is on (default off). An unmarked pane is
-    skipped and logged.
+    skipped and logged. So is a pane whose foreground program
+    (`pane_current_command`) is a shell, named in /etc/shells or a common
+    one: the mark outlives the program it was set for, and at the prompt
+    the keys would go to the shell.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
 - Recommended one-time setting, documented in docs/extras.md: System Settings >
