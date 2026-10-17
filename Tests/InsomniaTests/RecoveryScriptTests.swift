@@ -67,6 +67,60 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(fx.exists(fx.logFile), "an idle minute must not spam the log")
     }
 
+    private static let compactCleanJournal = #"{"appNapOverrides":[],"dockerFrozen":false,"frozenProcesses":[],"lowPowerSetByUs":false,"savedAudioOutputs":[],"sleepDisabledByUs":false}"#
+
+    /// The run launchd makes every minute between sessions ends before the
+    /// lock: it returns 0 while another process holds it. A full run would
+    /// wait for the lock and exit 75.
+    func testIdleRunDoesNotWaitForTheLock() throws {
+        let clean = try Store.makeEncoder().encode(RuntimeState.clean)
+        try clean.write(to: fx.state)
+        let holder = try fx.holdLock()
+        defer { holder.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.state), clean, "journal must not be rewritten")
+        XCTAssertFalse(fx.exists(fx.logFile), "an idle minute must not spam the log")
+    }
+
+    /// Whitespace between tokens does not matter, so a Foundation that lays
+    /// the JSON out differently keeps the early exit.
+    func testIdleRunAcceptsTheCleanJournalInAnyLayout() throws {
+        try fx.writeState(Self.compactCleanJournal + "\n")
+        let holder = try fx.holdLock()
+        defer { holder.stop() }
+
+        XCTAssertEqual(try fx.run(fx.backstop).status, 0)
+    }
+
+    /// Everything else takes the full run, seen here as exit 75 under a held lock.
+    func testOnlyTheCleanJournalWithNoSessionSkipsTheLock() throws {
+        let clean = Self.compactCleanJournal
+        let holder = try fx.holdLock()
+        defer { holder.stop() }
+
+        let others = [
+            "one more key": String(clean.dropLast()) + #","someFutureKey":1}"#,
+            "keys in another order": #"{"sleepDisabledByUs":false,"appNapOverrides":[],"dockerFrozen":false,"frozenProcesses":[],"lowPowerSetByUs":false,"savedAudioOutputs":[]}"#,
+            "a flag set": clean.replacingOccurrences(of: #""sleepDisabledByUs":false"#, with: #""sleepDisabledByUs":true"#),
+            "an entry": clean.replacingOccurrences(of: #""frozenProcesses":[]"#, with: #""frozenProcesses":[{"pid":1}]"#),
+            "a NUL byte at the end": clean + "\u{0}",
+        ]
+        for (what, journal) in others {
+            try fx.writeState(journal)
+            XCTAssertEqual(try fx.run(fx.backstop).status, 75, what)
+        }
+
+        try fx.writeState(clean)
+        XCTAssertEqual(try fx.run(fx.backstop, ["--force"]).status, 75, "--force")
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        XCTAssertEqual(try fx.run(fx.backstop).status, 75, "a session.json")
+        XCTAssertEqual(fx.calls(), [])
+    }
+
     func testMissingJournalAndNoSessionDoesNothing() throws {
         let r = try fx.run(fx.backstop)
         XCTAssertEqual(r.status, 0, r.stderr)

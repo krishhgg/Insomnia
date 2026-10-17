@@ -225,6 +225,7 @@ below cover what only a real Mac shows.
 - Normal end, deadline expiry, and repeated Quit restore live power state
 - Sleep guard read back: on macOS 26.6.2 (25G83), where `pmset -g` reads SleepDisabled 0 again about 2 s after `pmset -a disablesleep 1`, Start fails after about 5 s with "macOS set SleepDisabled back to 0" and no session runs; on a macOS where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
 - Force-quit followed by launchd deadline recovery and retry after failure
+- The recovery agent between sessions (no session.json, the clean journal a finished session leaves): `launchctl print gui/$(id -u)/com.insomnia.backstop` counts a run each minute with last exit code 0, the backstop writes nothing to insomnia.log and state.json is unchanged; a force-quit in the next session is still recovered at the deadline
 - Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge
 - session.json without read permission during a session: the agent restores sleep within a minute and renames the file to `session.json.unreadable-<time>`, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session
 - Reboot/login with active or dirty journals

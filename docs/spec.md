@@ -845,6 +845,10 @@ Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- Between sessions the agent's run ends early. With no `session.json` and a
+  `state.json` that is exactly the clean journal the app writes,
+  `backstop.sh` exits 0 before the lock and without `plutil`. Any other
+  journal, any `session.json` and `--force` take the full run.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
   plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that

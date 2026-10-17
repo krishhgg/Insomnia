@@ -18,7 +18,8 @@
 # state.json, decide, undo, publish the new journal atomically, release. If
 # the lock is not free within LOCK_TIMEOUT_SECONDS the run does nothing and
 # exits 75; launchd retries a minute later. The lock file is never unlinked
-# or replaced here, so every party locks the same inode.
+# or replaced here, so every party locks the same inode. The one run that
+# skips the lock is the idle one (see Idle below).
 #
 # Locking detail: the script opens the lock file on fd 9 and locks that fd
 # with `lockf <fd>`. If a caller (uninstall.sh) already holds the lock and
@@ -220,6 +221,36 @@ log() { # level message
   "$MKDIR" -p "$LOG_DIR"
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
+
+# --- Idle ---------------------------------------------------------------------
+# launchd runs this every 60 s, and between sessions there is nothing to do:
+# no session.json, and the clean journal the app leaves behind. That run ends
+# here, before the lock and without starting a process. The journal must match
+# token for token; anything else, and every --force run, goes the full way.
+#
+# No lock is needed: the app publishes each file with one rename, and this
+# pair means nothing to undo on either side of a transaction. tighten is
+# skipped too; install.sh's --force run and every non-idle run still do it.
+if (( force == 0 )) && [[ ! -e "$SESSION" && ! -L "$SESSION" && -f "$STATE" ]]; then
+  idle_ws=$'[ \t\r\n]*'
+  idle_clean="^$idle_ws"
+  for idle_token in '\{' \
+      '"appNapOverrides"' : '\[' '\]' ',' \
+      '"dockerFrozen"' : false ',' \
+      '"frozenProcesses"' : '\[' '\]' ',' \
+      '"lowPowerSetByUs"' : false ',' \
+      '"savedAudioOutputs"' : '\[' '\]' ',' \
+      '"sleepDisabledByUs"' : false \
+      '\}'; do
+    idle_clean+="$idle_token$idle_ws"
+  done
+  idle_clean+='$'
+  idle_journal=""
+  # read returns non-zero at end of file; zero means it stopped at a NUL byte.
+  if ! { IFS= read -r -d '' idle_journal < "$STATE"; } 2>/dev/null && [[ "$idle_journal" =~ $idle_clean ]]; then
+    exit 0
+  fi
+fi
 
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
