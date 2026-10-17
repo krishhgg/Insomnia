@@ -250,11 +250,11 @@ final class PackagingTests: XCTestCase {
         try (String(contentsOf: script, encoding: .utf8) + "echo tampered\n").write(to: script, atomically: true, encoding: .utf8)
         XCTAssertEqual(try CodeRequirement.designated(ofCodeAt: bundle), requirement, "the requirement alone still reads")
         XCTAssertThrowsError(try CodeRequirement.verify(codeAt: bundle, satisfies: requirement)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains(securityMessage(errSecCSBadResource)), error.localizedDescription)
         }
         XCTAssertThrowsError(try CodeRequirement.pin(bundle: bundle)) { error in
             XCTAssertTrue(error.localizedDescription.contains(bundle.path), error.localizedDescription)
-            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains(securityMessage(errSecCSBadResource)), error.localizedDescription)
         }
     }
 
@@ -275,7 +275,7 @@ final class PackagingTests: XCTestCase {
         XCTAssertNotEqual(replacement, launched.requirement, "re-signing gives the bundle a new cdhash")
         XCTAssertNoThrow(try CodeRequirement.verify(codeAt: bundle, satisfies: replacement), "the replacement is a valid bundle in its own right")
         XCTAssertThrowsError(try CodeRequirement.pin(bundle: bundle, running: { launched }, mainBundle: bundle)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("failed to satisfy"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains(securityMessage(errSecCSReqFailed)), error.localizedDescription)
         }
 
         // A process running from one bundle never pins another.
