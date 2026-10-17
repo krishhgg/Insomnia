@@ -14,6 +14,7 @@ final class LiveStatusSource: StatusSource {
     var lidClosed: Bool { services.status.lidClosed }
     var batteryPercent: Int? { services.status.batteryPercent }
     var isCharging: Bool { services.status.isCharging }
+    var thermalState: ProcessInfo.ThermalState { services.status.thermalState }
     var wifiSSID: String? { services.status.wifiSSID }
     var lastGap: TimeInterval? { services.status.lastGap }
     var frozenCount: Int { services.status.frozenCount }

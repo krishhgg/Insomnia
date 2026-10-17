@@ -107,7 +107,8 @@ recovery; newly written journals use `frozenProcesses`.
   SleepDisabled 1 five seconds after pmset exits 0 (macOS 26.6.2 sets it back
   to 0 after about 2 s), delete the session file and surface the error. The
   journal and backstop always exist before sleep is disabled.
-- Session end (timer, End now, Quit, battery floor, thermal critical):
+- Session end (timer, End now, Quit, battery floor, thermal critical or
+  sustained serious):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
 - Quitting Insomnia always ends the session. There is no "keep awake after quit".
@@ -616,10 +617,11 @@ IOKit sends no event for a read that keeps failing.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
-| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
-| thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
-| thermal state `critical` | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify, sleep a closed lid | — |
+| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify, sleep a closed lid | — |
+| thermal state `serious`, or `fair` with no `nominal` since a `serious` | `lowpowermode 1` | thermal back to `nominal`, or session end |
+| thermal state `critical` | end session, notify, sleep a closed lid | — |
+| thermal state `serious` without a break for `seriousThermalLimit` (default 15 minutes; 0 turns the end off) | end session, notify, sleep a closed lid | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
 
 `PowerMonitor` tells a machine with no internal battery (desktop: no floor
@@ -645,11 +647,58 @@ other floor when the two would cross (`endFloor` at most 95). A `config.json`
 that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
 + 5 (capped at 100), logged, and written back.
 
+The thermal cause holds from a `serious` reading until a `nominal` one. A Mac
+back at `fair` is still cooling down, and switching the mode off there brings
+back the load that made it serious, so the mode would go on and off as the
+Mac heats up and cools down. `FloorRuleDriver` keeps that history for the
+session, in memory: after a relaunch a Mac at `fair` counts as cooled down.
+The notifications say what the mode waits for ("Low Power Mode stays on until
+it is back to nominal") and why it went off ("Thermal state is back to
+nominal.", or "Thermal rules are off." when Settings turned them off). While
+the mode is on for heat the display sample is held, as for any Low Power Mode
+Insomnia switched on (section 4), so the hold can keep it longer than before.
+Nothing but `nominal` and the session end bounds the hold: a Mac that stays at
+`fair`, under a long build say, keeps the mode, and the display sample held,
+until the session ends. That is deliberate. A Mac at `fair` after `serious` is
+still carrying the heat, and a release on a timer would bring the cycling back
+at a slower pace. The menu shows the mode and the thermal state meanwhile, and
+turning the thermal rules off in Settings releases it at once.
+
+`critical` is rare on Apple silicon, which throttles before it gets there, so
+a Mac that cannot shed its heat, in a bag say, can stay `serious` for hours
+with Low Power Mode on. A `serious` stretch that lasts `seriousThermalLimit`
+ends the session (`thermalSustained`), and with the lid closed it puts the Mac
+to sleep like the other floor-rule ends: without that sleep the end would
+switch Low Power Mode off and unfreeze the apps of a Mac still running in the
+bag. The stretch is timed from the first floor run that reads it, on the
+continuous clock like the wait below, so a step of the wall clock (an NTP
+correction, a time set by hand) does not count, and any reading below
+`serious` breaks it. The thermal state sends no event while it
+stays serious, so after each floor run the driver reports when the stretch
+reaches the limit and `AppServices` runs the floors once more at that moment.
+Once it has, no new wait is owed: an end the lock or a running `sudo pmset`
+refuses is retried by the manager. The limit is set in Settings in 5-minute
+steps from 0 to 60 minutes; a hand-edited `config.json` outside that range is
+clamped at load, logged and written back.
+
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
 Battery and thermal rules run only while the app is alive; they are not
 provided by the standalone backstop. Performance effects depend on workload.
+
+"Sleep a closed lid": macOS asks for a closed lid's sleep once, at the close,
+and the sleep guard refuses it. `disablesleep 0` only clears the kernel's flag
+(`kPowerEventUserDisabledSleep` in xnu's `IOPMrootDomain.cpp`) and does not
+look at the lid again. So these ends owe a sleep, and Insomnia calls
+`IOPMSleepSystem` (no root needed) if `AppleClamshellState` and
+`AppleClamshellCausesSleep` are both true. It asks after an end, and only
+with no session, no lifecycle operation queued or running, and no `sudo pmset`
+left running. macOS refuses while sleep is still disabled, as after a failed
+`disablesleep 0` that the recovery agent retries, so a refused or postponed
+request is asked again every 30 s. The owed sleep is dropped once it is asked,
+when the lid is open or macOS keeps the closed Mac awake, or when a start
+begins. Other ends owe nothing.
 
 ### 7. Network failover
 
@@ -1077,7 +1126,11 @@ older build is tightened when the app reads it:
   earlier builds read it. A fresh install writes a config.json with the mark
   and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
-- `lowPowerFloor`, `endFloor`, thermal rules on/off
+- `lowPowerFloor`, `endFloor`, thermal rules on/off, `seriousThermalLimit`
+  (default 15 minutes, 0 off). A change to any of them, or to the lid
+  option, during a session runs the floors at once: `SessionManager.config`
+  calls `floorInputsChanged` when `Config.floorInputs` changes, and
+  `AppServices` runs `reevaluateFloors` for it.
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
@@ -1207,6 +1260,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | battery % | IOPS run loop source | none |
 | battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
+| serious heat limit | one wait after each floor run while the thermal state reads serious | one wake when the stretch reaches `seriousThermalLimit` |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
@@ -1359,7 +1413,10 @@ validation record.
 11. **Floors.** Set `lowPowerFloor` above current charge → Low Power Mode on.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to
-    `serious`, `critical`, and recovery. Do not intentionally overheat the Mac.
+    `serious`, `critical`, and recovery: Low Power Mode stays on at `fair`
+    after `serious` and goes off at `nominal`, and `serious` held for
+    `seriousThermalLimit` ends the session. Do not intentionally overheat the
+    Mac.
 13. **Darken.** Brightness 70%, keyboard backlight on, close lid → both go to
     0 (check `state.json` has `savedDisplayBrightness` and
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
@@ -1400,7 +1457,10 @@ validation record.
 
 - `pmset -a` (all power sources) rather than `-b` for `disablesleep`, so
   behaviour is identical whether or not a charger is attached.
-- Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s.
+- Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s,
+  `seriousThermalLimit` 15 minutes, also for an existing config.json without
+  the key: heat that bad for that long is a reason to stop holding sleep on
+  any install, and Settings can turn it off.
 - Turning App Nap off for agent apps is opt-in and the previous value is put
   back at session end. Values older builds wrote without a record are listed
   by uninstall, never deleted by it.
