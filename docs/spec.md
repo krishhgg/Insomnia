@@ -1035,8 +1035,9 @@ Backstop, independent of the app:
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
-  says the key does not exist; a read that succeeds or fails any other way
-  keeps the entry.
+  says the key is not there ("does not exist" up to macOS 26, "Could not
+  find key" or "Domain ... not found" on macOS 27); a read that succeeds or
+  fails any other way keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. Their real-Mac checks are
   in docs/releasing.md.

@@ -120,9 +120,11 @@
 #                              defaults delete <bundleId> NSAppSleepDisabled
 #                              when the key was absent. A delete that fails
 #                              counts as done only when defaults read then
-#                              says the key does not exist; a read that
-#                              fails any other way proves nothing and the
-#                              entry stays.
+#                              says the key is not there ("does not exist"
+#                              up to macOS 26, "Could not find key" or
+#                              "Domain ... not found" on macOS 27); a read
+#                              that fails any other way proves nothing and
+#                              the entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
@@ -1352,7 +1354,9 @@ if (( app_nap_count > 0 )); then
       # The key was absent before, so it goes. `defaults delete` fails when
       # the key is already gone, which is the wanted state. A failed delete
       # clears the entry only when `defaults read` then says in so many
-      # words that the key does not exist. A read that succeeds means the
+      # words that the key is not there: "does not exist" up to macOS 26,
+      # "Could not find key" for an existing domain and "Domain ... not
+      # found" for a missing one on macOS 27. A read that succeeds means the
       # key is still set; one that fails any other way (cfprefsd not
       # answering, a timeout) proves nothing, so the entry stays for the
       # next run.
@@ -1371,7 +1375,7 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif grep -q "does not exist" "$probe" 2>/dev/null; then
+        elif grep -qE "does not exist|Could not find key 'NSAppSleepDisabled' in domain '|Domain '[^']*' not found\." "$probe" 2>/dev/null; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else

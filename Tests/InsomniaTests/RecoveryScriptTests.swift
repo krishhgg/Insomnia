@@ -497,10 +497,35 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("com.apple.Terminal NSAppSleepDisabled failed and the key is still set"), fx.log())
     }
 
-    /// A failed delete followed by a read that fails for any reason other
-    /// than "does not exist" (cfprefsd not answering, say) proves nothing
-    /// about the key. The entry stays, the run fails, and the next run
-    /// finishes the job once `defaults` answers again.
+    /// macOS 27 says an absent key is not there in other words: "Could not
+    /// find key" when the domain exists and "Domain ... not found" when it
+    /// does not. Either one clears the entry after a failed delete, as
+    /// "does not exist" does on macOS 26 (#95).
+    func testDeleteOfAlreadyAbsentKeyCountsAsRestoredWithMacOS27Wording() throws {
+        for wording in ["27-key", "27-domain"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.aone.keka"}]}"#)
+            try fx.defaultsTable([])
+            try fx.setDefaultsWording(wording)
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertEqual(r.status, 0, "\(wording): " + r.stderr + fx.log())
+            XCTAssertEqual(fx.calls(), [
+                "defaults delete com.aone.keka NSAppSleepDisabled",
+                "defaults read com.aone.keka NSAppSleepDisabled",
+            ], wording)
+            XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 0, wording)
+            XCTAssertTrue(fx.log().contains("com.aone.keka NSAppSleepDisabled: the key is already absent"), "\(wording): " + fx.log())
+            XCTAssertFalse(fx.log().contains("could not tell whether the key is still set"), "\(wording): " + fx.log())
+        }
+    }
+
+    /// A failed delete followed by a read that fails without an absent-key
+    /// message (cfprefsd not answering, say) proves nothing about the key.
+    /// The entry stays, the run fails, and the next run finishes the job
+    /// once `defaults` answers again.
     func testDeleteAndReadBothFailingKeepsTheEntryForTheNextRun() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome"}]}"#)
@@ -1462,20 +1487,29 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// Nothing to list: the check still runs, reads the shipped list plus
     /// config.json's (each once), and says how many it checked rather than
-    /// claiming nothing is left anywhere.
+    /// claiming nothing is left anywhere. On macOS 27 an app without the
+    /// key reads as "Could not find key", or "Domain ... not found" when it
+    /// has no preferences at all; both count as checked, as macOS 26's
+    /// "does not exist" does, not as unreadable (#95).
     func testUninstallReportsNoUnrecordedAppNapWhenNoneIsSet() throws {
-        try fx.installMachinery()
-        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        try fx.writeConfig(#"{"agentList":["com.google.Chrome","com.example.extra"]}"#)
+        for wording in ["26", "27-key", "27-domain"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try fx.writeConfig(#"{"agentList":["com.google.Chrome","com.example.extra"]}"#)
+            try fx.setDefaultsWording(wording)
 
-        let r = try fx.run(fx.uninstall)
+            let r = try fx.run(fx.uninstall)
 
-        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        let expected = (Config.defaultAgentList + ["com.example.extra"]).map { "defaults read \($0) NSAppSleepDisabled" }
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, expected)
-        XCTAssertTrue(r.stdout.contains("Checking App Nap settings of agent apps"), r.stdout)
-        XCTAssertTrue(r.stdout.contains("none of the \(expected.count) agent apps checked has NSAppSleepDisabled set"), r.stdout)
-        XCTAssertFalse(r.stdout.contains("defaults delete"), r.stdout)
+            XCTAssertEqual(r.status, 0, "\(wording): " + r.stderr + r.stdout)
+            let expected = (Config.defaultAgentList + ["com.example.extra"]).map { "defaults read \($0) NSAppSleepDisabled" }
+            XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, expected, wording)
+            XCTAssertTrue(r.stdout.contains("Checking App Nap settings of agent apps"), "\(wording): " + r.stdout)
+            XCTAssertTrue(r.stdout.contains("none of the \(expected.count) agent apps checked has NSAppSleepDisabled set"), "\(wording): " + r.stdout)
+            XCTAssertFalse(r.stdout.contains("could not read NSAppSleepDisabled"), "\(wording): " + r.stdout)
+            XCTAssertFalse(r.stdout.contains("defaults delete"), "\(wording): " + r.stdout)
+        }
     }
 
     /// An app the user took off the list may still carry a value an older
@@ -6866,8 +6900,12 @@ private final class ScriptFixture {
         // write and delete fail; "fail:<domain>" only that domain's. Mode
         // "unreachable" (or "unreachable:<domain>") fails every command,
         // read included, the way a cfprefsd that does not answer would:
-        // non-zero without the "does not exist" message. Mode "hang" (or
-        // "hang:<domain>") never answers; see hangHere.
+        // non-zero without any absent-key message. Mode "hang" (or
+        // "hang:<domain>") never answers; see hangHere. defaults.wording
+        // picks the message for an absent key: macOS 26's "does not exist"
+        // by default, "27-key" for macOS 27's "Could not find key" (a
+        // domain that exists) and "27-domain" for its "Domain ... not
+        // found" (a domain with no preferences at all).
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
@@ -6887,6 +6925,15 @@ private final class ScriptFixture {
           awk -F'|' -v d="$domain" '$1 != d' "$table" > "$table.next" && mv "$table.next" "$table"
         }
         failing() { [[ "$mode" == fail || "$mode" == "fail:$domain" ]]; }
+        absent() {
+          case "$(cat "\(r)/defaults.wording" 2>/dev/null)" in
+            27-key) echo "Error: Could not find key '$key' in domain '$domain'." >&2 ;;
+            27-domain) echo "Error: Domain '$domain' not found." >&2 ;;
+            ""|26) echo "The domain/default pair of ($domain, $key) does not exist" >&2 ;;
+            *) echo "fake defaults: unknown wording" >&2; exit 2 ;;
+          esac
+          exit 1
+        }
         \(hangHere("defaults"))
         if [[ "$mode" == hang || "$mode" == "hang:$domain" ]]; then hang_here; fi
         if [[ "$mode" == unreachable || "$mode" == "unreachable:$domain" ]]; then
@@ -6894,7 +6941,7 @@ private final class ScriptFixture {
         fi
         case "$cmd" in
           read)
-            v="$(lookup)" || { echo "The domain/default pair of ($domain, $key) does not exist" >&2; exit 1; }
+            v="$(lookup)" || absent
             echo "$v"; exit 0 ;;
           write)
             failing && exit 1
@@ -7073,6 +7120,14 @@ private final class ScriptFixture {
 
     func setMode(_ name: String, _ value: String) {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
+    }
+
+    /// Which message the fake `defaults` prints for an absent key (see its
+    /// comment): "27-key", "27-domain", or "26" (the default) for macOS
+    /// 26's. Any other wording makes the fake fail, so a typo cannot pass
+    /// for macOS 26.
+    func setDefaultsWording(_ wording: String) throws {
+        try wording.write(to: root.appendingPathComponent("defaults.wording"), atomically: true, encoding: .utf8)
     }
 
     /// The word the fake app binary answers per pid; the exit status follows
