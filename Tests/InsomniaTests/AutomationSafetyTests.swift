@@ -342,8 +342,11 @@ final class TmuxLiveRunnerTests: XCTestCase {
         }
     }
 
+    /// `-f /dev/null` keeps the fixture off the contributor's `~/.tmux.conf`.
+    /// With `base-index 1` or `pane-base-index 1` set there, the session is
+    /// `nudge:1.1` and every `nudge:0.0` target below stops existing.
     private func tmuxRun(_ args: [String]) async throws -> ShellResult {
-        try await Shell.run(tmux, ["-L", socket] + args, timeout: 5)
+        try await Shell.run(tmux, ["-f", "/dev/null", "-L", socket] + args, timeout: 5)
     }
 
     /// One `cat` pane, marked for nudges unless `marked` is false.
@@ -632,8 +635,11 @@ final class TmuxTargetResolutionTests: XCTestCase {
         }
     }
 
+    /// `-f /dev/null` keeps the fixture off the contributor's `~/.tmux.conf`.
+    /// With `base-index 1` or `pane-base-index 1` set there, the session is
+    /// `nudge:1.1` and every `nudge:0.0` target below stops existing.
     private func tmuxRun(_ args: [String]) async throws -> ShellResult {
-        try await Shell.run(tmux, ["-L", socket] + args, timeout: 5)
+        try await Shell.run(tmux, ["-f", "/dev/null", "-L", socket] + args, timeout: 5)
     }
 
     private func continueLines(in pane: String) async throws -> Int {
