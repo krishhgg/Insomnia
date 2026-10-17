@@ -223,7 +223,7 @@ below cover what only a real Mac shows.
 ### Sessions and recovery
 
 - Normal end, deadline expiry, and repeated Quit restore live power state
-- Sleep guard read back: on macOS 26.6.2 (25G83), where `pmset -g` reads SleepDisabled 0 again about 2 s after `pmset -a disablesleep 1`, Start fails after about 5 s with "macOS set SleepDisabled back to 0" and no session runs; on a macOS where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
+- Sleep guard read back: on a Mac where another process sets SleepDisabled back to 0 about 2 s after `pmset -a disablesleep 1` (for example a root LaunchDaemon that loops `pmset -a disablesleep 0`), Start fails after about 5 s with "SleepDisabled read 0 again" and no session runs; on a Mac where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
 - Force-quit followed by launchd deadline recovery and retry after failure
 - Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge
 - session.json without read permission during a session: the agent restores sleep within a minute and renames the file to `session.json.unreadable-<time>`, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session

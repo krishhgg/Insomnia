@@ -104,8 +104,9 @@ recovery; newly written journals use `frozenProcesses`.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
   the backstop is armed. If pmset fails, or `pmset -g` no longer reads
-  SleepDisabled 1 five seconds after pmset exits 0 (macOS 26.6.2 sets it back
-  to 0 after about 2 s), delete the session file and surface the error. The
+  SleepDisabled 1 five seconds after pmset exits 0 (another process, such as
+  a keep-awake daemon, can set it back to 0), delete the session file and
+  surface the error. The
   journal and backstop always exist before sleep is disabled.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
