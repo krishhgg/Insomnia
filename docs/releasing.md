@@ -233,6 +233,7 @@ below cover what only a real Mac shows.
 - Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Low Power Mode while the lid is closed" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
 - Battery/thermal event behavior on supported hardware
+- A timer or floor-rule end with the lid closed puts the Mac to sleep (trigger it with a short timer and with the battery end floor, never by heating the Mac; with an external display in clamshell mode it stays awake)
 - A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits
 - The same command with the app force-quit: the backstop does not take the lock until the command exits; the relaunch names the pid from `unfinished-command.json`, and at its next retry after the command exits (retries start 30 s after each refusal) resumes the session with its battery floors
 - A left-running `disablesleep 0` that exits 0: the end finishes without running it again

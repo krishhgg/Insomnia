@@ -38,10 +38,16 @@ final class LidObserver {
     /// Pure registry read: true = closed, false = open, nil = unavailable
     /// (no IOPMrootDomain or no clamshell, e.g. a desktop).
     nonisolated static func readClamshellState() -> Bool? {
+        readRootDomainBool(clamshellKey)
+    }
+
+    /// A boolean property of IOPMrootDomain; nil when the service or the
+    /// property is missing.
+    nonisolated static func readRootDomainBool(_ key: String) -> Bool? {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
         guard service != 0 else { return nil }
         defer { IOObjectRelease(service) }
-        guard let value = IORegistryEntryCreateCFProperty(service, clamshellKey as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
+        guard let value = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
             return nil
         }
         return (value as? Bool) ?? ((value as? NSNumber)?.boolValue)

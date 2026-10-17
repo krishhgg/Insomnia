@@ -98,12 +98,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// outlive a quit (the command holds it through its own descriptor),
     /// but the end the command holds up would not: the app is what retries
     /// it, and confirms an undo the command finishes, the moment it exits.
+    /// It stays while a closed lid's sleep is owed: only the app asks for it.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateCancel }
         terminating = true
         Task {
             let outcome = await manager.end(reason: .quit)
-            if outcome.letsQuitGo {
+            if outcome.letsQuitGo, !manager.closedLidSleepOwed {
                 sender.reply(toApplicationShouldTerminate: true)
             } else {
                 Log.error("quit deferred: recovery still pending (\(outcome)); staying to retry")

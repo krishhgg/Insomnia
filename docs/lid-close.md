@@ -99,7 +99,10 @@ The defaults are worth knowing:
   read. One failed read is tolerated, and the level is re-read every 30 s
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
-  session. These rules require the app to be running.
+  session. When one of these rules, or the timer, ends a session with the
+  lid closed, Insomnia also puts the Mac to sleep, unless macOS keeps it
+  awake closed (an external display in clamshell mode). These rules require
+  the app to be running.
   Setting the end floor to 0 turns the battery end off. Otherwise the end
   floor stays below the Low Power Mode floor. The Settings steppers move the
   other floor when the two would cross, and a hand-edited `config.json` with
