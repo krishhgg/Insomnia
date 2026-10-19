@@ -6,8 +6,8 @@
 # copy older installs left in Application Support; from anywhere else, such
 # as a release zip: the sealed copy only), verifies for itself that the
 # journal is clean, and only then removes the LaunchAgent, the sudoers rule,
-# the app bundle (backstop.sh included), and the journal. Keeps config.json
-# and the logs unless --purge. Everything after the quit happens while this
+# the app bundle (backstop.sh included), and the journal. Keeps config.json,
+# hotspot-usage.json and the logs unless --purge. Everything after the quit happens while this
 # process holds APP_SUPPORT/.recovery.lock, so neither a queued periodic
 # backstop nor a relaunched app can republish the journal while it is being
 # removed.
@@ -1014,7 +1014,7 @@ done
 # current one went with the bundle.
 if (( PURGE == 1 )); then
   step "Purging Insomnia's files in $APP_SUPPORT and $LOG_DIR"
-  remove_owned "$SESSION" "$APP_SUPPORT/config.json" "$APP_SUPPORT/backstop.sh" \
+  remove_owned "$SESSION" "$APP_SUPPORT/config.json" "$APP_SUPPORT/hotspot-usage.json" "$APP_SUPPORT/backstop.sh" \
         "$APP_SUPPORT/unfinished-command.json" \
         "$LOG_DIR/insomnia.log" "$LOG_DIR/insomnia.log.1" \
         "$LOG_DIR/handoffs.log" "$LOG_DIR/handoffs.log.1"
@@ -1043,6 +1043,9 @@ else
   remove_owned "$APP_SUPPORT/backstop.sh" "$SESSION" "$APP_SUPPORT/unfinished-command.json"
   (( ${#kept_brightness[@]} > 0 )) || remove_owned "$STATE"
   echo "Kept $APP_SUPPORT/config.json and $LOG_DIR (use --purge to remove)."
+  if [[ -f "$APP_SUPPORT/hotspot-usage.json" ]]; then
+    echo "Kept $APP_SUPPORT/hotspot-usage.json (use --purge to remove)."
+  fi
   collect_moved_aside_sessions
   if (( ${#MOVED_ASIDE[@]} > 0 )); then
     echo "Kept ${#MOVED_ASIDE[@]} unreadable session.json file(s) moved aside in $APP_SUPPORT (use --purge to remove)."

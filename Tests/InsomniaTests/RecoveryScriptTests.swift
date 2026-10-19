@@ -3874,11 +3874,25 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("still loaded"), r.stderr)
     }
 
+    func testUninstallKeepsHotspotUsageUnlessPurged() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        let usage = fx.config.deletingLastPathComponent().appendingPathComponent("hotspot-usage.json")
+        let data = Data("usage fixture".utf8)
+        try data.write(to: usage)
+        let result = try fx.run(fx.uninstall)
+        XCTAssertEqual(result.status, 0, result.stderr + result.stdout)
+        XCTAssertEqual(try Data(contentsOf: usage), data)
+        XCTAssertTrue(result.stdout.contains("Kept \(usage.path)"), result.stdout)
+    }
+
     func testUninstallPurgeKeepsLockInode() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         try Data().write(to: fx.lock)
         let before = try fx.inode(fx.lock)
+        let usage = fx.config.deletingLastPathComponent().appendingPathComponent("hotspot-usage.json")
+        try Data("usage fixture".utf8).write(to: usage)
 
         let r = try fx.run(fx.uninstall, ["--purge"])
 
@@ -3887,6 +3901,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.inode(fx.lock), before)
         XCTAssertFalse(fx.exists(fx.state))
         XCTAssertFalse(fx.exists(fx.config))
+        XCTAssertFalse(fx.exists(usage))
         XCTAssertFalse(fx.exists(fx.logFile))
         XCTAssertFalse(fx.exists(fx.plist))
         XCTAssertFalse(fx.exists(fx.app))

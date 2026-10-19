@@ -654,7 +654,8 @@ final class StatusItemController: NSObject {
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
             relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
-            stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:))
+            stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:)),
+            hotspotUsageSettings: #selector(menuOpenHotspotUsage)
         )
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
@@ -688,7 +689,8 @@ final class StatusItemController: NSObject {
             commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
             outputsWaiting: manager.outputsWaitingForRestore,
-            lidSimulationBuild: LidSimulationBuild.isCompiledIn
+            lidSimulationBuild: LidSimulationBuild.isCompiledIn,
+            hotspotUsage: manager.config.trackHotspotUsage ? status.hotspotUsage : nil
         )
     }
 
@@ -733,6 +735,13 @@ final class StatusItemController: NSObject {
     @objc private func menuOpenSettings() {
         openSettings()
         showSettings()
+    }
+
+    @objc private func menuOpenHotspotUsage() {
+        menuOpenSettings()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: SettingsView.showHotspotUsage, object: nil)
+        }
     }
 
     // MARK: Settings

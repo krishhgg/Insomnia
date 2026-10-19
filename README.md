@@ -186,6 +186,14 @@ your login Keychain. Insomnia asks for Location Services access, because
 macOS requires it to read Wi-Fi network names. It never reads your location.
 After you reinstall Insomnia, enter the password again.
 
+In Settings, turn on **Track hotspot usage during sessions** and set a data
+budget in GB. The compact right-click menu shows the saved total and budget,
+with warnings at 80% and 100%. Click the total to open the data budget settings.
+Totals combine this Mac's upload and download on the configured hotspot during
+sessions, including local traffic. They exclude the phone and other devices;
+missing readings are skipped and marked incomplete. Warnings leave the
+connection running. Reset the total explicitly when your data period renews.
+
 After 90 seconds without a network, Insomnia can also type `continue` into a
 tmux pane running a coding agent. It only types into panes you list in
 Settings and mark yourself:

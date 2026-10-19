@@ -297,6 +297,9 @@ below cover what only a real Mac shows.
 ### Hotspot
 
 - Hotspot permission, association, cancellation, and reconnect
+- Opt-in usage tracking on the configured phone hotspot: confirm upload and download including local traffic, move to another saved Wi-Fi and back, stop/restart a session and relaunch; retained totals exclude inactive and other-network intervals, and missing readings show a paused/incomplete notice
+- Budget warnings with a small allowance: cross 80% and 100%, check foreground/background delivery once per threshold, repeat with notifications denied, edit the budget, confirm/reset or cancel, and verify the connection and power journal stay unchanged
+- Usage storage failure and recovery: read failures retain history, save failures defer notifications, recovered saves retain accumulated bytes, explicit reset clears only the selected readable history, normal uninstall retains usage and purge removes it
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
 

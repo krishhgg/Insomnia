@@ -4,6 +4,7 @@ import SwiftUI
 /// The settings window (spec 10). Every change is written straight through
 /// `manager.config` to config.json.
 struct SettingsView: View {
+    static let showHotspotUsage = Notification.Name("InsomniaShowHotspotUsage")
     let manager: SessionManager
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
@@ -25,35 +26,44 @@ struct SettingsView: View {
     @State private var wouldFreeze: [String] = []
 
     var body: some View {
-        Form {
-            sessionSection
-            lidSection
-            agentSection
-            powerSection
-            networkSection
-            appSection
+        ScrollViewReader { proxy in
+            Form {
+                sessionSection
+                lidSection
+                agentSection
+                powerSection
+                networkSection
+                Section("Hotspot data budget") {
+                    HotspotUsageSettings(config: Binding(get: { manager.config }, set: { manager.config = $0; save() }),
+                                         driver: manager.services?.hotspotUsage)
+                }.id("hotspot-usage")
+                appSection
+            }
+            .formStyle(.grouped)
+            .frame(width: 520)
+            .frame(minHeight: 560, idealHeight: 720)
+            .onAppear {
+                loadPassword()
+                refreshWouldFreeze()
+                // The user may have approved or removed the item in System
+                // Settings since the launch-time check (LoginItem also re-reads
+                // whenever the app becomes active, for a window left open).
+                loginItem.refresh()
+            }
+            // The failover may find the saved password unreadable while the
+            // window is open, and an SSID edit makes the notice about another
+            // hotspot's item: the notice follows both.
+            .onChange(of: manager.services?.status.hotspotPasswordReport) { recheckPassword() }
+            .onChange(of: HotspotSSID.normalized(manager.config.hotspotSSID)) { recheckPassword() }
+            // The preview depends on the toggle, both lists and what is running:
+            // recompute on any config change and whenever an app launches or quits.
+            .onChange(of: manager.config) { refreshWouldFreeze() }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in refreshWouldFreeze() }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in refreshWouldFreeze() }
+            .onReceive(NotificationCenter.default.publisher(for: Self.showHotspotUsage)) { _ in
+                proxy.scrollTo("hotspot-usage", anchor: .top)
+            }
         }
-        .formStyle(.grouped)
-        .frame(width: 520)
-        .frame(minHeight: 560, idealHeight: 720)
-        .onAppear {
-            loadPassword()
-            refreshWouldFreeze()
-            // The user may have approved or removed the item in System
-            // Settings since the launch-time check (LoginItem also re-reads
-            // whenever the app becomes active, for a window left open).
-            loginItem.refresh()
-        }
-        // The failover may find the saved password unreadable while the
-        // window is open, and an SSID edit makes the notice about another
-        // hotspot's item: the notice follows both.
-        .onChange(of: manager.services?.status.hotspotPasswordReport) { recheckPassword() }
-        .onChange(of: HotspotSSID.normalized(manager.config.hotspotSSID)) { recheckPassword() }
-        // The preview depends on the toggle, both lists and what is running:
-        // recompute on any config change and whenever an app launches or quits.
-        .onChange(of: manager.config) { refreshWouldFreeze() }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in refreshWouldFreeze() }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in refreshWouldFreeze() }
     }
 
     // MARK: Bindings
