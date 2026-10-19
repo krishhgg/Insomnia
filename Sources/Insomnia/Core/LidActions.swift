@@ -4,7 +4,8 @@ import Foundation
 /// undone on lid open. Every step is journaled to state.json *before* the
 /// side effect; undo reads state.json, never memory.
 ///
-/// Order on close: darken (save display brightness and keyboard backlight
+/// Order on close: lock the screen (when on; not journaled, never undone),
+/// darken (save display brightness and keyboard backlight
 /// first, then set both to 0 and ask the display to sleep), mute (save
 /// volume + mute state first), freeze scope (the freeze list plus every
 /// other Dock app when `freezeAllApps` is on; one journal write per app),
@@ -18,6 +19,7 @@ final class LidActions {
     private let audio: any AudioControlling
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
+    private let screenLock: any ScreenLocking
     /// Last trusted brightness values, kept by AppServices while the lid is
     /// open. nil (tests) means the device's own asleep/suppressed reading
     /// decides alone.
@@ -37,6 +39,7 @@ final class LidActions {
         audio: any AudioControlling,
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
+        screenLock: any ScreenLocking = NoopScreenLocker(),
         sampler: BrightnessSampler? = nil
     ) {
         self.manager = manager
@@ -45,6 +48,7 @@ final class LidActions {
         self.audio = audio
         self.display = display
         self.keyboard = keyboard
+        self.screenLock = screenLock
         self.sampler = sampler
     }
 
@@ -84,6 +88,19 @@ final class LidActions {
             // queued right behind and must not find a fresh freeze.
             let stillCurrent = { [self] in
                 manager.isActive && manager.endTicket == ticket && lidEvents == event && !Task.isCancelled
+            }
+
+            // Not journaled and not undone: the lid opening does nothing for
+            // it, the login password does. A failure is shown in the menu
+            // (the private call can break with an OS update) and the rest
+            // of the close still runs.
+            if config.lockScreenOnLidClose {
+                do {
+                    try screenLock.lockNow()
+                    Log.info("screen locked on lid close")
+                } catch {
+                    manager.fail("lid close: could not lock the screen: \(error.localizedDescription)")
+                }
             }
 
             if config.darkenDisplayOnLidClose {

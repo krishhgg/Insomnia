@@ -554,6 +554,22 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     }
 }
 
+/// Fake screen locker: counts calls, and throws when told to.
+final class FakeScreenLocker: ScreenLocking, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls = 0
+    var throwOnLock = false
+    var onLock: (@Sendable () -> Void)?
+
+    var calls: Int { lock.withLock { _calls } }
+
+    func lockNow() throws {
+        lock.withLock { _calls += 1 }
+        onLock?()
+        if throwOnLock { throw ScreenLockError(what: "SACLockScreenImmediate returned 1") }
+    }
+}
+
 /// Fake keyboard backlight; `brightness` nil models a Mac without one.
 final class FakeKeyboardBacklight: KeyboardBacklighting, @unchecked Sendable {
     private let lock = NSLock()
