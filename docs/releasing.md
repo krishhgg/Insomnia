@@ -223,12 +223,13 @@ below cover what only a real Mac shows.
 ### Sessions and recovery
 
 - Normal end, deadline expiry, and repeated Quit restore live power state
-- Sleep guard read back: on macOS 26.6.2 (25G83), where `pmset -g` reads SleepDisabled 0 again about 2 s after `pmset -a disablesleep 1`, Start fails after about 5 s with "macOS set SleepDisabled back to 0" and no session runs; on a macOS where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
+- Sleep guard read back: on a Mac where another process sets SleepDisabled back to 0 about 2 s after `pmset -a disablesleep 1` (for example a root LaunchDaemon that loops `pmset -a disablesleep 0`), Start fails after about 5 s with "SleepDisabled read 0 again" and no session runs; on a Mac where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
 - Force-quit followed by launchd deadline recovery and retry after failure
 - Unlimited start from ∞ after Minutes: immediate activation regardless of inputs, accessible labeling, ∞ display, manual end and normal Quit restore live power state
 - Timed-to-unlimited conversion, including a timed session resumed after a crash: keep-awake remains active beyond its former deadline; failed conversion preserves the original timed session
 - Unlimited force-quit followed by owner-aware launchd recovery and retry after failure; relaunch before helper cleanup restores rather than resumes; development/non-default bundle paths with spaces remain active while their recorded owner lives
 - Unlimited battery/thermal safety ending and safe recovery of journaled lid actions
+- The recovery agent between sessions (no session.json, the clean journal a finished session leaves): `launchctl print gui/$(id -u)/com.insomnia.backstop` counts a run each minute with last exit code 0, the backstop writes nothing to insomnia.log and state.json is unchanged; a force-quit in the next session is still recovered at the deadline
 - Unreadable session.json moved aside by the app at launch and by the agent, then uninstall with and without --purge
 - session.json without read permission during a session: the agent restores sleep within a minute and renames the file to `session.json.unreadable-<time>`, or the app does both at launch and notifies; after fixing the copy's permissions, a relaunch does not resume the session
 - Reboot/login with active or dirty journals
@@ -236,6 +237,7 @@ below cover what only a real Mac shows.
 - Existing Low Power Mode preference and saved audio restoration
 - Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Low Power Mode while the lid is closed" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
+- App Nap on macOS 27, where `defaults read` of a missing key prints "Could not find key 'NSAppSleepDisabled' in domain '<id>'." or "Domain '<id>' not found.": an `appNapOverrides` entry whose key is already gone (deleted by hand after a force-quit) is cleared by the agent with "the key is already absent" and the run exits 0, and uninstall counts agent apps without the key as checked, not unreadable; with a sandboxed agent app on the list (one with `~/Library/Containers/<id>`), its container's preferences have no `NSAppSleepDisabled` left after the agent clears its entry
 - Battery/thermal event behavior on supported hardware
 - A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits
 - The same command with the app force-quit: the backstop does not take the lock until the command exits; the relaunch names the pid from `unfinished-command.json`, and at its next retry after the command exits (retries start 30 s after each refusal) resumes the session with its battery floors
@@ -245,6 +247,13 @@ below cover what only a real Mac shows.
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
+
+### Menu bar
+
+- A session with the lid open holds the app near idle: start a session, wait
+  10 s, then sample `ps -o %cpu= -p <pid>` every 0.5 s for 20 s. The mean
+  stays under about 5%, and the countdown still changes every second. It read
+  about 46% before the countdown stopped animating its digits
 
 ### Lid close
 

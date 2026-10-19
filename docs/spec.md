@@ -116,8 +116,9 @@ recovery; newly written journals use `frozenProcesses`.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
   the backstop is armed. If pmset fails, or `pmset -g` no longer reads
-  SleepDisabled 1 five seconds after pmset exits 0 (macOS 26.6.2 sets it back
-  to 0 after about 2 s), delete the session file and surface the error. The
+  SleepDisabled 1 five seconds after pmset exits 0 (another process, such as
+  a keep-awake daemon, can set it back to 0), delete the session file and
+  surface the error. The
   journal and backstop always exist before sleep is disabled.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
@@ -872,6 +873,10 @@ Backstop, independent of the app:
   checks avoid replacing the loaded job for every extension and allow retries
   after a failure. A dead or mismatched unlimited owner triggers cleanup,
   rather than waiting for a deadline; normal launch never resumes that mode.
+- Between sessions the agent's run ends early. With no `session.json` and a
+  `state.json` that is exactly the clean journal the app writes,
+  `backstop.sh` exits 0 before the lock and without `plutil`. Any other
+  journal, any `session.json` and `--force` take the full run.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
   plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
@@ -1062,8 +1067,9 @@ Backstop, independent of the app:
 - The shell puts `appNapOverrides` back with `defaults write <id>
   NSAppSleepDisabled -bool <previous>` or `defaults delete` when the key was
   absent. A delete that fails counts as done only when `defaults read` then
-  says the key does not exist; a read that succeeds or fails any other way
-  keeps the entry.
+  says the key is not there ("does not exist" up to macOS 26, "Could not
+  find key" or "Domain ... not found" on macOS 27); a read that succeeds or
+  fails any other way keeps the entry.
 - The agent is a recovery mechanism, not a guarantee of crash/reboot behavior
   or a replacement for battery/thermal observers. Their real-Mac checks are
   in docs/releasing.md.
