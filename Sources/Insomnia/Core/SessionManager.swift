@@ -2917,21 +2917,40 @@ final class SessionManager {
     /// In-process timers only; the launchd agent is armed by callers before
     /// this runs.
     private func armDeadline(_ endsAt: Date) async {
-        deadlineTimer?.invalidate()
         scheduledDeadline = endsAt
         // One timer at the deadline. Fire dates in the past fire immediately.
-        let timer = Timer(fire: endsAt, interval: 0, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let s = self.session, s.isExpired(at: self.clock()) else { return }
-                await self.end(reason: .timer)
-            }
+        scheduleDeadlineTimer(fire: endsAt)
+
+        refreshCountdown()
+        if !countdownPaused { armCountdownTimer() }
+    }
+
+    private func scheduleDeadlineTimer(fire: Date) {
+        deadlineTimer?.invalidate()
+        let timer = Timer(fire: fire, interval: 0, repeats: false) { [weak self] _ in
+            Task { @MainActor in await self?.deadlineTimerFired() }
         }
         timer.tolerance = 1
         RunLoop.main.add(timer, forMode: .common)
         deadlineTimer = timer
+    }
 
-        refreshCountdown()
-        if !countdownPaused { armCountdownTimer() }
+    /// The timer is one-shot and runs on the real run loop, while `clock`
+    /// may read a few milliseconds earlier than the timer's own time: macOS
+    /// steps the wall clock back by about that much now and then. A clock
+    /// that has not reached the deadline yet waits out the rest, so a timer
+    /// that ran early cannot leave the session running with 00:00 on screen.
+    private func deadlineTimerFired() async {
+        guard let s = session else { return }
+        let remaining = s.endsAt.timeIntervalSince(clock())
+        guard remaining <= 0 else {
+            // The timer runs on the real run loop, so it is scheduled from
+            // `Date()`. The floor keeps a clock that stays behind from
+            // spinning the run loop.
+            scheduleDeadlineTimer(fire: Date().addingTimeInterval(max(remaining, 0.05)))
+            return
+        }
+        await end(reason: .timer)
     }
 
     /// 1 Hz redraw aligned to whole wall-clock seconds so the digits change

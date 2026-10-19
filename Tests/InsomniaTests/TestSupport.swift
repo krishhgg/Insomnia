@@ -827,6 +827,8 @@ struct Harness {
     /// the private-call guard refuses; `sleepGuard` wraps `guardFake`.
     /// `bootSession` stands in for `kern.bootsessionuuid`, for a launch
     /// after a restart.
+    /// `customClock` replaces the harness clock, for a test that needs time to
+    /// pass by itself, as a real timer does.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
@@ -837,7 +839,8 @@ struct Harness {
         display: (any DisplayDimming)? = nil,
         keyboard: (any KeyboardBacklighting)? = nil,
         sleepGuard: (any SleepGuarding)? = nil,
-        bootSession: String = SignalProcessControl.bootSession
+        bootSession: String = SignalProcessControl.bootSession,
+        clock customClock: (@Sendable () -> Date)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -853,7 +856,7 @@ struct Harness {
             appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
-            clock: { c.now },
+            clock: customClock ?? { c.now },
             processLookup: { table.lookup($0) },
             recoveryLockTimeout: lockTimeout,
             recoveryRetryDelay: retryDelay,
