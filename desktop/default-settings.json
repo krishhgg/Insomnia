@@ -1,0 +1,15 @@
+{
+  "freezeList": [],
+  "freezeAllApps": false,
+  "dockerRule": false,
+  "muteOnLidClose": true,
+  "darkenDisplayOnLidClose": true,
+  "lowPowerOnLidClose": true,
+  "lowPowerFloor": 40,
+  "endFloor": 10,
+  "thermalRules": true,
+  "launchAtLogin": true,
+  "lidCloseDefaultsApplied": true,
+  "disableAppNapForAgents": false,
+  "defaultPreset": 14400
+}
