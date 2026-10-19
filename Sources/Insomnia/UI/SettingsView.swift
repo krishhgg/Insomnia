@@ -477,6 +477,10 @@ struct SettingsView: View {
 
     private var appSection: some View {
         Section("App") {
+            Toggle("Show the countdown in the menu bar", isOn: bind(\.showMenuBarCountdown))
+            Text("Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End Session; click it to add time.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Launch at login", isOn: launchAtLogin)
             loginItemNote
             LabeledContent("Config") {

@@ -1,17 +1,22 @@
 import AppKit
 
 /// The right-click menu on the status item: a read-only status block, then
-/// Settings and Quit, which live here and nowhere else.
+/// Settings and Quit, which live here and nowhere else. With the menu bar
+/// countdown turned off, the time left heads the status block and End
+/// Session stands in for the hold-to-end ring.
 ///
 /// The item list is pure so the ordering and the omission rules can be
-/// tested without a menu bar; `menu(_:target:settings:quit:)` is the only
-/// part that touches AppKit.
+/// tested without a menu bar; `menu(_:target:endSession:settings:quit:)`
+/// is the only part that touches AppKit.
 enum StatusMenu {
     struct Item: Equatable {
         enum Kind: Equatable {
             case info
             case warning
             case separator
+            /// End the running session. Offered only while the menu bar
+            /// countdown, and with it the hold-to-end ring, is turned off.
+            case endSession
             case settings
             case quit
             /// Relaunch this browser with the occlusion flags. Carries the
@@ -29,8 +34,15 @@ enum StatusMenu {
         let kind: Kind
     }
 
+    static let endSessionTitle = "End Session"
     static let settingsTitle = "Settings\u{2026}"
     static let quitTitle = "Quit Insomnia"
+
+    /// The time-left line, from the session's minute-granularity text
+    /// ("2h 14m").
+    static func remainingLine(_ remaining: String) -> String {
+        "\(remaining) remaining"
+    }
 
     /// Disabled status lines, a separator, then Settings… and Quit. Empty
     /// lines are dropped, and the separator only appears when something
@@ -46,6 +58,9 @@ enum StatusMenu {
     /// `outputsWaiting` are output devices still muted from a lid close
     /// because they were not connected to get their volume back; each gets
     /// a line and an item to stop waiting for it.
+    /// `remaining` is the time left, given while the menu bar countdown is
+    /// turned off and a session runs; it heads the menu. `offersEnd` adds
+    /// End Session above Settings… in the same case.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -58,9 +73,14 @@ enum StatusMenu {
         commandRunning: String? = nil,
         foreignSleep: String? = nil,
         outputsWaiting: [SavedAudioOutput] = [],
-        lidSimulationBuild: Bool = false
+        lidSimulationBuild: Bool = false,
+        remaining: String? = nil,
+        offersEnd: Bool = false
     ) -> [Item] {
         var out: [Item] = []
+        if let remaining = present(remaining) {
+            out.append(Item(title: remainingLine(remaining), kind: .info))
+        }
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
             out.append(Item(title: held.text, kind: held.isWarning ? .warning : .info))
         }
@@ -109,6 +129,9 @@ enum StatusMenu {
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))
         }
+        if offersEnd {
+            out.append(Item(title: endSessionTitle, kind: .endSession))
+        }
         out.append(Item(title: settingsTitle, kind: .settings))
         out.append(Item(title: quitTitle, kind: .quit))
         return out
@@ -126,6 +149,7 @@ enum StatusMenu {
     static func menu(
         _ items: [Item],
         target: AnyObject?,
+        endSession: Selector,
         settings: Selector,
         quit: Selector,
         relaunchBrowser: Selector,
@@ -149,6 +173,8 @@ enum StatusMenu {
                 }
                 entry.attributedTitle = NSAttributedString(string: item.title, attributes: attributes)
                 menu.addItem(entry)
+            case .endSession:
+                menu.addItem(action(title: item.title, selector: endSession, key: "", target: target))
             case .settings:
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))
             case .quit:
