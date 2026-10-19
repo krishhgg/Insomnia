@@ -916,6 +916,19 @@ Backstop, independent of the app:
   the candidate plists install.sh and the app stage it from
   (`com.insomnia.backstop.candidate-*` in `.com.insomnia.backstop.staging`
   and, from older builds, in the LaunchAgents directory).
+- install.sh and uninstall.sh find the running app with `pgrep -x
+  Insomnia`, which also finds Kong's Insomnia API client. They tell the two
+  apart by the signature of the code each process runs, not by a path that
+  argv[0] can set. A pid is skipped, with one line naming it, only when
+  `codesign --verify -R='anchor apple generic and identifier
+  "com.insomnia.app" and certificate leaf[subject.OU] = "FX44YY62GV"' <pid>`
+  exits 0: the running code has a valid signature from a certificate Apple
+  issued, with Kong's identifier and Kong's team (`FX44YY62GV`) in the leaf
+  certificate. Any other exit counts as the app: 3 when the requirement is
+  not met (this app's ad hoc signature, another identifier or team, a
+  certificate Apple did not issue), 1 for a process that is gone or a
+  signature that does not verify, any other status. Under the lock the call
+  is bounded like `pgrep`, and one that does not answer counts as the app.
 - App and script transactions must coordinate through a shared lock. Failure
   to acquire it must not permit an unprotected journal write or side effect.
 - A `sudo pmset` is sent SIGTERM at its timeout (20 s in the app, 30 s in the
