@@ -20,6 +20,7 @@ struct StatusRootView: View {
     let onTapCountdown: () -> Void
     let onHoldEnd: () -> Void
     let onWidthChange: (CGFloat) -> Void
+    var onTapUnlimited: () -> Void = {}
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotionEnv
 
@@ -72,6 +73,7 @@ struct StatusRootView: View {
             // `.animation(_:value:)` on this container did not reach it.
             if model.slotsPresent {
                 pills
+                unlimitedButton
                 if let error = model.startError {
                     startError(error)
                         .opacity(model.startErrorShown ? 1 : 0)
@@ -168,6 +170,34 @@ struct StatusRootView: View {
         }
     }
 
+    /// Shares the last pill's reveal and fold so the fixed action slot never
+    /// changes width under an animation, and leaves before the slots do.
+    private var unlimitedButton: some View {
+        let shown = model.visiblePills == DurationInput.Field.allCases.count
+        let collapsing = !shown && model.pillsCollapsing && !reduceMotion
+        let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
+        return Button(action: onTapUnlimited) {
+            Text("∞")
+                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color.white)
+                .frame(width: 28, height: 19)
+                .background(shape.fill(Color(brand: BrandPalette.charcoal).opacity(0.92)))
+                .overlay { shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5) }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .environment(\.colorScheme, .dark)
+        .help(model.mode == .extend ? "Make session unlimited (U)" : "Start unlimited session (U)")
+        .accessibilityLabel(model.mode == .extend ? "Make session unlimited" : "Start unlimited session")
+        .disabled(!model.phase.isEntering || model.pillsCollapsing)
+        .allowsHitTesting(shown && model.phase.isEntering && !model.pillsCollapsing)
+        .scaleEffect(reduceMotion || shown ? 1 : (collapsing ? Motion.collapseScale : Self.hiddenPillScale), anchor: .leading)
+        .offset(x: collapsing ? -collapseTravel(index: DurationInput.Field.allCases.count) : 0)
+        .opacity(shown ? 1 : 0)
+        .accessibilityHidden(!shown)
+        .transition(.asymmetric(insertion: shown ? Motion.pillTransition(reduceMotion: reduceMotion) : .identity, removal: .identity))
+    }
+
     /// How far the pill in slot `index` travels to put its leading edge on
     /// the first slot's: the slots before it and the gaps between. Zero for
     /// the first slot, which shrinks and fades where it is (its leading
@@ -195,7 +225,9 @@ struct StatusRootView: View {
             .transition(Motion.countdownTransition(reduceMotion: reduceMotion))
             .contentShape(Rectangle())
             .onTapGesture(perform: onTapCountdown)
-            .accessibilityLabel(model.phase == .starting ? "Starting session" : countdownText)
+            .accessibilityLabel(model.phase == .starting
+                ? (countdownText == "∞" ? "Starting unlimited session" : "Starting session")
+                : (countdownText == "∞" ? "Unlimited session" : countdownText))
     }
 
     /// The manager refused the start: say so next to the pills the value is

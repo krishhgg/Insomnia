@@ -10,11 +10,12 @@ are not exhaustive descriptions of the current code.
 
 ## Purpose
 
-Insomnia is a menu bar app for timed awake sessions on a MacBook, used on a
+Insomnia is a menu bar app for timed or unlimited awake sessions on a MacBook, used on a
 stable, well-ventilated surface. It must not be used to keep a Mac awake in a
 closed bag. Its design goals are to:
 
-1. Prevent lid-close sleep for a fixed, user-chosen duration. Never a toggle.
+1. Prevent lid-close sleep for a user-chosen timed or unlimited session.
+   Unlimited is an explicit immediate-start action, not a duration toggle.
 2. Reduce battery waste while the lid is closed without slowing the agents.
 3. Shorten Wi-Fi to hotspot handoffs so agent API retries succeed.
 4. Journal changes and support recovery after interruption, while reporting
@@ -62,7 +63,9 @@ closed bag. Its design goals are to:
 ```
 Session {
   startedAt:   Date
-  endsAt:      Date          // the only thing that keeps sleep disabled
+  mode:        timed | unlimited
+  endsAt:      Date?         // required for timed; no deadline for unlimited
+  owner:       process identity?  // required for unlimited recovery
   extendedBy:  [TimeInterval]
 }
 
@@ -93,14 +96,23 @@ recovery; newly written journals use `frozenProcesses`.
 
 ## Features
 
-### 1. Timed sessions (the only way to keep the Mac awake)
+### 1. Timed and unlimited sessions
 
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
-  Enter with empty fields uses the configured default preset. Maximum 30 days.
-- While active the menu bar shows a second-resolution countdown. The redraw
-  timer runs at 1 Hz and stops while the lid is closed.
-- Click the cup/countdown to enter an extension; hold the end control to end.
-  Right-click opens the status, browser actions, Settings, and Quit menu.
+  Enter with empty fields uses the configured default preset. Timed sessions
+  have a maximum of 30 days.
+- An ∞ button immediately after Minutes starts an unlimited session on click,
+  ignoring the numeric fields. It is an action, not a duration toggle.
+- While a timed session is active the menu bar shows a second-resolution
+  countdown. The redraw timer runs at 1 Hz and stops while the lid is closed.
+  Unlimited sessions show ∞ instead and have no expiry timer; existing
+  safety observations remain active.
+- Click the eye/countdown during a timed session to enter an extension, or
+  click ∞ in that entry to convert the running session without stopping it.
+  Failed conversion leaves the previous timed deadline intact.
+- Clicking a running ∞ does nothing. To return to timed mode, stop the
+  unlimited session and start a new timed session. Hold the end control to
+  end either mode. Right-click opens status, browser actions, Settings, and Quit.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
   the backstop is armed. If pmset fails, or `pmset -g` no longer reads
@@ -112,6 +124,11 @@ recovery; newly written journals use `frozenProcesses`.
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
 - Quitting Insomnia always ends the session. There is no "keep awake after quit".
+- Unlimited means no time limit, not bypassing manual end or configured battery
+  and thermal protections. After an unexpected exit the backstop attempts
+  restoration once it detects the owning process is gone. A later launch
+  cleans up rather than resumes the interrupted unlimited session. Recovery
+  is periodic and may fail; it is not an instantaneous guarantee.
 
 ### 2. Sleep guard and root access
 
@@ -777,13 +794,17 @@ provided by the standalone backstop. Performance effects depend on workload.
 
 Invariants:
 
-- Sleep is never disabled unless a session file with a future `endsAt` exists.
+- Sleep is never disabled unless a valid session file exists: a timed session
+  requires a future `endsAt`; an unlimited session requires an explicit mode
+  and a live matching owning process identity. A missing legacy deadline is
+  malformed data, never an unlimited session.
 - Every change Insomnia makes is in RuntimeState before it is made, and is
   undone from RuntimeState, never from memory.
 
 Reconcile runs at every Insomnia launch:
 
-1. Session file missing or expired → restore journaled changes: sleep,
+1. Session file missing, expired, or an interrupted unlimited session →
+   restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, saved audio, and
    recorded App Nap values.
    Unverified entries and failed restoration remain unresolved, not successful.
@@ -792,8 +813,11 @@ Reconcile runs at every Insomnia launch:
    overwriting an earlier copy), the user is told where, and the journal is
    restored as with no session. `backstop.sh` does the same once the journal
    is clean. A session file that decodes as JSON but lacks a key or type
-   the `Session` decoder needs (`startedAt`, `endsAt`, `extensions`) is not
-   a session either; `backstop.sh` checks the same keys and types. The app
+   the `Session` decoder needs (`startedAt`, `extensions`, and a deadline
+   for timed sessions or a valid owner identity for explicit unlimited mode)
+   is not a session either; `backstop.sh` checks the same keys and types.
+   Legacy timed sessions remain readable; unknown modes or missing legacy
+   deadlines do not authorize unlimited operation. The app
    and both scripts read a date in one form only: `2027-01-15T08:00:00Z`,
    as Store writes it, or the same with an offset such as `+02:00` in place
    of `Z`, in whole seconds, naming a date and time that exist, years 1970
@@ -816,7 +840,7 @@ Reconcile runs at every Insomnia launch:
    the folder. `backstop.sh` tries the rename again on every run.
    An unreadable journal still refuses every transaction and leaves both
    files in place.
-2. Session valid → establish the independent recovery agent before reapplying
+2. Timed session valid and unexpired → establish the independent recovery agent before reapplying
    the sleep guard, then resume observers. If the lid is open, restore recorded
    lid-close actions. Arming or restoration errors must remain visible.
 3. `pmset -g` reports `SleepDisabled 1` with no session and no journal
@@ -844,8 +868,11 @@ journal and owes no check.
 
 Backstop, independent of the app:
 
-- The agent reads the saved deadline; recurring recovery checks avoid replacing
-  the loaded job for every extension and allow retries after a failure.
+- The agent reads the saved deadline for timed sessions and validates the
+  recorded owning process identity for unlimited sessions. Recurring recovery
+  checks avoid replacing the loaded job for every extension and allow retries
+  after a failure. A dead or mismatched unlimited owner triggers cleanup,
+  rather than waiting for a deadline; normal launch never resumes that mode.
 - Between sessions the agent's run ends early. With no `session.json` and a
   `state.json` that is exactly the clean journal the app writes,
   `backstop.sh` exits 0 before the lock and without `plutil`. Any other
@@ -1127,7 +1154,7 @@ along the menu bar: three pill fields spring out to the right of the icon,
 one after another with a short stagger.
 
 ```
-☕  ( Days ? ) ( Hours ? ) ( Minutes ? )
+☕  ( Days ? ) ( Hours ? ) ( Minutes ? ) ( ∞ )
 ```
 
 - Days · Hours · Minutes rather than the reference's Hours · Minutes · Seconds.
@@ -1142,9 +1169,11 @@ one after another with a short stagger.
   from the original design. Empty-field Enter starts the default preset.
 
 **Running state.** On Enter the pills collapse and morph into a compact
-second-resolution countdown next to the icon. Clicking the cup or countdown
-opens inline duration entry for an extension. Hold the end control to end the
-session. The right-click menu contains status lines (lid, watts, Wi-Fi, frozen
+second-resolution countdown next to the icon. Clicking ∞ starts immediately
+and shows ∞ instead of a countdown. Clicking the eye or numeric countdown
+opens inline duration entry for an extension or conversion to unlimited.
+Clicking a running ∞ or its eye does not open entry. Hold the end control to
+end either mode. The right-click menu contains status lines (lid, watts, Wi-Fi, frozen
 apps, Docker), browser relaunch actions, Settings, and Quit.
 
 Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
@@ -1214,8 +1243,8 @@ transitions. If it feels like a web dropdown, it is wrong.
 | battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
-| session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
-| countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
+| session deadline | timed sessions: one in-app timer plus independent launchd recovery; unlimited: owner-aware recovery only | recovery checks may wake periodically |
+| countdown redraw | timed sessions: 1 Hz timer, stopped while lid closed; unlimited: static ∞ | one wake per second while timed, active and visible |
 | hotspot retry | only during an outage | none otherwise |
 
 ## Repository layout

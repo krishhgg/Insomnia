@@ -24,13 +24,13 @@ enum SessionMath {
     /// Push `endsAt` out by `extra` seconds, never past `now + maxDuration`.
     /// Extending an already-expired session restarts the countdown from `now`.
     static func extended(_ session: Session, by extra: TimeInterval, now: Date, maxDuration: TimeInterval) -> Session {
-        let base = max(session.endsAt, now)
+        guard let deadline = session.endsAt else { return session }
+        let base = max(deadline, now)
         let ceiling = now.addingTimeInterval(max(maxDuration, minimumDuration))
         let proposed = base.addingTimeInterval(max(extra, 0))
         let newEnd = min(proposed, ceiling)
         var s = session
-        s.extensions.append(newEnd.timeIntervalSince(session.endsAt))
-        s.endsAt = newEnd
+        s.extendDeadline(to: newEnd)
         return s
     }
 

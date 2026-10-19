@@ -1167,6 +1167,15 @@ final class SessionManager {
     /// undone from the journal like an end, and the journal keeps the entry
     /// until that undo is confirmed.
     func start(duration: TimeInterval) async {
+        await requestStart(duration: duration)
+    }
+
+    /// Start without a deadline; the recovery helper watches this app's ownership.
+    func startUnlimited() async {
+        await requestStart(duration: nil)
+    }
+
+    private func requestStart(duration: TimeInterval?) async {
         guard !quitRequested else {
             Log.info("start ignored: quit requested")
             return
@@ -1182,7 +1191,7 @@ final class SessionManager {
         await settleEarlierCommand()
     }
 
-    private func performStart(duration: TimeInterval, ticket: Int) async {
+    private func performStart(duration: TimeInterval?, ticket: Int) async {
         guard session == nil else {
             Log.info("start ignored: session already active")
             return
@@ -1192,7 +1201,17 @@ final class SessionManager {
             return
         }
         let now = clock()
-        let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        let new: Session
+        if let duration {
+            new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
+        } else {
+            do {
+                new = try ownedUnlimitedSession(startedAt: now)
+            } catch {
+                fail("could not identify unlimited owner: \(error.localizedDescription)")
+                return
+            }
+        }
         // What was on disk before this attempt, read under the lock. A
         // rollback puts exactly this back: an entry an earlier failed restore
         // left behind is evidence, not something this start may clear.
@@ -1260,12 +1279,50 @@ final class SessionManager {
         lastError = nil
         countdownPaused = clamshell() == true
         foreignSleepWarning = nil
-        Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
+        if let deadline = new.endsAt, let duration {
+            Log.info("session started until \(iso(deadline)) (\(Int(duration))s requested)")
+        } else {
+            Log.info("unlimited session started")
+        }
         await armDeadline(new.endsAt)
         applyAppNapInJournal()
         // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
+    }
+
+    /// Convert a confirmed timed session without dropping sleep ownership.
+    /// Confirmation and persistence must both succeed before replacing its deadline.
+    func makeUnlimited() async {
+        guard let current = session, !current.isUnlimited, pendingEnd == nil, !quitRequested else { return }
+        let ticket = endTicket
+        _ = await exclusive("make unlimited") {
+            guard self.session == current, self.endTicket == ticket else { return }
+            do {
+                try await self.backstop.arm()
+            } catch {
+                self.fail("could not confirm backstop: \(error.localizedDescription)")
+                return
+            }
+            guard self.endTicket == ticket, self.session == current else { return }
+            let updated: Session
+            do {
+                updated = try self.ownedUnlimitedSession(startedAt: current.startedAt, extensions: current.extensions)
+            } catch {
+                self.fail("could not identify unlimited owner: \(error.localizedDescription)")
+                return
+            }
+            do {
+                try self.store.saveSession(updated)
+            } catch {
+                self.fail("could not write session: \(error.localizedDescription)")
+                return
+            }
+            self.session = updated
+            self.lastError = nil
+            Log.info("session converted to unlimited")
+            await self.armDeadline(nil)
+        }
     }
 
     func extend(by extra: TimeInterval) async {
@@ -1275,7 +1332,7 @@ final class SessionManager {
     }
 
     private func performExtend(by extra: TimeInterval, ticket: Int) async {
-        guard let current = session, endTicket == ticket else { return }
+        guard let current = session, !current.isUnlimited, endTicket == ticket else { return }
         let updated = SessionMath.extended(current, by: extra, now: clock(), maxDuration: config.maxDuration)
         // The agent enforces whatever deadline is on disk; confirm it is
         // still loaded before moving that deadline out.
@@ -1297,7 +1354,9 @@ final class SessionManager {
         }
         session = updated
         lastError = nil
-        Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
+        if let deadline = updated.endsAt {
+            Log.info("session extended by \(Int(extra))s until \(iso(deadline))")
+        }
         await armDeadline(updated.endsAt)
     }
 
@@ -2610,7 +2669,7 @@ final class SessionManager {
             onDisk = nil
         }
 
-        if let s = onDisk, !s.isExpired(at: now) {
+        if let s = onDisk, let deadline = s.endsAt, !s.isExpired(at: now) {
             // Step 2: valid session. Arm first, then journal, then hold
             // sleep. Any failure ends the session rather than holding sleep
             // with nothing guaranteed to release it.
@@ -2645,7 +2704,7 @@ final class SessionManager {
                 _ = await performEnd(reason: .recoveryUnavailable)
                 return
             }
-            Log.info("reconcile: session valid until \(iso(s.endsAt))")
+            Log.info("reconcile: session valid until \(iso(deadline))")
             if !state.lowPowerSetByUs, state.displayRestoredUnderLowPower != nil {
                 dropDisplayWrite(reason: "the mode is not ours")
             }
@@ -2674,9 +2733,11 @@ final class SessionManager {
         // for one too, as on any other dirty journal.
         let savedOutputs = Set(state.savedAudioOutputs.map(\.deviceUID))
         let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
-        if onDisk != nil {
-            Log.info("reconcile: session expired, restoring")
-            if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
+        if let interrupted = onDisk {
+            Log.info(interrupted.isUnlimited
+                ? "reconcile: interrupted unlimited session, restoring instead of resuming"
+                : "reconcile: session expired, restoring")
+            if case .privilegedCommandRunning = await performEnd(reason: interrupted.isUnlimited ? .backstop : .timer) { return }
         } else if owesEnd {
             Log.info(keptSessionFile != nil
                 ? "reconcile: session.json kept in place, restoring the journal as for an expired session"
@@ -2885,6 +2946,11 @@ final class SessionManager {
             countdownText = ""
             return
         }
+        if s.isUnlimited {
+            remainingText = "∞"
+            countdownText = "∞"
+            return
+        }
         let remaining = s.remaining(at: clock())
         let minute = SessionMath.formatRemaining(remaining)
         if remainingText != minute { remainingText = minute }
@@ -2893,6 +2959,24 @@ final class SessionManager {
     }
 
     // MARK: Private
+
+    private func ownedUnlimitedSession(startedAt: Date, extensions: [TimeInterval] = []) throws -> Session {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        // libproc's PROC_PIDPATHINFO_MAXSIZE macro is 4 * MAXPATHLEN.
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else {
+            throw BackstopError(message: "the owning executable path could not be read")
+        }
+        let executable = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        let identity: ProcessIdentity
+        if case let .present(process) = SignalProcessControl.kernelState(pid: pid), !process.identity.bootSession.isEmpty {
+            identity = process.identity
+        } else {
+            throw BackstopError(message: "the owning process identity could not be read")
+        }
+        let owner = SessionOwner(pid: pid, identity: identity, executable: executable)
+        return Session(unlimitedStartedAt: startedAt, owner: owner, extensions: extensions)
+    }
 
     /// Undo the writes made at the top of `start` by restoring the journal
     /// and session file exactly as they were read under this transaction's
@@ -2916,9 +3000,16 @@ final class SessionManager {
 
     /// In-process timers only; the launchd agent is armed by callers before
     /// this runs.
-    private func armDeadline(_ endsAt: Date) async {
+    private func armDeadline(_ endsAt: Date?) async {
         deadlineTimer?.invalidate()
+        deadlineTimer = nil
         scheduledDeadline = endsAt
+        guard let endsAt else {
+            countdownTimer?.invalidate()
+            countdownTimer = nil
+            refreshCountdown()
+            return
+        }
         // One timer at the deadline. Fire dates in the past fire immediately.
         let timer = Timer(fire: endsAt, interval: 0, repeats: false) { [weak self] _ in
             Task { @MainActor in
@@ -2944,7 +3035,7 @@ final class SessionManager {
         // `resumeCountdown` covers every caller: a session that ends while the
         // lid is shut would otherwise leave lid-open arming a 1 Hz timer that
         // wakes the run loop forever to format an empty string.
-        guard session != nil else { return }
+        guard let session, !session.isUnlimited else { return }
         let first = SessionMath.nextSecondBoundary(after: clock())
         let timer = Timer(fire: first, interval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshCountdown() }
