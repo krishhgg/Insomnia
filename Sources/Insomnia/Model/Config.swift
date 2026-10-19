@@ -233,6 +233,20 @@ extension Config {
     /// gets its chance before the end.
     var floorsAreOrdered: Bool { endFloor == 0 || endFloor < lowPowerFloor }
 
+    /// The settings the floor rules read (`FloorRules.evaluate`). A change
+    /// to any of them during a session runs the floors at once
+    /// (`SessionManager.floorInputsChanged`).
+    struct FloorInputs: Equatable {
+        var lowPowerFloor: Int
+        var endFloor: Int
+        var thermalRules: Bool
+        var lowPowerOnLidClose: Bool
+    }
+
+    var floorInputs: FloorInputs {
+        FloorInputs(lowPowerFloor: lowPowerFloor, endFloor: endFloor, thermalRules: thermalRules, lowPowerOnLidClose: lowPowerOnLidClose)
+    }
+
     /// Sets the end floor (0...`maxEndFloor`) and raises the Low Power Mode
     /// floor one step above it when it would otherwise not be above it.
     mutating func setEndFloor(_ value: Int) {

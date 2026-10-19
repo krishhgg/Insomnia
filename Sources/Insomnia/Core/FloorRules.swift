@@ -17,7 +17,9 @@ enum FloorRules {
         case endSession(EndReason)
     }
 
-    /// Ordered actions for the current inputs.
+    /// Ordered actions for the current inputs. `hot` says the thermal state
+    /// read serious or critical earlier in the session and has not read
+    /// nominal since (`FloorRuleDriver` keeps it).
     ///
     /// - battery below `endFloor` while not charging: end session. 0 never
     ///   matches, so 0 turns the battery end off; Config keeps a non-zero
@@ -28,14 +30,15 @@ enum FloorRules {
     ///   applied to a level nobody can read, and the Mac is on a battery
     ///   that may be about to die. A desktop has no battery and no floor.
     /// - battery below `lowPowerFloor` while not charging, thermal
-    ///   `serious` (if `thermalRules`), or lid closed (if
-    ///   `lowPowerOnLidClose`, charging or not): Low Power Mode on
+    ///   `serious` or still `hot` at `fair` (if `thermalRules`), or lid
+    ///   closed (if `lowPowerOnLidClose`, charging or not): Low Power Mode on
     /// - none of the above while we set Low Power Mode: Low Power Mode off
-    ///   ("charger connected", "thermal back to nominal/fair", "lid opened")
+    ///   ("charger connected", "thermal back to nominal", "lid opened")
     static func evaluate(
         battery: BatteryStatus,
         isCharging: Bool,
         thermal: ProcessInfo.ThermalState,
+        hot: Bool,
         lidClosed: Bool,
         lowPowerSetByUs: Bool,
         config: Config
@@ -51,7 +54,7 @@ enum FloorRules {
         if case let .unreadable(misses) = battery, onBattery, misses >= 2, config.endFloor > 0 {
             return [.endSession(.batteryUnreadable)]
         }
-        let cause = lowPowerCause(percent: percent, isCharging: isCharging, thermal: thermal, lidClosed: lidClosed, config: config)
+        let cause = lowPowerCause(percent: percent, isCharging: isCharging, thermal: thermal, hot: hot, lidClosed: lidClosed, config: config)
         if let cause, !lowPowerSetByUs { return [.enableLowPower(cause)] }
         if cause == nil, lowPowerSetByUs { return [.disableLowPower] }
         return []
@@ -61,14 +64,20 @@ enum FloorRules {
     /// then battery, then lid), or nil when none holds. Independent of
     /// whether the mode is already on, so the driver can track which cause
     /// is keeping it on as the inputs change.
+    ///
+    /// The thermal cause holds at serious, and at fair while the Mac is
+    /// still `hot`: switching the mode off at the first step down brings
+    /// back the load that made it serious, and the mode goes on and off
+    /// as the Mac heats up and cools down again.
     static func lowPowerCause(
         percent: Int?,
         isCharging: Bool,
         thermal: ProcessInfo.ThermalState,
+        hot: Bool,
         lidClosed: Bool,
         config: Config
     ) -> LowPowerCause? {
-        if config.thermalRules, thermal == .serious { return .thermal }
+        if config.thermalRules, thermal == .serious || (hot && thermal == .fair) { return .thermal }
         if let p = percent, !isCharging, p < config.lowPowerFloor { return .battery }
         if lidClosed, config.lowPowerOnLidClose { return .lid }
         return nil
@@ -93,10 +102,30 @@ struct FloorRuleDriver {
     /// so the matching disable knows whether it is announced. Not
     /// journaled: after a relaunch the disable is announced as before.
     private let lastCause = LastCause()
+    /// Whether the runs of this session have read serious or critical with
+    /// no nominal since (`FloorRules.evaluate`'s `hot`). Not journaled:
+    /// after a relaunch a Mac at fair counts as cooled down.
+    private let heatLog = HeatLog()
 
     @MainActor
     private final class LastCause {
         var value: FloorRules.LowPowerCause?
+    }
+
+    @MainActor
+    private final class HeatLog {
+        var hot = false
+
+        /// Records the state a run reads and returns whether the Mac
+        /// counts as hot for that run.
+        func read(_ thermal: ProcessInfo.ThermalState) -> Bool {
+            switch thermal {
+            case .serious, .critical: hot = true
+            case .nominal: hot = false
+            default: break
+            }
+            return hot
+        }
     }
 
     init(manager: SessionManager, notifier: any Notifying) {
@@ -108,10 +137,12 @@ struct FloorRuleDriver {
         guard let manager, manager.isActive, !Task.isCancelled else { return }
         let config = manager.config
         let percent = battery.percent
+        let hot = heatLog.read(thermal)
         let actions = FloorRules.evaluate(
             battery: battery,
             isCharging: isCharging,
             thermal: thermal,
+            hot: hot,
             lidClosed: lidClosed,
             lowPowerSetByUs: manager.state.lowPowerSetByUs,
             config: config
@@ -119,7 +150,7 @@ struct FloorRuleDriver {
         // Track the effective cause while the mode is ours, not only at the
         // enable: another cause may have taken over since.
         if manager.state.lowPowerSetByUs,
-           let cause = FloorRules.lowPowerCause(percent: percent, isCharging: isCharging, thermal: thermal, lidClosed: lidClosed, config: config) {
+           let cause = FloorRules.lowPowerCause(percent: percent, isCharging: isCharging, thermal: thermal, hot: hot, lidClosed: lidClosed, config: config) {
             lastCause.value = cause
         }
         for action in actions {
@@ -131,7 +162,7 @@ struct FloorRuleDriver {
                 guard manager.isActive, !Task.isCancelled else { return }
                 switch cause {
                 case .thermal:
-                    notifier.post(title: "Low Power Mode on", body: "Thermal state is serious. Low Power Mode is on until it cools down.")
+                    notifier.post(title: "Low Power Mode on", body: "Thermal state is \(PowerMonitor.name(thermal)). Low Power Mode stays on until it is back to nominal.")
                 case .battery:
                     notifier.post(title: "Low Power Mode on", body: "Battery at \(percent ?? 0)%, below the \(config.lowPowerFloor)% floor.")
                 case .lid:
@@ -142,9 +173,12 @@ struct FloorRuleDriver {
                     let cause = lastCause.value
                     lastCause.value = nil
                     guard manager.isActive, !Task.isCancelled else { return }
-                    if cause == .lid {
+                    switch cause {
+                    case .lid:
                         Log.info("low power mode off (lid opened)")
-                    } else {
+                    case .thermal:
+                        notifier.post(title: "Low Power Mode off", body: config.thermalRules ? "Thermal state is back to \(PowerMonitor.name(thermal))." : "Thermal rules are off.")
+                    case .battery, nil:
                         notifier.post(title: "Low Power Mode off", body: isCharging ? "Charger connected." : "Back above the floor.")
                     }
                 }

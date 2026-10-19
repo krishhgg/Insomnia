@@ -2,13 +2,14 @@ import XCTest
 @testable import Insomnia
 
 final class FloorRulesTests: XCTestCase {
-    /// nil is a machine with no battery (desktop).
-    func eval(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
-        eval(battery: percent.map { .percent($0) } ?? .none, charging: charging, thermal: thermal, lid: lid, lp: lp, config: config)
+    /// nil is a machine with no battery (desktop). `hot`: serious or
+    /// critical read earlier in the session, with no nominal since.
+    func eval(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
+        eval(battery: percent.map { .percent($0) } ?? .none, charging: charging, thermal: thermal, hot: hot, lid: lid, lp: lp, config: config)
     }
 
-    func eval(battery: BatteryStatus, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
-        FloorRules.evaluate(battery: battery, isCharging: charging, thermal: thermal, lidClosed: lid, lowPowerSetByUs: lp, config: config)
+    func eval(battery: BatteryStatus, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
+        FloorRules.evaluate(battery: battery, isCharging: charging, thermal: thermal, hot: hot, lidClosed: lid, lowPowerSetByUs: lp, config: config)
     }
 
     // Row 1: battery below lowPowerFloor -> lowpowermode 1
@@ -46,9 +47,24 @@ final class FloorRulesTests: XCTestCase {
         XCTAssertEqual(eval(80, thermal: .serious, lp: true), [])
     }
 
-    func testThermalBackToNominalOrFairClearsLowPower() {
+    func testThermalBackToNominalClearsLowPower() {
         XCTAssertEqual(eval(80, thermal: .nominal, lp: true), [.disableLowPower])
+        // Fair with no serious before it in this session is not heat.
         XCTAssertEqual(eval(80, thermal: .fair, lp: true), [.disableLowPower])
+    }
+
+    /// A Mac back at fair after serious is still cooling down: the mode
+    /// stays on, and is switched on if it is not ours yet, until nominal.
+    /// Off at the first step down, the load that made the Mac serious
+    /// comes back and the mode goes on and off as it heats up again.
+    func testFairAfterSeriousKeepsLowPowerUntilNominal() {
+        XCTAssertEqual(eval(80, thermal: .fair, hot: true, lp: true), [])
+        XCTAssertEqual(eval(80, charging: true, thermal: .fair, hot: true, lp: true), [])
+        XCTAssertEqual(eval(80, thermal: .fair, hot: true), [.enableLowPower(.thermal)])
+        XCTAssertEqual(eval(80, thermal: .nominal, hot: true, lp: true), [.disableLowPower])
+        var off = Config()
+        off.thermalRules = false
+        XCTAssertEqual(eval(80, thermal: .fair, hot: true, lp: true, config: off), [.disableLowPower])
     }
 
     // Row 4: thermal critical -> end session
@@ -172,8 +188,8 @@ final class FloorRulesTests: XCTestCase {
         XCTAssertEqual(eval(80, thermal: .serious, lid: true), [.enableLowPower(.thermal)])
     }
 
-    func cause(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, config: Config = Config()) -> FloorRules.LowPowerCause? {
-        FloorRules.lowPowerCause(percent: percent, isCharging: charging, thermal: thermal, lidClosed: lid, config: config)
+    func cause(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, lid: Bool = false, config: Config = Config()) -> FloorRules.LowPowerCause? {
+        FloorRules.lowPowerCause(percent: percent, isCharging: charging, thermal: thermal, hot: hot, lidClosed: lid, config: config)
     }
 
     /// The effective cause is the strongest one holding right now, whether
@@ -187,6 +203,9 @@ final class FloorRulesTests: XCTestCase {
         XCTAssertEqual(cause(35, lid: true), .battery)
         XCTAssertEqual(cause(35, charging: true, lid: true), .lid)
         XCTAssertEqual(cause(35, thermal: .serious, lid: true), .thermal)
+        XCTAssertEqual(cause(35, thermal: .fair, hot: true, lid: true), .thermal)
+        XCTAssertNil(cause(80, thermal: .fair))
+        XCTAssertNil(cause(80, thermal: .nominal, hot: true))
     }
 
     func testLowPowerCauseHonorsTheOptions() {
@@ -194,6 +213,7 @@ final class FloorRulesTests: XCTestCase {
         c.lowPowerOnLidClose = false
         c.thermalRules = false
         XCTAssertNil(cause(80, thermal: .serious, lid: true, config: c))
+        XCTAssertNil(cause(80, thermal: .fair, hot: true, config: c))
         XCTAssertEqual(cause(35, thermal: .serious, lid: true, config: c), .battery)
     }
 }
@@ -518,7 +538,8 @@ final class FloorRuleDriverTests: XCTestCase {
     }
 
     /// The thermal cause is tracked the same way: lid enable, thermal
-    /// takes over, lid opens (thermal holds), cools down: announced.
+    /// takes over, lid opens (thermal holds), cools down to fair (still
+    /// holds), then to nominal: announced as the cooldown it is.
     func testThermalTakeoverThenLidOpenAnnouncesTheCooldown() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
@@ -530,9 +551,121 @@ final class FloorRuleDriverTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.count, 0)
 
         await driver.run(battery: .percent(80), isCharging: false, thermal: .fair, lidClosed: false)
+        XCTAssertTrue(h.guardFake.lowPowerOn, "the mode went off while the Mac was still cooling down")
+        XCTAssertEqual(h.notifier.posts.count, 0)
+
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .nominal, lidClosed: false)
         XCTAssertFalse(h.guardFake.lowPowerOn)
         XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode off")
-        XCTAssertEqual(h.notifier.posts.last?.body, "Back above the floor.")
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state is back to nominal.")
+    }
+
+    /// Heat with the lid open: the mode goes on once at serious and stays
+    /// on through fair and a second serious, so it does not cycle, and goes
+    /// off at nominal. A fair later in the session, with no serious before
+    /// it since nominal, holds nothing.
+    func testHeatLowPowerStaysOnUntilNominalWithoutCycling() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode on")
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state is serious. Low Power Mode stays on until it is back to nominal.")
+
+        for thermal in [ProcessInfo.ThermalState.fair, .serious, .fair] {
+            await driver.run(battery: .percent(80), isCharging: true, thermal: thermal, lidClosed: false)
+            XCTAssertTrue(h.guardFake.lowPowerOn, "off at \(PowerMonitor.name(thermal))")
+        }
+        XCTAssertEqual(h.guardFake.calls.filter { $0.hasPrefix("lowpowermode") }, ["lowpowermode 1"])
+        XCTAssertEqual(h.notifier.posts.count, 1)
+
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .nominal, lidClosed: false)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state is back to nominal.")
+
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .fair, lidClosed: false)
+        XCTAssertFalse(h.guardFake.lowPowerOn, "fair with no serious since nominal switched the mode on")
+    }
+
+    /// Thermal rules turned off while the mode is on for heat: the next run
+    /// (Settings queues one) switches it off and says why.
+    func testTurningTheThermalRulesOffReleasesHeatLowPowerAndSaysWhy() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: false)
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+
+        m.config.thermalRules = false
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: false)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        XCTAssertEqual(h.notifier.posts.last?.title, "Low Power Mode off")
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal rules are off.")
+        XCTAssertTrue(m.isActive)
+    }
+
+    /// Settings writes through `manager.config`. A change to a floor input
+    /// asks for a floor run at once (`AppServices` points the hook at
+    /// `reevaluateFloors()`), and no other change does.
+    func testAFloorInputChangeAsksForAFloorRunAtOnce() async throws {
+        let m = h.makeManager()
+        var asked = 0
+        m.floorInputsChanged = { asked += 1 }
+
+        m.config.setLowPowerFloor(50)
+        m.config.setEndFloor(20)
+        m.config.thermalRules = false
+        m.config.lowPowerOnLidClose = false
+        XCTAssertEqual(asked, 4)
+
+        m.config.hotspotSSID = "iPhone"
+        m.config.presets = [600]
+        m.config.muteOnLidClose = false
+        m.config.setLowPowerFloor(50)
+        XCTAssertEqual(asked, 4, "a change that is not a floor input, or no change, ran the floors")
+    }
+
+    /// The same path during a session, with the hook wired as `AppServices`
+    /// wires it: each change runs the floors on inputs that have not moved,
+    /// with no battery, thermal or lid event, and its effect is in the
+    /// power calls, the journal and the session.
+    func testSettingsChangesApplyWithoutAPowerEvent() async throws {
+        let m = h.makeManager()
+        m.config.thermalRules = false
+        await m.start(duration: 3600)
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        var runs: [Task<Void, Never>] = []
+        m.floorInputsChanged = {
+            let previous = runs.last
+            runs.append(Task { @MainActor in
+                await previous?.value
+                await driver.run(battery: .percent(45), isCharging: false, thermal: .serious, lidClosed: false)
+            })
+        }
+        func settle() async { for run in runs { await run.value } }
+
+        m.config.thermalRules = true
+        await settle()
+        XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 1", "turning the thermal rules on did not apply at once")
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, true)
+
+        m.config.thermalRules = false
+        await settle()
+        XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 0")
+        XCTAssertEqual(try h.store.loadState()?.lowPowerSetByUs, false)
+
+        m.config.setLowPowerFloor(50)
+        await settle()
+        XCTAssertEqual(h.guardFake.calls.last, "lowpowermode 1", "a Low Power Mode floor raised above the charge did not apply at once")
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("below the 50% floor") ?? false)
+
+        m.config.setEndFloor(50)
+        await settle()
+        XCTAssertFalse(m.isActive, "an end floor raised above the charge did not end the session at once")
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
     /// Flipping the lid option while the lid is closed takes effect on the
