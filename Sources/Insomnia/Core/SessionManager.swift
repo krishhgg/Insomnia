@@ -98,7 +98,8 @@ final class SessionManager {
     var config: Config
     /// Minute-granularity remaining time for the popover ("2h 14m").
     private(set) var remainingText: String = ""
-    /// Live `H:MM:SS` countdown for the status item, updated at 1 Hz.
+    /// Countdown text for the status item: `H:MM:SS` updated at 1 Hz, or the
+    /// end time (`Config.countdownStyle`).
     private(set) var countdownText: String = ""
 
     /// Why the display or the keyboard backlight is left alone on lid close
@@ -2876,6 +2877,13 @@ final class SessionManager {
         armCountdownTimer()
     }
 
+    /// Settings calls this when the countdown style changes, so a running
+    /// session reads the new one now and gets or loses its tick with it.
+    func countdownStyleChanged() {
+        refreshCountdown()
+        if !countdownPaused { armCountdownTimer() }
+    }
+
     /// Recompute `remainingText` and `countdownText` from the injected clock.
     /// Each is only assigned when it changes, so observers are not woken every
     /// second for the minute-granularity text.
@@ -2885,10 +2893,10 @@ final class SessionManager {
             countdownText = ""
             return
         }
-        let remaining = s.remaining(at: clock())
-        let minute = SessionMath.formatRemaining(remaining)
+        let now = clock()
+        let minute = SessionMath.formatRemaining(s.remaining(at: now))
         if remainingText != minute { remainingText = minute }
-        let second = SessionMath.formatCountdown(remaining: remaining, shape: s.countdownShape)
+        let second = SessionMath.countdownText(endsAt: s.endsAt, shape: s.countdownShape, style: config.countdownStyle, now: now)
         if countdownText != second { countdownText = second }
     }
 
@@ -2945,6 +2953,8 @@ final class SessionManager {
         // lid is shut would otherwise leave lid-open arming a 1 Hz timer that
         // wakes the run loop forever to format an empty string.
         guard session != nil else { return }
+        // The end time changes only with the session, so it has no tick.
+        guard config.countdownStyle == .remaining else { return }
         let first = SessionMath.nextSecondBoundary(after: clock())
         let timer = Timer(fire: first, interval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshCountdown() }

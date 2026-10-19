@@ -250,6 +250,11 @@ below cover what only a real Mac shows.
   10 s, then sample `ps -o %cpu= -p <pid>` every 0.5 s for 20 s. The mean
   stays under about 5%, and the countdown still changes every second. It read
   about 46% before the countdown stopped animating its digits
+- With Countdown set to End time in Settings, a running session shows its end
+  time in the bar, the right-click menu has a Time left line, and switching
+  the setting while the session runs changes the bar at once. Start a
+  session, wait 10 s, then sample `ps -o %cpu= -p <pid>` every 0.5 s for 20 s:
+  the mean stays near zero (under about 0.1%)
 
 ### Lid close
 

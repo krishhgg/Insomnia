@@ -569,4 +569,31 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual(c.defaultFocusField, .hours)
         XCTAssertEqual(c.endFloor, 15, "one bad value must not throw the whole config away")
     }
+
+    // MARK: Countdown style
+
+    func testTheDefaultCountdownStyleIsRemaining() {
+        XCTAssertEqual(Config().countdownStyle, .remaining)
+    }
+
+    func testAConfigFromAnEarlierBuildKeepsTheRemainingCountdown() throws {
+        XCTAssertEqual(try decode("{}").countdownStyle, .remaining)
+    }
+
+    func testTheCountdownStyleIsSavedByName() throws {
+        for style in CountdownStyle.allCases {
+            var c = Config()
+            c.countdownStyle = style
+            let data = try JSONEncoder().encode(c)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(json["countdownStyle"] as? String, "\(style)")
+            XCTAssertEqual(try JSONDecoder().decode(Config.self, from: data).countdownStyle, style)
+        }
+    }
+
+    func testAnUnknownCountdownStyleFallsBackToRemainingAndKeepsTheRestOfTheConfig() throws {
+        let c = try decode(#"{"countdownStyle": "minutes", "endFloor": 15}"#)
+        XCTAssertEqual(c.countdownStyle, .remaining)
+        XCTAssertEqual(c.endFloor, 15, "one bad value must not throw the whole config away")
+    }
 }

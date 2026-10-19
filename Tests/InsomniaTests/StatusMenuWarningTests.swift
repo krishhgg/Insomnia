@@ -168,4 +168,16 @@ final class StatusMenuWarningTests: XCTestCase {
         let closed = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], relaunchProblems: [problem], error: nil)
         XCTAssertEqual(closed.filter { $0.kind == .warning }.map(\.title), ["\u{26A0} \(problem)"])
     }
+
+    func testTheMenuShowsTimeLeftWhileASessionIsActive() {
+        let items = StatusMenu.items(sessionActive: true, sleepHeld: true, machine: nil, actions: nil, throttledBrowsers: [], error: nil, remaining: "2h 14m")
+        XCTAssertEqual(items.map(\.kind), [.info, .info, .separator, .settings, .quit])
+        XCTAssertEqual(items[0].title, "Sleep held per journal \u{2014} not verified live")
+        XCTAssertEqual(items[1].title, "Time left: 2h 14m")
+    }
+
+    func testTheMenuHasNoTimeLeftLineWithoutASession() {
+        let items = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, remaining: "2h 14m")
+        XCTAssertEqual(items.map(\.kind), [.settings, .quit])
+    }
 }
