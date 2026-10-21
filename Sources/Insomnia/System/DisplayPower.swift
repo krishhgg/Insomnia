@@ -32,10 +32,15 @@ protocol DisplayDimming: Sendable {
     /// not measured on, a framework that could not be loaded), or nil when
     /// the calls run. Shown in Settings next to the darken toggle.
     func refusal() -> String?
+    /// Whether the built-in display is online. It is not under a lid closed
+    /// with an external display connected, nor once that display is
+    /// unplugged: macOS keeps the panel off then.
+    var builtInIsOnline: Bool { get }
 }
 
 extension DisplayDimming {
     func refusal() -> String? { nil }
+    var builtInIsOnline: Bool { true }
 }
 
 /// Built-in keyboard backlight. Setting the display to 0 does not switch it
@@ -282,6 +287,15 @@ final class DisplayServicesDimmer: DisplayDimming, @unchecked Sendable {
             throw DisplayPowerError(what: "display \(display) cannot change brightness")
         }
         return display
+    }
+
+    /// A list that cannot be read counts as online, so a close still
+    /// darkens.
+    var builtInIsOnline: Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count) == .success else { return true }
+        return ids.prefix(Int(count)).contains { CGDisplayIsBuiltin($0) != 0 }
     }
 
     private static func builtInDisplayID() -> CGDirectDisplayID {

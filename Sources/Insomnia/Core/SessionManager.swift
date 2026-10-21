@@ -374,6 +374,8 @@ final class SessionManager {
     private let appNap: any AppNapPreferencing
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
+    /// The lid is closed at a desk (`LidReading.closedAtDesk`).
+    private let lidAtDesk: @Sendable () -> Bool
     private let clock: @Sendable () -> Date
     /// What the process table says a pid is now. Read only, to tell whether
     /// a recorded command is still running (`recordedLockHolder`).
@@ -449,8 +451,12 @@ final class SessionManager {
     /// reads then: the lid observer reports changes only, so a session that
     /// starts under a closed lid gets no close call to pause it, and one
     /// that starts after an end with the lid shut must not inherit that
-    /// session's pause. Every end clears it.
+    /// session's pause. A lid closed at a desk (`LidReading.closedAtDesk`)
+    /// reads open then. Every end clears it.
     @ObservationIgnored private var countdownPaused = false
+    /// Whether the session takes the lid as closed: set when it becomes
+    /// active and by each lid event since. The lid observer starts from it.
+    var lidTakenAsClosed: Bool { countdownPaused }
 
     /// Counts end requests. Start, extend and Low Power changes capture it
     /// when requested and compare after each await, so an end that arrived
@@ -541,6 +547,7 @@ final class SessionManager {
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
+        lidAtDesk: @escaping @Sendable () -> Bool = { LidObserver.readLid() == .closedAtDesk },
         clock: @escaping @Sendable () -> Date = { Date() },
         processLookup: @escaping @Sendable (Int32) -> ProcessLookup = { SignalProcessControl.processTableState(pid: $0) },
         recoveryLockTimeout: TimeInterval = 10,
@@ -562,6 +569,7 @@ final class SessionManager {
         self.appNap = appNap
         self.notifier = notifier
         self.clamshell = clamshell
+        self.lidAtDesk = lidAtDesk
         self.clock = clock
         self.processLookup = processLookup
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
@@ -1258,7 +1266,9 @@ final class SessionManager {
 
         session = new
         lastError = nil
-        countdownPaused = clamshell() == true
+        // A lid closed at a desk counts as open: the countdown is on the
+        // external display, and nothing has been done for a close.
+        countdownPaused = clamshell() == true && !lidAtDesk()
         foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
@@ -2658,7 +2668,9 @@ final class SessionManager {
             } else if state.hasLidActions {
                 Log.info("reconcile: lid \(lidClosed == nil ? "unknown" : "closed"), keeping lid-close actions")
             }
-            countdownPaused = lidClosed == true
+            // A lid closed at a desk counts as open, unless the lid-close
+            // actions kept above show the lid closed for this session.
+            countdownPaused = lidClosed == true && (!lidAtDesk() || state.hasLidActions)
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
             services?.start(for: self)

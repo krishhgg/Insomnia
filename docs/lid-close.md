@@ -13,6 +13,13 @@ starts right away. **The timer keeps counting down while the lid is
 closed**; only its on-screen redraw pauses, also for a session started with
 the lid already closed.
 
+A MacBook used closed on an external display is in use at a desk, so
+Insomnia does not act on that lid: the countdown keeps running and nothing
+is paused, muted or darkened. Unplug the display and the lid actions run
+then, apart from the darkening, which macOS already does under that lid;
+plug it in again and they are undone. A lid that closed in a bag stays
+closed for Insomnia when you plug in a display, until you open it.
+
 ## Display and keyboard backlight
 
 The display step exists because the sleep guard stops macOS from doing it:

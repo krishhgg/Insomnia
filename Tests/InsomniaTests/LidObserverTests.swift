@@ -10,7 +10,7 @@ import XCTest
 @MainActor
 final class LidObserverTests: XCTestCase {
     private let debounce: TimeInterval = 0.05
-    private var reading: Bool? = false
+    private var reading: LidReading? = .open
     private var events: [String] = []
 
     private func makeObserver() -> LidObserver {
@@ -56,7 +56,7 @@ final class LidObserverTests: XCTestCase {
 
     func testWaiterRunsAfterTheDeliveryOfAPendingChange() async {
         let observer = makeObserver()
-        reading = true
+        reading = .closed
         observer.handleInterest()
 
         observer.whenSettled(waiter())
@@ -68,11 +68,11 @@ final class LidObserverTests: XCTestCase {
 
     func testWaiterRunsWhenThePendingChangeFlapsBack() async {
         let observer = makeObserver()
-        reading = true
+        reading = .closed
         observer.handleInterest()
         observer.whenSettled(waiter())
 
-        reading = false
+        reading = .open
         observer.handleInterest()
 
         XCTAssertEqual(events, ["settled false"])
@@ -84,11 +84,11 @@ final class LidObserverTests: XCTestCase {
     /// where it was and drops the change.
     func testWaiterRunsWhenTheChangeHasFlappedByTheDeadline() async {
         let observer = makeObserver()
-        reading = true
+        reading = .closed
         observer.handleInterest()
         observer.whenSettled(waiter())
 
-        reading = false
+        reading = .open
         await waitUntil("the debounce never settled") { !events.isEmpty }
 
         XCTAssertEqual(events, ["settled false"])
@@ -96,7 +96,7 @@ final class LidObserverTests: XCTestCase {
 
     func testNewerWaiterReplacesTheOlder() async {
         let observer = makeObserver()
-        reading = true
+        reading = .closed
         observer.handleInterest()
 
         observer.whenSettled(waiter("first"))
@@ -106,11 +106,120 @@ final class LidObserverTests: XCTestCase {
         XCTAssertEqual(events, ["change true", "second true"])
     }
 
+    func testAClosedLidIsAtADeskOnlyWithAnExternalDisplay() {
+        XCTAssertEqual(LidObserver.reading(closed: false, externalDisplay: true), .open)
+        XCTAssertEqual(LidObserver.reading(closed: true, externalDisplay: true), .closedAtDesk)
+        XCTAssertEqual(LidObserver.reading(closed: true, externalDisplay: false), .closed)
+        XCTAssertNil(LidObserver.reading(closed: nil, externalDisplay: true))
+    }
+
+    /// The display macOS keeps online with the lid closed and nothing
+    /// plugged in is no external display.
+    func testTheStandInDisplayIsNotExternal() {
+        XCTAssertTrue(LidObserver.isExternal(builtIn: false, vendor: 0x1E6D))
+        XCTAssertFalse(LidObserver.isExternal(builtIn: false, vendor: 0x756E_6B6E))
+        XCTAssertFalse(LidObserver.isExternal(builtIn: true, vendor: 0x0610))
+    }
+
+    /// Closed with a display attached, then the display unplugged and
+    /// plugged in again: closed while it is gone, open once it is back.
+    func testALidClosedAtADeskClosesOnlyWhileItsDisplayIsGone() async {
+        let observer = makeObserver()
+        reading = .closedAtDesk
+        observer.handleInterest()
+        await pastTheDebounce()
+        XCTAssertEqual(events, [])
+        XCTAssertFalse(observer.isClosed)
+        XCTAssertTrue(observer.isShut)
+
+        reading = .closed
+        observer.handleInterest()
+        await waitUntil("the close was never delivered") { !events.isEmpty }
+        XCTAssertEqual(events, ["change true"])
+        XCTAssertTrue(observer.closedByDisplayLoss)
+
+        reading = .closedAtDesk
+        observer.handleInterest()
+        await waitUntil("the open was never delivered") { events.count >= 2 }
+        XCTAssertEqual(events, ["change true", "change false"])
+        XCTAssertFalse(observer.closedByDisplayLoss)
+    }
+
+    /// A saved brightness only a lid open may restore keeps a lid closed by
+    /// its display's unplugging closed when the display comes back.
+    func testADisplayBackLeavesTheLidClosedWhileABrightnessWaits() async {
+        let observer = makeObserver()
+        observer.brightnessJournaled = { true }
+        reading = .closedAtDesk
+        observer.handleInterest()
+        reading = .closed
+        observer.handleInterest()
+        await waitUntil("the close was never delivered") { !events.isEmpty }
+        XCTAssertTrue(observer.closedByDisplayLoss)
+
+        reading = .closedAtDesk
+        observer.handleInterest()
+        await pastTheDebounce()
+        XCTAssertEqual(events, ["change true"], "the display's return opened a lid a brightness waits under")
+
+        reading = .open
+        observer.handleInterest()
+        await waitUntil("the open was never delivered") { events.count >= 2 }
+        XCTAssertEqual(events, ["change true", "change false"])
+    }
+
+    /// Closed with nothing attached, then a display plugged in: still
+    /// closed, until the lid opens.
+    func testALidClosedInABagStaysClosedWhenADisplayIsPluggedIn() async {
+        let observer = makeObserver()
+        reading = .closed
+        observer.handleInterest()
+        await waitUntil("the close was never delivered") { !events.isEmpty }
+        XCTAssertFalse(observer.closedByDisplayLoss)
+
+        reading = .closedAtDesk
+        observer.handleInterest()
+        await pastTheDebounce()
+        XCTAssertEqual(events, ["change true"], "a display plugged into a closed lid opened it")
+        XCTAssertTrue(observer.isClosed)
+
+        reading = .open
+        observer.handleInterest()
+        await waitUntil("the open was never delivered") { events.count >= 2 }
+        XCTAssertEqual(events, ["change true", "change false"])
+        XCTAssertFalse(observer.isShut)
+    }
+
+    /// A display that comes back within the debounce leaves the lid open.
+    func testADisplayUnpluggedForAMomentIsAFlap() async {
+        let observer = makeObserver()
+        reading = .closedAtDesk
+        observer.handleInterest()
+        reading = .closed
+        observer.handleInterest()
+        reading = .closedAtDesk
+        observer.handleInterest()
+        await pastTheDebounce()
+        XCTAssertEqual(events, [])
+    }
+
+    func testTheSeedDecidesALidClosedAtADesk() {
+        let observer = makeObserver()
+        reading = .closedAtDesk
+        observer.seed(closed: true)
+        XCTAssertTrue(observer.isClosed)
+        observer.seed(closed: false)
+        XCTAssertFalse(observer.isClosed)
+        reading = .closed
+        observer.seed(closed: false)
+        XCTAssertTrue(observer.isClosed)
+    }
+
     /// A change after the stop, as after a restart, must not run a
     /// waiter left from before it.
     func testStopDropsTheWaiter() async {
         let observer = makeObserver()
-        reading = true
+        reading = .closed
         observer.handleInterest()
         observer.whenSettled(waiter())
 

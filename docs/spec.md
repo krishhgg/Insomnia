@@ -130,6 +130,27 @@ recovery; newly written journals use `frozenProcesses`.
   between events.
 - 2-second debounce to ignore flapping.
 - Lid close and open each run a fixed, reversible action list (below).
+- A closed lid with an external display connected (closed-display mode:
+  an online display that is neither built in nor of vendor
+  `kDisplayVendorIDUnknown`) keeps the state delivered before it. Closed
+  at a desk, the lid stays open: no lid actions, the countdown keeps
+  running and the lid is no Low Power Mode cause. Unplugging the last
+  external display then delivers the close, and plugging one in again the
+  open, unless a saved display or keyboard brightness waits for the lid to
+  open. Closed in a bag, the lid stays closed when a display is plugged
+  in, until it opens, so the built-in panel and keyboard are only lit
+  again once they are uncovered.
+- A close darkens the display and keyboard backlight only while the
+  built-in display is online. Under a lid closed at a desk, and after its
+  external display is unplugged, it is offline and macOS keeps both dark,
+  so the close leaves them alone, a close replayed after a power command
+  included.
+  `NSApplication.didChangeScreenParametersNotification` reads the lid
+  again when displays come and go. A display asleep stays online. With the
+  lid closed and nothing plugged in, macOS keeps a stand-in display online
+  (vendor `unkn`, model `virt`), which does not count. The kernel's
+  `AppleClamshellCausesSleep` is no substitute: on Apple Silicon it is set
+  at lid changes only, and stays No after the display is unplugged.
 - Lid events do nothing when no session is active.
 - Each lid event is numbered as it arrives, before its actions queue behind
   earlier ones. An open makes every earlier close stale. A close still
@@ -365,7 +386,8 @@ retry, unless a newer failure has taken its place.
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
 reports changes only, so no close event arrives for it. The next lid open
-restarts the redraw.
+restarts the redraw. A lid closed at a desk reads open then, unless
+reconcile keeps lid-close actions from a close in that session.
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from

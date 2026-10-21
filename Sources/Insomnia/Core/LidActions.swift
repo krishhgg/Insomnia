@@ -86,7 +86,12 @@ final class LidActions {
                 manager.isActive && manager.endTicket == ticket && lidEvents == event && !Task.isCancelled
             }
 
-            if config.darkenDisplayOnLidClose {
+            // Off, the built-in display is under a lid closed at a desk, or
+            // one whose external display was just unplugged: macOS keeps the
+            // panel and keyboard dark, and there is nothing to darken.
+            if config.darkenDisplayOnLidClose, !display.builtInIsOnline {
+                Log.info("display and keyboard backlight left alone: the built-in display is off, as macOS keeps it under a lid closed at a desk")
+            } else if config.darkenDisplayOnLidClose {
                 darkenSavingCurrent(manager)
             }
 
