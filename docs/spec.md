@@ -98,7 +98,8 @@ recovery; newly written journals use `frozenProcesses`.
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
   Enter with empty fields uses the configured default preset. Maximum 30 days.
 - While active the menu bar shows a second-resolution countdown. The redraw
-  timer runs at 1 Hz and stops while the lid is closed.
+  timer runs at 1 Hz and stops while the lid is closed or every display
+  sleeps.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
 - Session start: write session + state to disk, arm the launchd backstop, and
@@ -1239,7 +1240,8 @@ transitions. If it feels like a web dropdown, it is wrong.
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
-| countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
+| countdown redraw | 1 Hz timer, stopped while lid closed or displays asleep | one wake per second while active and visible |
+| displays asleep | `NSWorkspace` screensDidSleep / screensDidWake, and `CGDisplayIsAsleep` once at launch | none |
 | hotspot retry | only during an outage | none otherwise |
 | update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |
 

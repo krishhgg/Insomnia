@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let releases = ReleaseChecker()
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
+    private var displaySleep: DisplaySleepObserver?
     private var terminating = false
 
     override init() {
@@ -86,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
             settings?.show()
         }
+        displaySleep = DisplaySleepObserver { [manager] asleep in manager.displaysAsleepChanged(asleep) }
         Task { await manager.reconcile() }
     }
 
