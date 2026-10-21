@@ -46,6 +46,33 @@ final class FloorRulesTests: XCTestCase {
         XCTAssertEqual(eval(80, thermal: .serious, lp: true), [])
     }
 
+    func testClosedLidSeriousHeatEndsEvenWhenChargingOrAlreadyInLowPower() {
+        for charging in [false, true] {
+            for lowPower in [false, true] {
+                XCTAssertEqual(eval(80, charging: charging, thermal: .serious, lid: true, lp: lowPower), [.endSession(.thermalSeriousClosedLid)])
+            }
+        }
+    }
+
+    func testClosedLidThermalRuleIsIndependentOfOpenLidRules() {
+        var c = Config()
+        c.thermalRules = false
+        XCTAssertEqual(eval(80, thermal: .serious, lid: true, config: c), [.endSession(.thermalSeriousClosedLid)])
+        XCTAssertEqual(eval(80, thermal: .critical, lid: true, config: c), [.endSession(.thermalCritical)])
+        XCTAssertEqual(eval(80, thermal: .serious, config: c), [])
+        c.endClosedLidWhenHot = false
+        XCTAssertEqual(eval(80, thermal: .serious, lid: true, config: c), [.enableLowPower(.lid)])
+        XCTAssertEqual(eval(80, thermal: .critical, lid: true, config: c), [.enableLowPower(.lid)])
+    }
+
+    func testClosedLidThermalOptOutKeepsExistingLowPowerRule() {
+        var c = Config()
+        c.endClosedLidWhenHot = false
+        XCTAssertEqual(eval(80, thermal: .serious, lid: true, config: c), [.enableLowPower(.thermal)])
+        XCTAssertEqual(eval(80, thermal: .critical, lid: true, config: c), [.endSession(.thermalCritical)])
+        XCTAssertEqual(eval(80, thermal: .fair, lid: true), [.enableLowPower(.lid)])
+    }
+
     func testThermalBackToNominalOrFairClearsLowPower() {
         XCTAssertEqual(eval(80, thermal: .nominal, lp: true), [.disableLowPower])
         XCTAssertEqual(eval(80, thermal: .fair, lp: true), [.disableLowPower])
@@ -168,8 +195,8 @@ final class FloorRulesTests: XCTestCase {
     /// The cause names the strongest reason: thermal, then battery, then lid.
     func testLidIsTheWeakestCause() {
         XCTAssertEqual(eval(30, lid: true), [.enableLowPower(.battery)])
-        XCTAssertEqual(eval(30, thermal: .serious, lid: true), [.enableLowPower(.thermal)])
-        XCTAssertEqual(eval(80, thermal: .serious, lid: true), [.enableLowPower(.thermal)])
+        XCTAssertEqual(eval(30, thermal: .serious, lid: true), [.endSession(.thermalSeriousClosedLid)])
+        XCTAssertEqual(eval(80, thermal: .serious, lid: true), [.endSession(.thermalSeriousClosedLid)])
     }
 
     func cause(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, lid: Bool = false, config: Config = Config()) -> FloorRules.LowPowerCause? {
@@ -272,6 +299,20 @@ final class FloorRuleDriverTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertTrue(h.guardFake.calls.contains("lowpowermode 0"))
         XCTAssertTrue(h.notifier.posts.last?.body.contains("critical") ?? false)
+    }
+
+    func testClosedLidSeriousHeatRestoresOwnedPowerAndEndsSession() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        _ = await m.setLowPower(true)
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: true)
+        XCTAssertFalse(m.isActive)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertFalse(h.guardFake.lowPowerOn)
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertTrue(h.notifier.posts.last?.body.contains("lid closed") ?? false)
     }
 
     func testNoSessionDoesNothing() async throws {
@@ -521,6 +562,7 @@ final class FloorRuleDriverTests: XCTestCase {
     /// takes over, lid opens (thermal holds), cools down: announced.
     func testThermalTakeoverThenLidOpenAnnouncesTheCooldown() async throws {
         let m = h.makeManager()
+        m.config.endClosedLidWhenHot = false
         await m.start(duration: 3600)
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier)
         await driver.run(battery: .percent(80), isCharging: false, thermal: .nominal, lidClosed: true)
