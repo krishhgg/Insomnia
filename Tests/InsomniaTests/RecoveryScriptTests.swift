@@ -141,6 +141,111 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.session))
     }
 
+    func testMonitoredFutureSessionContinuesOnlyOnExactSafetyAnswer() throws {
+        try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600))
+        let dirty = #"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#
+        try fx.writeState(dirty)
+        try fx.safetyAnswer("continue\n")
+        let result = try fx.run(fx.backstop)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertEqual(fx.calls(), ["Insomnia --check-safety 5"])
+        XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), dirty)
+        XCTAssertTrue(fx.exists(fx.session))
+        XCTAssertEqual(try fx.backstopFiles(), [])
+    }
+
+    func testMonitoredFutureCutoutsUndoOwnedPowerBeforeTheDeadline() throws {
+        for reason in ["batteryFloor", "batteryUnreadable", "thermalCritical", "thermalSeriousClosedLid", "configuration-unreadable", "lid-unreadable", "thermal-unreadable"] {
+            fx.clearCalls()
+            try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600))
+            try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try fx.safetyAnswer("end \(reason)\n")
+            let result = try fx.run(fx.backstop)
+            XCTAssertEqual(result.status, 0, "\(reason): \(result.stderr)")
+            XCTAssertEqual(fx.calls(), [
+                "Insomnia --check-safety 5",
+                "sudo -n \(fx.fakePmset) -a disablesleep 0",
+                "sudo -n \(fx.fakePmset) -b lowpowermode 0",
+            ])
+            XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+            XCTAssertEqual(try fx.stateJSON()["lowPowerSetByUs"] as? Bool, false)
+            XCTAssertFalse(fx.exists(fx.session))
+            XCTAssertTrue(fx.log().contains(reason))
+        }
+    }
+
+    func testMissingOrUnsupportedSafetyProtocolDoesNotLaunchAnOldApp() throws {
+        for version in [nil, 2] as [Int?] {
+            fx.clearCalls()
+            try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600))
+            try fx.writeState(#"{"sleepDisabledByUs":true}"#)
+            try fx.declareSafetyVersion(version)
+            let result = try fx.run(fx.backstop)
+            XCTAssertEqual(result.status, 0, result.stderr)
+            XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+            XCTAssertFalse(fx.exists(fx.session))
+        }
+    }
+
+    func testUnexpectedSafetyOutputOrExitNeverKeepsSleepDisabled() throws {
+        for (answer, status) in [("continue", 0), ("continue\n\n", 0), ("continue\njunk\n", 0), ("end unknown\n", 0), ("continue\n", 1)] {
+            fx.clearCalls()
+            try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600))
+            try fx.writeState(#"{"sleepDisabledByUs":true}"#)
+            try fx.safetyAnswer(answer, status: status)
+            let result = try fx.run(fx.backstop)
+            XCTAssertEqual(result.status, 0, result.stderr)
+            XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+            XCTAssertFalse(fx.exists(fx.session))
+        }
+    }
+
+    func testSafetyTimeoutEndsSessionAndDoesNotLeaveHelperOrLock() throws {
+        try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true}"#)
+        try fx.safetyAnswer("continue\n")
+        fx.setMode("safety", "hang")
+        let result = try fx.run(fx.backstop)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertTrue(fx.log().contains("--check-safety"))
+        XCTAssertTrue(fx.log().contains("sent SIGTERM"))
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    func testFailedSafetyRecoveryKeepsOwnedChangesForRetry() throws {
+        try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600))
+        try fx.writeState(#"{"sleepDisabledByUs":true}"#)
+        try fx.safetyAnswer("end thermalSeriousClosedLid\n")
+        fx.setMode("sudo", "fail")
+        let result = try fx.run(fx.backstop)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.exists(fx.session))
+        let saved = try Store.makeDecoder().decode(Session.self, from: Data(contentsOf: fx.session))
+        XCTAssertTrue(saved.isExpired(at: Date()), "the cutoff was not latched before the failed undo")
+
+        // Cooling down cannot resume a session whose cutoff already fired.
+        fx.clearCalls()
+        fx.setMode("sudo", "ok")
+        try fx.safetyAnswer("continue\n")
+        let retry = try fx.run(fx.backstop)
+        XCTAssertEqual(retry.status, 0, retry.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertFalse(fx.exists(fx.session))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+    }
+
+    func testUnsupportedSessionSafetyVersionFailsClosed() throws {
+        try fx.writeSafetySession(endsAt: Date(timeIntervalSinceNow: 3600), version: 2)
+        try fx.writeState(#"{"sleepDisabledByUs":true}"#)
+        let result = try fx.run(fx.backstop)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
     func testForceEndsValidSession() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
@@ -6629,7 +6734,7 @@ private final class ScriptFixture {
         return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(key)</dict></plist>
+        <plist version="1.0"><dict><key>CFBundleExecutable</key><string>Insomnia</string>\(key)<key>InsomniaSafetyCheckVersion</key><integer>1</integer></dict></plist>
 
         """
     }
@@ -6904,6 +7009,14 @@ private final class ScriptFixture {
         try fm.createDirectory(at: appInfo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Self.infoPlist(resumeFrozenVersion: "1").write(to: appInfo, atomically: true, encoding: .utf8)
         try writeFake("Insomnia", """
+        case "$*" in
+          "--check-safety "*)
+            printf 'Insomnia %s\\n' "$*" >> "\(calls)"
+            if [[ "$(cat "\(r)/safety.mode" 2>/dev/null || echo ok)" == hang ]]; then exec /bin/sleep 300; fi
+            if [[ -f "\(r)/insomnia.safety-output" ]]; then cat "\(r)/insomnia.safety-output"; else printf 'continue\\n'; fi
+            exit "$(cat "\(r)/insomnia.safety-status" 2>/dev/null || echo 0)"
+            ;;
+        esac
         input=()
         while IFS= read -r line || [[ -n "$line" ]]; do input+=("$line"); done
         joined=""
@@ -7329,6 +7442,24 @@ private final class ScriptFixture {
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
         let json = #"{"startedAt":"\#(f.string(from: endsAt.addingTimeInterval(-3600)))","endsAt":"\#(f.string(from: endsAt))","extensions":[]}"#
         try json.write(to: session, atomically: true, encoding: .utf8)
+    }
+
+    func writeSafetySession(endsAt: Date, version: Int = 1) throws {
+        try writeSession(endsAt: endsAt)
+        var object = try JSONSerialization.jsonObject(with: Data(contentsOf: session)) as! [String: Any]
+        object["safetyCheckVersion"] = version
+        try JSONSerialization.data(withJSONObject: object).write(to: session)
+    }
+
+    func safetyAnswer(_ answer: String, status: Int = 0) throws {
+        try answer.write(to: root.appendingPathComponent("insomnia.safety-output"), atomically: true, encoding: .utf8)
+        try String(status).write(to: root.appendingPathComponent("insomnia.safety-status"), atomically: true, encoding: .utf8)
+    }
+
+    func declareSafetyVersion(_ version: Int?) throws {
+        var object = try PropertyListSerialization.propertyList(from: Data(contentsOf: appInfo), format: nil) as! [String: Any]
+        object["InsomniaSafetyCheckVersion"] = version
+        try PropertyListSerialization.data(fromPropertyList: object, format: .xml, options: 0).write(to: appInfo)
     }
 
     func stateJSON() throws -> [String: Any] {

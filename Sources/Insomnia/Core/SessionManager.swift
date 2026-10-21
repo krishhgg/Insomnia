@@ -10,6 +10,8 @@ enum EndReason: String, Sendable {
     /// while on battery: the end floor could not be applied.
     case batteryUnreadable
     case thermalCritical
+    case thermalSeriousClosedLid
+    case safetyBackstop
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
     /// agent, journal, or hold sleep for it, so it ended the session instead
@@ -439,6 +441,7 @@ final class SessionManager {
     @ObservationIgnored var services: AppServices?
 
     @ObservationIgnored private var deadlineTimer: Timer?
+    @ObservationIgnored private var safetySyncTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
@@ -1276,6 +1279,17 @@ final class SessionManager {
 
     private func performExtend(by extra: TimeInterval, ticket: Int) async {
         guard let current = session, endTicket == ticket else { return }
+        if current.safetyCheckVersion != nil {
+            do {
+                if try monitoredSessionEndedOnDisk() {
+                    _ = await performEnd(reason: .safetyBackstop)
+                    return
+                }
+            } catch {
+                fail("extend refused: could not read the session the recovery agent monitors: \(error.localizedDescription)")
+                return
+            }
+        }
         let updated = SessionMath.extended(current, by: extra, now: clock(), maxDuration: config.maxDuration)
         // The agent enforces whatever deadline is on disk; confirm it is
         // still loaded before moving that deadline out.
@@ -2480,6 +2494,28 @@ final class SessionManager {
 
     // MARK: Reconcile (spec section 8)
 
+    /// The recovery agent can end a future session on a battery/thermal
+    /// cutoff. Drop the cached session and finish app-only restoration,
+    /// rather than keeping a live countdown or resurrecting it on Extend.
+    func synchronizeWithBackstop() async {
+        guard session?.safetyCheckVersion != nil else { return }
+        _ = await exclusive("safety sync") {
+            guard self.session != nil else { return }
+            do {
+                if try self.monitoredSessionEndedOnDisk() {
+                    _ = await self.performEnd(reason: .safetyBackstop)
+                }
+            } catch {
+                self.fail("could not check the recovery agent's session: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func monitoredSessionEndedOnDisk() throws -> Bool {
+        let saved = try store.loadSession()
+        return saved == nil || saved?.isExpired(at: clock()) == true || !state.sleepDisabledByUs
+    }
+
     /// Run at launch. A refused reconcile changed nothing and runs again
     /// after `recoveryRetryDelay` until it goes through. Nothing else would
     /// resume a session still live on disk: its sleep stays disabled until
@@ -2615,6 +2651,26 @@ final class SessionManager {
             // sleep. Any failure ends the session rather than holding sleep
             // with nothing guaranteed to release it.
             session = s
+            if s.safetyCheckVersion != nil {
+                do {
+                    // A failed on-disk cutoff may leave a future deadline.
+                    // Once recovery (or another tool) has released sleep,
+                    // a relaunch must not turn it off again for that session.
+                    guard state.sleepDisabledByUs else {
+                        _ = await performEnd(reason: .safetyBackstop)
+                        return
+                    }
+                    let sleepStillDisabled = try await sleepGuard.isSleepDisabled()
+                    if !sleepStillDisabled {
+                        _ = await performEnd(reason: .safetyBackstop)
+                        return
+                    }
+                } catch {
+                    fail("could not verify the monitored session still holds sleep; ending it: \(error.localizedDescription)")
+                    _ = await performEnd(reason: .recoveryUnavailable)
+                    return
+                }
+            }
             do {
                 try await backstop.arm()
             } catch {
@@ -2930,6 +2986,17 @@ final class SessionManager {
         RunLoop.main.add(timer, forMode: .common)
         deadlineTimer = timer
 
+        safetySyncTimer?.invalidate()
+        safetySyncTimer = nil
+        if session?.safetyCheckVersion != nil {
+            let sync = Timer(fire: clock().addingTimeInterval(30), interval: 30, repeats: true) { [weak self] _ in
+                Task { @MainActor in await self?.synchronizeWithBackstop() }
+            }
+            sync.tolerance = 2
+            RunLoop.main.add(sync, forMode: .common)
+            safetySyncTimer = sync
+        }
+
         refreshCountdown()
         if !countdownPaused { armCountdownTimer() }
     }
@@ -2957,6 +3024,8 @@ final class SessionManager {
     private func stopTimers() {
         deadlineTimer?.invalidate()
         deadlineTimer = nil
+        safetySyncTimer?.invalidate()
+        safetySyncTimer = nil
         countdownTimer?.invalidate()
         countdownTimer = nil
     }
@@ -3180,6 +3249,8 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
+        case .thermalSeriousClosedLid: "The Mac became hot with the lid closed. Sleep is back to normal. Let it cool on a ventilated surface."
+        case .safetyBackstop: "The recovery agent ended this session. Sleep is back to normal. Check the log for the reason."
         case .backstop: outputsWaiting
             ? "A previous session left changes behind. Sleep is back to normal."
             : "A previous session left changes behind; everything has been undone."

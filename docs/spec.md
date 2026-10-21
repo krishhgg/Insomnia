@@ -649,8 +649,15 @@ that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
-Battery and thermal rules run only while the app is alive; they are not
-provided by the standalone backstop. Performance effects depend on workload.
+The app reacts to battery and thermal events. New sessions additionally
+require the standalone backstop's read-only end-rule check every minute,
+even after the menu app exits. The check never enables Low Power Mode:
+it only allows the session to continue or restores the journal on an end.
+Missing or failed checks end the session. Legacy sessions without
+`safetyCheckVersion` keep deadline-only recovery. Performance effects depend
+on workload. With `endClosedLidWhenHot` on (default), serious thermal
+pressure ends a closed-lid session instead of only requesting Low Power
+Mode; this is independent of `thermalRules`.
 
 ### 7. Network failover
 
@@ -846,6 +853,19 @@ Backstop, independent of the app:
 
 - The agent reads the saved deadline; recurring recovery checks avoid replacing
   the loaded job for every extension and allow retries after a failure.
+- A new session records `safetyCheckVersion: 1`. Before honoring its future
+  deadline, the agent requires the installed bundle to declare
+  `InsomniaSafetyCheckVersion: 1` and runs `Insomnia --check-safety 5` with the
+  recovery lock inherited on fd 9. Only an exact `continue` line with exit
+  status 0 keeps it awake. The helper uses the same end rules as the app and
+  arms its own five-second lifetime before reading configuration or power
+  state. An unknown protocol, failed read, timeout or malformed answer
+  instead expires the saved deadline before restoring the journal, so a
+  failed undo is retried even when the hazard recedes. A laptop's unavailable lid is not guessed
+  open; an unreadable battery is retried once before applying its end rule.
+  The app synchronizes with this cleanup every 30 seconds and before Extend,
+  under the lock. An ended session cannot be extended back onto disk; a
+  relaunch cannot reapply an owned sleep setting that has been released.
 - Between sessions the agent's run ends early. With no `session.json` and a
   `state.json` that is exactly the clean journal the app writes,
   `backstop.sh` exits 0 before the lock and without `plutil`. Any other
@@ -1239,6 +1259,8 @@ transitions. If it feels like a web dropdown, it is wrong.
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
+| independent battery/thermal end check | one-shot helper under the backstop's lock | once a minute during new sessions |
+| backstop cleanup sync | in-app timer, stopped on session end | one wake every 30 s during monitored sessions |
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
 | hotspot retry | only during an outage | none otherwise |
 | update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |

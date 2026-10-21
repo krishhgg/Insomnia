@@ -7,11 +7,15 @@ struct Session: Codable, Equatable, Sendable {
     var endsAt: Date
     /// Every extension applied, in order, in seconds.
     var extensions: [TimeInterval]
+    /// New sessions require the backstop's independent power check before
+    /// it honors a future deadline. Missing in sessions from older builds.
+    var safetyCheckVersion: Int?
 
-    init(startedAt: Date, endsAt: Date, extensions: [TimeInterval] = []) {
+    init(startedAt: Date, endsAt: Date, extensions: [TimeInterval] = [], safetyCheckVersion: Int? = nil) {
         self.startedAt = startedAt
         self.endsAt = endsAt
         self.extensions = extensions
+        self.safetyCheckVersion = safetyCheckVersion
     }
 
     /// Seconds left until `endsAt`, never negative.
