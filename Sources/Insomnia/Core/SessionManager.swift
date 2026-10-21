@@ -188,10 +188,14 @@ final class SessionManager {
         /// failed restore, retried like any other and counted as dirty by
         /// backstop.sh and uninstall.sh.
         case unflag(Float)
+        /// An old keyboard zero needs no hardware undo, even if the
+        /// private-call guard refuses. Its clear still has to reach disk.
+        case discardedZero
 
         var saved: Float {
             switch self {
             case .clear(let value), .restored(let value, _), .unflag(let value): value
+            case .discardedZero: 0
             }
         }
 
@@ -204,10 +208,18 @@ final class SessionManager {
         /// `s` still holds the entry with that value and its flag. Lost, it
         /// leaves that entry for the next launch to read again.
         func clearsEntry(in s: RuntimeState, saved: KeyPath<RuntimeState, Float?>, flag: KeyPath<RuntimeState, Bool>) -> Bool {
-            !isUnflag && s[keyPath: flag] && s[keyPath: saved] == self.saved
+            if case .discardedZero = self { return s[keyPath: saved] == 0 }
+            return !isUnflag && s[keyPath: flag] && s[keyPath: saved] == self.saved
         }
 
         func apply(to s: inout RuntimeState, saved: WritableKeyPath<RuntimeState, Float?>, flag: WritableKeyPath<RuntimeState, Bool>, restoredUnderLowPower: WritableKeyPath<RuntimeState, Float?>? = nil) {
+            if case .discardedZero = self {
+                if s[keyPath: saved] == 0 {
+                    s[keyPath: saved] = nil
+                    s[keyPath: flag] = false
+                }
+                return
+            }
             guard s[keyPath: flag], s[keyPath: saved] == self.saved else { return }
             if !isUnflag { s[keyPath: saved] = nil }
             s[keyPath: flag] = false
@@ -222,6 +234,7 @@ final class SessionManager {
             case .clear(let value): "\(what) \(value), set since its refused restore, cleared from the journal"
             case .restored(let value, _): "\(what) \(value), restored, cleared from the journal"
             case .unflag(let value): "\(what) \(value), whose restore failed, marked in the journal for retry"
+            case .discardedZero: "\(what) zero restore discarded without a brightness write"
             }
         }
     }
@@ -278,6 +291,7 @@ final class SessionManager {
                 switch edit {
                 case .clear(let value)?: "\(what) \(value), set since its refused restore, still to be cleared from the journal"
                 case .restored(let value, _)?: "\(what) \(value), restored, still to be cleared from the journal"
+                case .discardedZero?: "\(what) zero restore still to be cleared from the journal"
                 case .unflag?, nil: nil
                 }
             }
@@ -2121,7 +2135,7 @@ final class SessionManager {
         } else if let saved = kept.savedDisplayBrightness {
             restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
         }
-        if let saved = kept.savedKeyboardBrightness, let why = keyboard.refusal() {
+        if let saved = kept.savedKeyboardBrightness, saved != 0, let why = keyboard.refusal() {
             refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
         } else if let saved = kept.savedKeyboardBrightness {
             restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
@@ -2226,6 +2240,19 @@ final class SessionManager {
 
     /// As restoreDisplay, for the keyboard backlight.
     private func restoreKeyboard(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
+        if saved == 0 {
+            do {
+                try journal { s in
+                    s.savedKeyboardBrightness = nil
+                    s.keyboardRestoreRefused = false
+                }
+            } catch {
+                owedEdits.keyboard = .discardedZero
+                errors.append("could not clear the obsolete zero keyboard restore: \(error.localizedDescription); it will be retried")
+            }
+            Log.info("zero keyboard restore discarded without a brightness write")
+            return nil
+        }
         if effectiveState.keyboardRestoreRefused {
             switch keptLevel(read: { try keyboard.readBrightness() },
                              untrusted: { keyboard.isSuppressedOrDimmed() ? "macOS has the backlight suppressed or dimmed" : nil }) {
@@ -2303,7 +2330,7 @@ final class SessionManager {
     private func recheckKeptBrightness() async {
         let kept = effectiveState
         let rereadDisplay = kept.savedDisplayBrightness != nil && kept.displayRestoreRefused && display.refusal() == nil
-        let rereadKeyboard = kept.savedKeyboardBrightness != nil && kept.keyboardRestoreRefused && keyboard.refusal() == nil
+        let rereadKeyboard = kept.savedKeyboardBrightness != nil && kept.keyboardRestoreRefused && (kept.savedKeyboardBrightness == 0 || keyboard.refusal() == nil)
         guard rereadDisplay || rereadKeyboard || !owedEdits.clearsWaiting.isEmpty else { return }
         guard clamshell() == false || !(rereadDisplay || rereadKeyboard) else {
             if !keptRecheckSawLidClosed {
@@ -2419,6 +2446,14 @@ final class SessionManager {
             }
             Log.error("could not clear the display write owed after low power mode from the journal: \(error.localizedDescription); it is not made, and the next journal write or transaction clears it")
         }
+    }
+
+    func cancelBrightnessReassert() {
+        if pendingReassert.display != nil || pendingReassert.keyboard != nil {
+            Log.info("pending brightness re-assert canceled: lid closed again")
+        }
+        reassertTask?.cancel()
+        pendingReassert = (nil, nil)
     }
 
     /// The second write of a restore, `reassertDelay` later. Best effort:

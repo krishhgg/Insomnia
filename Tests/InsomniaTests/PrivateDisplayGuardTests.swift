@@ -608,8 +608,8 @@ final class RefusedDarkeningTests: XCTestCase {
     /// both come back, still at the 0 the old close left, the sampler takes
     /// no reading of them while they are journaled, and the re-read's
     /// restore becomes its sample. A lid close soon after, with the panel
-    /// pulled down by auto-brightness and the backlight suppressed again,
-    /// journals 0.8 and 0.3, not 0, and the open restores them.
+    /// pulled down by auto-brightness and a positive but suppressed keyboard
+    /// reading, journals 0.8 and 0.3, not the dimmed reads, and restores them.
     func testADelayedRestoreIsTheSampleTheNextCloseJournals() async throws {
         try seedSavedBrightness(sessionValid: false, refused: true)
         h.clamshell.closed = false
@@ -653,7 +653,7 @@ final class RefusedDarkeningTests: XCTestCase {
 
         h.clamshell.closed = true
         h.display.brightness = 0.335
-        h.keyboard.brightness = 0
+        h.keyboard.brightness = 0.01
         h.keyboard.suppressedOrDimmed = true
         await actions.onClose()
 
@@ -1039,8 +1039,8 @@ final class RefusedDarkeningTests: XCTestCase {
     /// read-only writes nothing, and the sampler, no longer held by the
     /// settled entries, takes the new levels. Once the journal takes writes
     /// again, the lid close clears the old entries first and journals the
-    /// levels the user chose, so the open brings back 0.2 and 0, never the
-    /// old 0.8 and 0.3.
+    /// display level the user chose and leaves the zero keyboard alone, so
+    /// the open brings back 0.2 without writing the old 0.8 or 0.3.
     func testACloseAfterAClearTheJournalRefusedJournalsTheLevelChosenSince() async throws {
         try seedSavedBrightness(sessionValid: false, refused: true)
         h.clamshell.closed = false
@@ -1095,7 +1095,7 @@ final class RefusedDarkeningTests: XCTestCase {
 
         let closed = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(closed.savedDisplayBrightness, 0.2)
-        XCTAssertEqual(closed.savedKeyboardBrightness, 0)
+        XCTAssertNil(closed.savedKeyboardBrightness)
         XCTAssertFalse(closed.displayRestoreRefused)
         XCTAssertFalse(closed.keyboardRestoreRefused)
         XCTAssertTrue(logText().contains("keyboard backlight 0.3, set since its refused restore, cleared from the journal"), logText())
@@ -1107,6 +1107,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(h.keyboard.sets.contains(0.3), "\(h.keyboard.sets)")
         XCTAssertEqual(h.display.brightness, 0.2)
         XCTAssertEqual(h.keyboard.brightness, 0)
+        XCTAssertEqual(h.keyboard.sets, [])
     }
 
     /// The display refused, the keyboard's write failing: the report keeps
