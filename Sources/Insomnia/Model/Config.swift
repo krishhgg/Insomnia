@@ -62,7 +62,32 @@ struct Config: Codable, Equatable, Sendable {
     var thermalRules: Bool = true
 
     // Network failover
+    /// The one hotspot joined during an outage while
+    /// `hotspotPriorityEnabled` is off.
     var hotspotSSID: String = ""
+    /// Join `priorityHotspots` in order during an outage, in place of
+    /// `hotspotSSID`. Off by default (and for a config.json without the
+    /// key). Turning it off keeps the list for the next time.
+    var hotspotPriorityEnabled: Bool = false
+    /// Hotspot SSIDs, highest priority first. Each one's password is the
+    /// keychain item for that SSID, the same item `hotspotSSID` uses, so a
+    /// hotspot on both shares one password.
+    var priorityHotspots: [String] = []
+    /// With the priority list on, move from a lower hotspot on it to a
+    /// higher one once scans find the higher one back in range
+    /// (`SwitchUpMachine`). Each move takes the Mac offline for a few
+    /// seconds.
+    var hotspotSwitchUp: Bool = true
+    /// With the priority list on, leave a hotspot Insomnia joined once
+    /// scans find a saved Wi-Fi network in range, and let macOS rejoin
+    /// it (`HandBackMachine`).
+    var hotspotReturnToWiFi: Bool = true
+    /// Wake and join a hotspot 5 s into any outage. Off by default (and
+    /// for a config.json without the key): an outage that did not start on
+    /// a hotspot Insomnia joined waits `FailoverMachine.patientDelay`
+    /// first, so macOS can rejoin the network it dropped, such as a blip
+    /// of home Wi-Fi, without a hotspot being woken for nothing.
+    var aggressiveHotspotJoin: Bool = false
     /// Seconds of outage after which tmux panes are nudged.
     var nudgeThreshold: TimeInterval = 90
     /// tmux targets as `session:window.pane`. Only a pane carrying the
@@ -166,6 +191,11 @@ struct Config: Codable, Equatable, Sendable {
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
         hotspotSSID = try c.decodeIfPresent(String.self, forKey: .hotspotSSID) ?? d.hotspotSSID
+        hotspotPriorityEnabled = try c.decodeIfPresent(Bool.self, forKey: .hotspotPriorityEnabled) ?? d.hotspotPriorityEnabled
+        priorityHotspots = try c.decodeIfPresent([String].self, forKey: .priorityHotspots) ?? d.priorityHotspots
+        hotspotSwitchUp = try c.decodeIfPresent(Bool.self, forKey: .hotspotSwitchUp) ?? d.hotspotSwitchUp
+        hotspotReturnToWiFi = try c.decodeIfPresent(Bool.self, forKey: .hotspotReturnToWiFi) ?? d.hotspotReturnToWiFi
+        aggressiveHotspotJoin = try c.decodeIfPresent(Bool.self, forKey: .aggressiveHotspotJoin) ?? d.aggressiveHotspotJoin
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
@@ -222,6 +252,75 @@ struct LidCloseDefaultsChange: Codable, Equatable, Sendable {
     var settingsLine: String {
         "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
             + "\(both ? "Both toggles are" : "The toggle is") below."
+    }
+}
+
+// MARK: Hotspots
+
+extension Config {
+    /// The hotspots an outage tries, in order: the priority list when it
+    /// is on, otherwise `hotspotSSID`. Normalized, without blanks or
+    /// repeats.
+    var hotspotsToJoin: [String] {
+        hotspotPriorityEnabled ? priorityHotspotList : Self.distinct([hotspotSSID])
+    }
+
+    /// The priority list as the failover and Settings read it, whether or
+    /// not it is on: normalized, without blanks or repeats, which a
+    /// config.json edited by hand can hold.
+    var priorityHotspotList: [String] {
+        Self.distinct(priorityHotspots)
+    }
+
+    private static func distinct(_ ssids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ssids.map(HotspotSSID.normalized).filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    /// Whether `hotspotSSID` or the priority list, on or off, names `ssid`.
+    /// Its keychain item is removed only when neither does.
+    func namesHotspot(_ ssid: String) -> Bool {
+        let ssid = HotspotSSID.normalized(ssid)
+        guard !ssid.isEmpty else { return false }
+        return HotspotSSID.normalized(hotspotSSID) == ssid
+            || priorityHotspots.contains { HotspotSSID.normalized($0) == ssid }
+    }
+
+    /// Turns the priority list on or off. Turned on with an empty list,
+    /// the list starts with `hotspotSSID`, whose saved password it shares.
+    mutating func setHotspotPriority(_ enabled: Bool) {
+        hotspotPriorityEnabled = enabled
+        let single = HotspotSSID.normalized(hotspotSSID)
+        if enabled, priorityHotspotList.isEmpty, !single.isEmpty {
+            priorityHotspots = [single]
+        }
+    }
+
+    /// Adds `ssid` at the bottom of the list, unless it is blank or listed.
+    /// Each change to the list stores it as `priorityHotspotList` first,
+    /// so what Settings shows is what it moves.
+    mutating func addPriorityHotspot(_ ssid: String) {
+        let ssid = HotspotSSID.normalized(ssid)
+        priorityHotspots = priorityHotspotList
+        // The same device whichever apostrophe it was typed with.
+        guard !ssid.isEmpty, !HotspotSSID.any(of: priorityHotspots, matches: ssid) else { return }
+        priorityHotspots.append(ssid)
+    }
+
+    mutating func removePriorityHotspot(_ ssid: String) {
+        let ssid = HotspotSSID.normalized(ssid)
+        priorityHotspots = priorityHotspotList.filter { $0 != ssid }
+    }
+
+    /// Moves `ssid` `offset` places down the list (negative: up), stopping
+    /// at either end.
+    mutating func movePriorityHotspot(_ ssid: String, by offset: Int) {
+        let ssid = HotspotSSID.normalized(ssid)
+        priorityHotspots = priorityHotspotList
+        guard let from = priorityHotspots.firstIndex(of: ssid) else { return }
+        let to = min(max(from + offset, 0), priorityHotspots.count - 1)
+        guard to != from else { return }
+        priorityHotspots.insert(priorityHotspots.remove(at: from), at: to)
     }
 }
 

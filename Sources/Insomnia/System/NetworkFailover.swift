@@ -15,6 +15,10 @@ struct FailoverMachine: Sendable, Equatable {
 
     /// Seconds the path must stay unsatisfied before the first join.
     static let initialDelay: TimeInterval = 5
+    /// The same, when macOS may rejoin the network that dropped by itself.
+    /// Measured 2026-10-20: blips of home Wi-Fi took it 14 s, and a hotspot
+    /// join started meanwhile failed with "Resource busy" as macOS joined.
+    static let patientDelay: TimeInterval = 20
     /// Delays after each join attempt: 5, 10, 20, 30, 30, 30, ...
     static let backoff: [TimeInterval] = [5, 10, 20, 30]
 
@@ -28,12 +32,12 @@ struct FailoverMachine: Sendable, Equatable {
         backoff[min(max(n - 1, 0), backoff.count - 1)]
     }
 
-    mutating func pathUnsatisfied(at now: Date) -> [Output] {
+    mutating func pathUnsatisfied(at now: Date, delay: TimeInterval = initialDelay) -> [Output] {
         guard outageStart == nil else { return [] }
         outageStart = now
         joins = 0
-        nextAttemptAt = now.addingTimeInterval(Self.initialDelay)
-        return [.scheduleRetry(after: Self.initialDelay)]
+        nextAttemptAt = now.addingTimeInterval(delay)
+        return [.scheduleRetry(after: delay)]
     }
 
     mutating func pathSatisfied(at now: Date) -> [Output] {
@@ -68,6 +72,131 @@ struct FailoverMachine: Sendable, Equatable {
         if s > 0 || parts.isEmpty { parts.append("\(s)s") }
         return parts.joined(separator: " ")
     }
+}
+
+// MARK: - Switching up the priority list and handing back
+
+/// What switch-up and hand-back share: a move takes the Mac offline for a
+/// few seconds, so it needs its target found strong in `sightingsNeeded`
+/// scans in a row, all made on the same network, and comes at most once
+/// per `cooldown`. Pure: the driver owns the clock and the scans.
+struct SightingCounter: Sendable, Equatable {
+    /// Scans in a row that must find a network before the move.
+    static let sightingsNeeded = 2
+    /// Weakest signal (RSSI, dBm) that counts as finding a network: one
+    /// at the edge of its range would drop again soon after the move.
+    static let minimumRSSI = -70
+    /// Seconds after a move, made or not, before the next one, so a
+    /// target that refuses the Mac costs a few seconds offline at most
+    /// once per cooldown.
+    static let cooldown: TimeInterval = 300
+
+    /// The network the Mac was on when the sightings were counted.
+    private(set) var countingOn: String?
+    /// Scans in a row that found each target strong enough.
+    private(set) var sightings: [String: Int] = [:]
+    private(set) var lastMoveAt: Date?
+
+    /// The Mac is on `current`: a new network starts the count again.
+    /// False while a move is cooling down.
+    mutating func begin(on current: String, at now: Date) -> Bool {
+        if countingOn != current {
+            countingOn = current
+            sightings = [:]
+        }
+        guard let last = lastMoveAt else { return true }
+        return now.timeIntervalSince(last) >= Self.cooldown
+    }
+
+    /// A scan found `signal` (RSSI by SSID). Returns the targets now
+    /// found strong enough in `sightingsNeeded` scans in a row. A scan
+    /// that misses a target, or finds it weak, starts its count again.
+    mutating func count(_ signal: [String: Int]) -> Set<String> {
+        var counted: [String: Int] = [:]
+        for (ssid, rssi) in signal where rssi >= Self.minimumRSSI {
+            counted[ssid] = (sightings[ssid] ?? 0) + 1
+        }
+        sightings = counted
+        return Set(counted.filter { $0.value >= Self.sightingsNeeded }.keys)
+    }
+
+    /// A move began: the cooldown starts, whether or not it works.
+    mutating func moved(at now: Date) {
+        lastMoveAt = now
+        forget()
+    }
+
+    /// The Mac left the network the sightings were counted on, or Wi-Fi
+    /// dropped: count again from nothing.
+    mutating func forget() {
+        countingOn = nil
+        sightings = [:]
+    }
+}
+
+/// Decides when to move the Mac from a lower hotspot on the priority list
+/// to a higher one that is back in range: you walk back to the car with
+/// the phone while the Mac is on the tablet you left in it.
+struct SwitchUpMachine: Sendable, Equatable {
+    private(set) var counter = SightingCounter()
+    var sightings: [String: Int] { counter.sightings }
+
+    /// The hotspots above `current` to scan for, highest first. Empty
+    /// when there is nothing to move to: the Mac is on no network, on one
+    /// not on the list, or on the top hotspot, or a move is cooling down.
+    mutating func candidates(current: String?, hotspots: [String], at now: Date) -> [String] {
+        guard let current, let rank = hotspots.firstIndex(of: current), rank > 0 else {
+            forget()
+            return []
+        }
+        guard counter.begin(on: current, at: now) else { return [] }
+        return Array(hotspots[..<rank])
+    }
+
+    /// A scan for `candidates` found `signal`. Returns the hotspot to move
+    /// to: the highest one seen enough.
+    mutating func scanned(_ signal: [String: Int], candidates: [String]) -> String? {
+        let seen = counter.count(signal.filter { candidates.contains($0.key) })
+        return candidates.first { seen.contains($0) }
+    }
+
+    mutating func moving(at now: Date) { counter.moved(at: now) }
+    mutating func forget() { counter.forget() }
+}
+
+/// Decides when to hand the Mac back from a hotspot Insomnia joined to a
+/// saved Wi-Fi network in range again: you get home with the Mac still on
+/// the phone. Any network macOS knows counts, except the hotspots on the
+/// list. Insomnia has no password for it, so the hand-back only leaves
+/// the hotspot and macOS's auto-join rejoins the saved network (measured
+/// on macOS 27: 14 s).
+struct HandBackMachine: Sendable, Equatable {
+    /// Seconds the failover holds its joins after a hand-back while
+    /// macOS rejoins the saved network.
+    static let grace: TimeInterval = 30
+
+    private(set) var counter = SightingCounter()
+    var sightings: [String: Int] { counter.sightings }
+
+    /// Whether to scan for saved networks: the Mac is on `current`, the
+    /// hotspot Insomnia joined (`joined`), and no hand-back is cooling
+    /// down. A hotspot joined by hand, or by macOS, is left alone.
+    mutating func due(current: String?, joined: String?, at now: Date) -> Bool {
+        guard let current, let joined, HotspotSSID.matches(current, joined) else {
+            forget()
+            return false
+        }
+        return counter.begin(on: current, at: now)
+    }
+
+    /// A scan found `signal` among the saved networks. Returns the one to
+    /// hand back to: the strongest seen enough.
+    mutating func scanned(_ signal: [String: Int]) -> String? {
+        counter.count(signal).max { (signal[$0]!, $1) < (signal[$1]!, $0) }
+    }
+
+    mutating func handingBack(at now: Date) { counter.moved(at: now) }
+    mutating func forget() { counter.forget() }
 }
 
 // MARK: - networksetup parsing
@@ -161,6 +290,35 @@ enum HotspotSSID {
     static func normalized(_ configured: String) -> String {
         configured.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// iOS names a device, and so its hotspot, with the curly apostrophe
+    /// (U+2019), while a name typed on a Mac usually has the straight one.
+    /// Folded, the two spellings compare equal.
+    static func folded(_ name: String) -> String {
+        String(normalized(name).map { curly.contains($0) ? "'" : $0 })
+    }
+
+    /// The same hotspot, whichever apostrophe each name uses.
+    static func matches(_ a: String, _ b: String) -> Bool {
+        folded(a) == folded(b)
+    }
+
+    /// Whether `names` has `name`, whichever apostrophe.
+    static func any(of names: [String], matches name: String) -> Bool {
+        names.contains { matches($0, name) }
+    }
+
+    /// The name with its apostrophes swapped for the other kind, or nil
+    /// when it has none: a scan must name the network byte for byte.
+    static func otherApostrophe(_ name: String) -> String? {
+        if name.contains(where: { curly.contains($0) }) {
+            return folded(name)
+        }
+        guard name.contains("'") else { return nil }
+        return name.replacingOccurrences(of: "'", with: "\u{2019}")
+    }
+
+    private static let curly: Set<Character> = ["\u{2019}", "\u{2018}", "\u{02BC}"]
 }
 
 /// Why the failover has no hotspot password to join with. Shown in the
@@ -176,6 +334,11 @@ enum HotspotPasswordProblem: Equatable, Sendable {
     /// Any other keychain failure.
     case error(String)
 
+    /// What a failed keychain read means for the join.
+    init(_ error: any Error) {
+        self = (error as? KeychainError)?.problem ?? .error(error.localizedDescription)
+    }
+
     /// One sentence for the notification body and the Settings notice.
     var explanation: String {
         switch self {
@@ -189,14 +352,30 @@ enum HotspotPasswordProblem: Equatable, Sendable {
     }
 
     /// The right-click menu's warning line.
-    var menuLine: String {
+    var menuLine: String { menuLine(naming: nil) }
+
+    /// The same for one hotspot of several (`ssid`), which says which one.
+    func menuLine(naming ssid: String?) -> String {
+        let subject = ssid.map { "Password for hotspot \"\($0)\"" } ?? "Hotspot password"
+        return switch self {
+        case .missing:
+            "\u{26A0} \(subject) not saved: enter it in Settings"
+        case .unreadable:
+            "\u{26A0} \(subject) unreadable by this build: enter it again in Settings"
+        case let .error(message):
+            "\u{26A0} \(subject) unreadable: \(message)"
+        }
+    }
+
+    /// Under a hotspot in the priority list in Settings.
+    var listNotice: String {
         switch self {
         case .missing:
-            "\u{26A0} Hotspot password not saved: enter it in Settings"
+            "No password saved. Enter this name and its password below."
         case .unreadable:
-            "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings"
+            "This build of Insomnia can't read the saved password: it was saved by another build, or the login keychain is locked. Enter this name and its password below."
         case let .error(message):
-            "\u{26A0} Hotspot password unreadable: \(message)"
+            "The saved password can't be read: \(message)"
         }
     }
 
@@ -223,7 +402,22 @@ struct HotspotPasswordReport: Equatable, Sendable {
 
     /// The problem, if this report is about `configuredSSID`.
     func problem(for configuredSSID: String) -> HotspotPasswordProblem? {
-        ssid == HotspotSSID.normalized(configuredSSID) ? problem : nil
+        problem(among: [configuredSSID])
+    }
+
+    /// The problem, if this report is about one of `configuredSSIDs`, the
+    /// hotspots an outage tries now (`Config.hotspotsToJoin`).
+    func problem(among configuredSSIDs: [String]) -> HotspotPasswordProblem? {
+        configuredSSIDs.contains { HotspotSSID.normalized($0) == ssid } ? problem : nil
+    }
+
+    /// The right-click menu's line while `config` is the one in use, or
+    /// nil when the report is about a hotspot no longer configured. With
+    /// several hotspots configured the line names this one.
+    func menuLine(for config: Config) -> String? {
+        let hotspots = config.hotspotsToJoin
+        guard let problem = problem(among: hotspots) else { return nil }
+        return problem.menuLine(naming: hotspots.count > 1 ? ssid : nil)
     }
 
     /// Whether the report still stands after a save or clear in Settings
@@ -233,8 +427,13 @@ struct HotspotPasswordReport: Equatable, Sendable {
     /// stored for an SSID edited away while it waited, and the window had
     /// not loaded the configured one.
     func stands(after change: HotspotPasswordChange, configuredSSID: String) -> Bool {
-        let configured = HotspotSSID.normalized(configuredSSID)
-        return ssid == configured && !change.touches(configured)
+        stands(after: change, configuredSSIDs: [configuredSSID])
+    }
+
+    /// The same with several hotspots configured: the report stands while
+    /// it is about one of them and the save touched neither of its items.
+    func stands(after change: HotspotPasswordChange, configuredSSIDs: [String]) -> Bool {
+        problem(among: configuredSSIDs) != nil && !change.touches(ssid)
     }
 }
 
@@ -779,6 +978,8 @@ final class NetworkFailover {
     private let keychainQueue: KeychainQueue
     private let nudge: TmuxNudge
     private let hotspotJoiner: any HotspotJoining
+    private let scanner: any HotspotScanning
+    private let waker: any HotspotWaking
     private let notifier: any Notifying
     private let configProvider: @MainActor () -> Config
     private let clock: @Sendable () -> Date
@@ -798,6 +999,46 @@ final class NetworkFailover {
     private var outage = 0
     /// Path/timer work spawned by the driver, cancelled by `stop()`.
     private var inflight: [UUID: Task<Void, Never>] = [:]
+    /// When to move up the priority list. Reset by `stop()`.
+    private(set) var switchUp = SwitchUpMachine()
+    /// When to leave a hotspot for a saved Wi-Fi network. Reset by `stop()`.
+    private(set) var handBack = HandBackMachine()
+    /// The hotspot Insomnia joined last, the only one a hand-back leaves.
+    /// Kept in joined-hotspot.json, so a restart or a new session knows the
+    /// Mac is still on it. Cleared by a hand-back, and by a check that
+    /// finds the Mac on a network that is not a listed hotspot.
+    private(set) var joinedHotspot: String? {
+        didSet { if joinedHotspot != oldValue { saveJoinedHotspot() } }
+    }
+    /// What each woken device handed over, by folded SSID, so a later join
+    /// this session needs no wake and no saved password. Memory only,
+    /// never written anywhere; cleared by `stop()`.
+    private var handedOver: [String: HotspotCredentials] = [:]
+    /// The saved network a hand-back left a hotspot for, and until when
+    /// the failover's joins wait for macOS to rejoin it.
+    private(set) var handingBack: (network: String, until: Date)?
+    /// Saved networks macOS did not rejoin after a hand-back (auto-join
+    /// off, a stale password): never handed back to again this session,
+    /// so one cannot take the Mac offline every cooldown. Cleared by
+    /// `stop()`.
+    private(set) var refusedHandBacks: [String] = []
+    /// Names the networks of the lines about where the Mac lands, made on
+    /// first use. The hotspots on the list keep their names in the log.
+    private lazy var tag = NetworkTag.load(paths)
+    /// Seconds between hotspot checks during a session.
+    static let hotspotCheckInterval: TimeInterval = 30
+    /// Checks every `hotspotCheckInterval` for a higher hotspot and for a
+    /// saved Wi-Fi network, only while the session runs with the priority
+    /// list and either check on (`syncHotspotChecks`). A check with
+    /// nothing to do costs one read of the current SSID and no scan.
+    private(set) var hotspotCheckTimer: Timer?
+    /// How often a woken hotspot is looked for, and how long to wait
+    /// between looks: it can take a few seconds to come on the air.
+    var wokenJoinTries = 3
+    var wokenJoinWait: Duration = .seconds(3)
+    /// A move up the list or a hand-back is under way. The failover's
+    /// joins wait for it, so two never change the network at once.
+    private(set) var changingNetwork = false
 
     init(
         paths: Paths,
@@ -805,6 +1046,8 @@ final class NetworkFailover {
         keychainQueue: KeychainQueue = .shared,
         nudge: TmuxNudge = TmuxNudge(),
         hotspotJoiner: any HotspotJoining = CoreWLANHotspotJoiner(),
+        scanner: any HotspotScanning = CoreWLANHotspotScanner(),
+        waker: any HotspotWaking = NoHotspotWaker(),
         notifier: any Notifying,
         wifiInterface: String? = nil,
         clock: @escaping @Sendable () -> Date = { Date() },
@@ -815,16 +1058,25 @@ final class NetworkFailover {
         self.keychainQueue = keychainQueue
         self.nudge = nudge
         self.hotspotJoiner = hotspotJoiner
+        self.scanner = scanner
+        self.waker = waker
         self.notifier = notifier
         self.wifiInterface = wifiInterface
         self.clock = clock
         self.configProvider = config
+        self.joinedHotspot = Self.loadJoinedHotspot(paths)
     }
 
     func start() async {
         guard monitor == nil else { return }
         let epoch = self.epoch
         await resolveInterface()
+        // The record of the hotspot Insomnia joined outlives sessions, and
+        // the Mac may have left that hotspot since: it decides the next
+        // outage's first wait (`firstJoinDelay`).
+        if joinedHotspot != nil, let iface = wifiInterface {
+            observe(await scanner.currentSSID(interfaceName: iface).map(HotspotSSID.normalized))
+        }
         // stop() may have run while networksetup was being awaited.
         guard !Task.isCancelled, self.epoch == epoch else { return }
         let m = NWPathMonitor(requiredInterfaceType: .wifi)
@@ -839,6 +1091,7 @@ final class NetworkFailover {
         }
         m.start(queue: .main)
         monitor = m
+        syncHotspotChecks()
         Log.info("network failover started (wifi \(wifiInterface ?? "unresolved"))")
     }
 
@@ -846,11 +1099,21 @@ final class NetworkFailover {
         monitor?.cancel()
         monitor = nil
         cancelTimer()
+        hotspotCheckTimer?.invalidate()
+        hotspotCheckTimer = nil
         for task in inflight.values { task.cancel() }
         inflight.removeAll()
         epoch += 1
         outage += 1
         machine = FailoverMachine()
+        switchUp = SwitchUpMachine()
+        handBack = HandBackMachine()
+        // `joinedHotspot` stays: the next session, after a restart too, is
+        // still on the hotspot Insomnia joined.
+        handingBack = nil
+        refusedHandBacks = []
+        handedOver = [:]
+        changingNetwork = false
         // The session is over: the menu line about the password goes with it.
         passwordReport = nil
         notifiedThisOutage = []
@@ -861,7 +1124,12 @@ final class NetworkFailover {
     /// so the menu line goes, and forget the notifications of every other
     /// hotspot, so a problem that comes back is notified afresh.
     func passwordChanged(_ change: HotspotPasswordChange, configuredSSID: String) {
-        if passwordReport?.stands(after: change, configuredSSID: configuredSSID) != true {
+        passwordChanged(change, configuredSSIDs: [configuredSSID])
+    }
+
+    /// The same with several hotspots configured (`Config.hotspotsToJoin`).
+    func passwordChanged(_ change: HotspotPasswordChange, configuredSSIDs: [String]) {
+        if passwordReport?.stands(after: change, configuredSSIDs: configuredSSIDs) != true {
             passwordReport = nil
         }
         notifiedThisOutage = notifiedThisOutage.filter { $0 == passwordReport?.ssid }
@@ -924,10 +1192,25 @@ final class NetworkFailover {
     private func process(satisfied: Bool) async {
         guard !Task.isCancelled else { return }
         let now = clock()
-        let outputs = satisfied ? machine.pathSatisfied(at: now) : machine.pathUnsatisfied(at: now)
+        let delay = firstJoinDelay()
+        let outputs = satisfied ? machine.pathSatisfied(at: now) : machine.pathUnsatisfied(at: now, delay: delay)
         if outputs.isEmpty { return }
-        if !satisfied { Log.info("wifi path unsatisfied") }
+        if !satisfied {
+            Log.info(delay > FailoverMachine.initialDelay
+                ? "wifi path unsatisfied; macOS has \(Int(delay)) s to rejoin a network before a hotspot is woken"
+                : "wifi path unsatisfied")
+            switchUp.forget()
+        }
         await apply(outputs)
+    }
+
+    /// How long an outage waits for its first join. Off the hotspot
+    /// Insomnia joined, macOS may well rejoin the network it dropped by
+    /// itself, and a join meanwhile would fight it ("Resource busy") and
+    /// wake a hotspot for nothing: the outage waits longer then, unless
+    /// Settings asks for the aggressive join.
+    private func firstJoinDelay() -> TimeInterval {
+        configProvider().aggressiveHotspotJoin || joinedHotspot != nil ? FailoverMachine.initialDelay : FailoverMachine.patientDelay
     }
 
     /// What the retry timer calls. Internal so tests can exercise the
@@ -991,78 +1274,407 @@ final class NetworkFailover {
         generation += 1
     }
 
-    func joinHotspot() async {
+    // MARK: Switching up and handing back
+
+    /// Starts the check timer when the driver runs with the priority list
+    /// and switch-up or the hand-back on, and stops it otherwise, so a
+    /// session without them has no timer at all. Called at start and when
+    /// Settings changes any of the toggles.
+    func syncHotspotChecks() {
         let config = configProvider()
-        let ssid = HotspotSSID.normalized(config.hotspotSSID)
-        guard !ssid.isEmpty else {
-            Log.info("hotspot join skipped: no hotspotSSID configured")
+        let wanted = monitor != nil && config.hotspotPriorityEnabled && (config.hotspotSwitchUp || config.hotspotReturnToWiFi)
+        guard wanted != (hotspotCheckTimer != nil) else { return }
+        guard wanted else {
+            hotspotCheckTimer?.invalidate()
+            hotspotCheckTimer = nil
+            switchUp.forget()
+            handBack.forget()
+            return
+        }
+        let t = Timer(timeInterval: NetworkFailover.hotspotCheckInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkHotspots() }
+        }
+        t.tolerance = 5
+        RunLoop.main.add(t, forMode: .common)
+        hotspotCheckTimer = t
+    }
+
+    /// What the check timer calls. Internal so tests can run a check
+    /// without waiting for the timer; the task is returned so a test can
+    /// await it.
+    @discardableResult
+    func checkHotspots() -> Task<Void, Never> {
+        track { [weak self] in await self?.checkHotspotsIfDue() }
+    }
+
+    /// One check. On the hotspot Insomnia joined, scan for saved Wi-Fi
+    /// networks and hand back to the one `HandBackMachine` has seen
+    /// enough of: a saved network beats any hotspot. Otherwise, on a lower
+    /// hotspot of the priority list, scan for the higher ones and move to
+    /// the highest one `SwitchUpMachine` has seen enough of. Nothing while
+    /// Wi-Fi is down: the failover owns an outage.
+    private func checkHotspotsIfDue() async {
+        let config = configProvider()
+        let climbing = config.hotspotPriorityEnabled && config.hotspotSwitchUp
+        let leaving = config.hotspotPriorityEnabled && config.hotspotReturnToWiFi
+        if !climbing { switchUp.forget() }
+        if !leaving { handBack.forget() }
+        guard climbing || leaving else { return }
+        guard !changingNetwork, !machine.inOutage, let iface = wifiInterface else { return }
+        // A hand-back that macOS answered without an outage is over.
+        if let h = handingBack, clock() >= h.until { handingBack = nil }
+        let epoch = self.epoch
+        let outage = self.outage
+        func stillDue() -> Bool {
+            !Task.isCancelled && self.epoch == epoch && self.outage == outage && !machine.inOutage && !changingNetwork
+        }
+        let current = await scanner.currentSSID(interfaceName: iface).map(HotspotSSID.normalized)
+        guard stillDue() else { return }
+        let hotspots = configProvider().hotspotsToJoin
+        observe(current)
+        if leaving, let current, handBack.due(current: current, joined: joinedHotspot, at: clock()) {
+            do {
+                let saved = try await scanner.savedSignal(excluding: hotspots + refusedHandBacks, interfaceName: iface)
+                guard stillDue() else { return }
+                if let network = handBack.scanned(saved) {
+                    await handBack(from: current, to: network, signal: saved[network] ?? 0, interfaceName: iface)
+                    return
+                }
+            } catch {
+                Log.error("saved Wi-Fi scan failed: \(error.localizedDescription)")
+            }
+        }
+        guard climbing else { return }
+        // The list's own spelling of the network the Mac is on: a woken
+        // device hands over its name with the curly apostrophe.
+        let listed = current.flatMap { current in hotspots.first { HotspotSSID.matches($0, current) } }
+        let candidates = switchUp.candidates(current: listed, hotspots: hotspots, at: clock())
+        guard let current = listed, !candidates.isEmpty else { return }
+        let seen: [String: Int]
+        do {
+            seen = try await scanner.signal(of: candidates, interfaceName: iface)
+        } catch {
+            Log.error("hotspot switch-up scan failed: \(error.localizedDescription)")
+            return
+        }
+        guard stillDue() else { return }
+        guard let target = switchUp.scanned(seen, candidates: candidates) else { return }
+        await move(from: current, to: target, interfaceName: iface)
+    }
+
+    /// Moves from `current` to the higher hotspot `target`. Both passwords
+    /// are found first, while the Mac is still online (`credentials`):
+    /// `target` is woken for its own. The join scans for
+    /// `target` before it leaves `current`, so a hotspot gone again by
+    /// then costs nothing; one that refuses the join leaves the Mac on no
+    /// network, and it goes straight back to `current` instead of waiting
+    /// for the failover's first retry.
+    private func move(from current: String, to target: String, interfaceName iface: String) async {
+        changingNetwork = true
+        switchUp.moving(at: clock())
+        defer { changingNetwork = false }
+        let epoch = self.epoch
+        let hotspots = configProvider().hotspotsToJoin
+        let place = { (ssid: String) in Self.place(of: ssid, in: hotspots) ?? "the hotspot" }
+        let targetCredentials = await credentials(for: target, waking: true)
+        let backCredentials = await credentials(for: current, waking: false)
+        guard !Task.isCancelled, self.epoch == epoch, !machine.inOutage else { return }
+        guard let targetCredentials else {
+            Log.error("hotspot switch-up skipped: \(place(target)) did not wake, and no password for it is known")
+            return
+        }
+        let configured = configProvider().hotspotsToJoin
+        guard HotspotSSID.any(of: configured, matches: target), HotspotSSID.any(of: configured, matches: current) else {
+            Log.info("hotspot switch-up dropped: the hotspots changed during the keychain read")
+            return
+        }
+        Log.info("moving from \(place(current)) to \(place(target)) (\(target)), which is back in range")
+        switch await join(targetCredentials, interfaceName: iface) {
+        case .joined:
+            Log.info("moved to hotspot \(target)")
+            return
+        case .notFound:
+            Log.info("hotspot switch-up: the scan no longer finds \(target); staying on \(current)")
+            return
+        case let .failed(error):
+            Log.error("hotspot switch-up to \(target) failed: \(error.localizedDescription)")
+        }
+        guard !Task.isCancelled, self.epoch == epoch else { return }
+        // Still on a network (the join failed before leaving, or macOS
+        // joined one): leave it be.
+        guard await scanner.currentSSID(interfaceName: iface) == nil else { return }
+        guard !Task.isCancelled, self.epoch == epoch else { return }
+        // The device left is still on: woken again, it hands its password over.
+        var back = backCredentials
+        if back == nil {
+            back = await credentials(for: current, waking: true)
+            guard !Task.isCancelled, self.epoch == epoch else { return }
+        }
+        guard let back else {
+            Log.error("hotspot switch-up: offline, and no password for \(place(current)) is known; the failover takes over")
+            return
+        }
+        Log.info("hotspot switch-up: rejoining \(current)")
+        switch await join(back, interfaceName: iface) {
+        case .joined:
+            break
+        case .notFound:
+            Log.error("hotspot switch-up: the scan no longer finds \(current); the failover takes over")
+        case let .failed(error):
+            Log.error("hotspot switch-up: rejoining \(current) failed: \(error.localizedDescription); the failover takes over")
+        }
+    }
+
+    /// Leaves the hotspot `current` for the saved network `network`, which
+    /// macOS rejoins by itself: Insomnia has no password for it. The
+    /// failover's joins wait `HandBackMachine.grace` for that, then take
+    /// over if the Mac is still on no network.
+    private func handBack(from current: String, to network: String, signal: Int, interfaceName iface: String) async {
+        changingNetwork = true
+        handBack.handingBack(at: clock())
+        defer { changingNetwork = false }
+        Log.info("leaving hotspot \(current) for saved Wi-Fi \(tag(network)) (\(signal) dBm), which is back in range; macOS rejoins it")
+        joinedHotspot = nil
+        handingBack = (network, clock().addingTimeInterval(HandBackMachine.grace))
+        do {
+            try await hotspotJoiner.leave(interfaceName: iface)
+        } catch {
+            Log.error("leaving hotspot \(current) failed: \(error.localizedDescription)")
+            handingBack = nil
+            joinedHotspot = current
+        }
+    }
+
+    /// One join attempt: the configured hotspots in priority order
+    /// (`Config.hotspotsToJoin`), each read from the keychain and joined,
+    /// until one joins. A hotspot whose password is missing or unreadable
+    /// is reported and skipped, and so is one the scan does not find or
+    /// that refuses the join, so the next one on the list gets its turn.
+    /// A phone or tablet macOS sees over Bluetooth is woken first, since
+    /// it keeps its hotspot off the air while nothing uses it, and joined
+    /// with the network and password it hands over (`HotspotWaking`).
+    /// Those nearby go ahead of the rest, in the order of the list. No
+    /// Wi-Fi scan comes before the joins: one did, and every join right
+    /// after it failed with "Resource busy".
+    func joinHotspot() async {
+        let hotspots = configProvider().hotspotsToJoin
+        guard !hotspots.isEmpty else {
+            Log.info("hotspot join skipped: no hotspot configured")
             return
         }
         guard let iface = wifiInterface else {
             Log.error("hotspot join skipped: no Wi-Fi interface")
             return
         }
-        // Off the main actor, behind any save Settings has running, which
-        // may be waiting on a keychain dialog. Everything the join depends
-        // on is checked again after the wait: the session, the outage and
-        // the configured SSID.
+        // A move or a hand-back is changing the network; the retry comes back.
+        guard !changingNetwork else {
+            Log.info("hotspot join skipped: a move or hand-back is under way")
+            return
+        }
+        // A hand-back left the hotspot on purpose: give macOS its time to
+        // rejoin the saved network. The retry comes back.
+        if let h = handingBack {
+            let left = h.until.timeIntervalSince(clock())
+            guard left <= 0 else {
+                Log.info("hotspot join held: macOS has \(Int(left.rounded(.up))) s more to rejoin \(tag(h.network))")
+                return
+            }
+            Log.info("macOS did not rejoin \(tag(h.network)) within \(Int(HandBackMachine.grace)) s; joining a hotspot, and no more hand-backs to it this session")
+            refusedHandBacks.append(h.network)
+            handingBack = nil
+        }
         let epoch = self.epoch
         let outage = self.outage
-        let keychain = self.keychain
-        let read: Result<String?, any Error>
-        do {
-            read = .success(try await keychainQueue.run { try keychain.get(service: KeychainStore.service, account: ssid) })
-        } catch {
-            read = .failure(error)
-        }
-        guard !Task.isCancelled, self.epoch == epoch else {
-            Log.info("hotspot join dropped: the session ended during the keychain read")
+        let near = await waker.nearbyNames()
+        guard !Task.isCancelled, self.epoch == epoch, self.outage == outage else {
+            Log.info("hotspot join dropped: the session ended or Wi-Fi recovered during the Bluetooth look")
             return
         }
-        guard self.outage == outage else {
-            Log.info("hotspot join dropped: Wi-Fi recovered during the keychain read")
-            return
+        let isNear = { (ssid: String) in HotspotSSID.any(of: near, matches: ssid) }
+        let order = hotspots.filter(isNear) + hotspots.filter { !isNear($0) }
+        if !near.isEmpty {
+            Log.info("bluetooth sees \(order.filter(isNear).count) of \(hotspots.count) hotspots nearby")
         }
-        // Settings may have changed the hotspot meanwhile. The answer, a
-        // password or a problem, is about the old one; the retry timer
-        // stays, and the next tick reads the hotspot configured then.
-        guard HotspotSSID.normalized(configProvider().hotspotSSID) == ssid else {
-            Log.info("hotspot join dropped: the hotspot SSID changed during the keychain read")
-            return
-        }
-        let password: String
-        switch read {
-        case let .success(p?):
-            password = p
-            passwordReport = nil
-        case .success(nil):
-            report(.missing, for: ssid)
-            return
-        case let .failure(error as KeychainError):
-            report(error.problem, for: ssid)
-            return
-        case let .failure(error):
-            report(.error(error.localizedDescription), for: ssid)
-            return
-        }
-        Log.info("joining hotspot \(ssid) on \(iface) (attempt \(machine.joins))")
-        do {
-            let joined = try await hotspotJoiner.join(ssid: ssid, password: password, interfaceName: iface)
-            if !joined {
-                Log.error("CoreWLAN scan found no network for hotspot \(ssid); retrying with backoff")
+        // Only the first problem of the pass becomes the report, so the
+        // menu names the first hotspot tried that has one. Every problem
+        // is still logged and notified.
+        var reported = false
+        for ssid in order {
+            let place = Self.place(of: ssid, in: hotspots)
+            let suffix = place.map { ", \($0)" } ?? ""
+            // Settings may have taken it off the list while an earlier
+            // hotspot was read or joined.
+            guard configProvider().hotspotsToJoin.contains(ssid) else { continue }
+            if isNear(ssid) {
+                switch await joinWoken(ssid, interfaceName: iface, place: suffix) {
+                case .joined: return
+                case .gone: return
+                case .notWoken: break
+                case .notJoined: continue
+                }
             }
-        } catch {
-            Log.error("CoreWLAN hotspot join failed: \(error.localizedDescription)")
+            // Handed over by a wake earlier this session.
+            if let earlier = handedOver[HotspotSSID.folded(ssid)] {
+                Log.info("joining hotspot \(earlier.ssid) on \(iface) with the password it handed over earlier (attempt \(machine.joins)\(suffix))")
+                if await failoverJoin(earlier, interfaceName: iface, label: "hotspot \(earlier.ssid)") { return }
+                guard !Task.isCancelled, self.epoch == epoch, self.outage == outage else { return }
+                continue
+            }
+            // Off the main actor, behind any save Settings has running,
+            // which may be waiting on a keychain dialog. Everything the
+            // join depends on is checked again after the wait: the
+            // session, the outage and the configured hotspots.
+            let read = await readPassword(for: ssid)
+            guard !Task.isCancelled, self.epoch == epoch else {
+                Log.info("hotspot join dropped: the session ended during the keychain read")
+                return
+            }
+            guard self.outage == outage else {
+                Log.info("hotspot join dropped: Wi-Fi recovered during the keychain read")
+                return
+            }
+            // Settings may have changed the hotspots meanwhile. The answer,
+            // a password or a problem, is about one no longer configured;
+            // the retry timer stays, and the next tick reads the hotspots
+            // configured then.
+            let configured = configProvider().hotspotsToJoin
+            guard configured.contains(ssid) else {
+                Log.info("hotspot join dropped: the hotspot SSID changed during the keychain read\(suffix)")
+                continue
+            }
+            let password: String
+            switch read {
+            case let .success(p?):
+                password = p
+                // A readable password ends the report about this hotspot,
+                // and one about a hotspot no longer configured.
+                if let current = passwordReport, current.ssid == ssid || !configured.contains(current.ssid) {
+                    passwordReport = nil
+                }
+            case .success(nil) where configProvider().hotspotPriorityEnabled:
+                // The list needs no saved password: a device it could not
+                // wake is skipped for now, with no report.
+                Log.info("hotspot join skipped (\(place ?? "the hotspot")): not woken over Bluetooth, and no password saved")
+                continue
+            case .success(nil):
+                report(.missing, for: ssid, place: place, publish: !reported)
+                reported = true
+                continue
+            case let .failure(error):
+                report(HotspotPasswordProblem(error), for: ssid, place: place, publish: !reported)
+                reported = true
+                continue
+            }
+            Log.info("joining hotspot \(ssid) on \(iface) (attempt \(machine.joins)\(suffix))")
+            if await failoverJoin(HotspotCredentials(ssid: ssid, password: password), interfaceName: iface, label: "hotspot \(ssid)") { return }
+            // The scan and the join take seconds: the session may have
+            // ended or Wi-Fi come back meanwhile, and then the next
+            // hotspot must not be joined.
+            guard !Task.isCancelled, self.epoch == epoch, self.outage == outage else { return }
         }
     }
 
-    /// The join is skipped: log it, show it in the menu, and notify once per
-    /// outage and hotspot. The log line names the problem, not the SSID.
-    private func report(_ problem: HotspotPasswordProblem, for ssid: String) {
-        Log.error("hotspot join skipped: \(problem.explanation)")
-        passwordReport = HotspotPasswordReport(ssid: ssid, problem: problem)
+    private enum WokenJoin { case joined, notJoined, notWoken, gone }
+
+    /// Wakes the device named `ssid` and joins the network it hands over,
+    /// looking for it a few times while it comes on the air. `notWoken`
+    /// leaves the saved password to try; `gone` means the session ended or
+    /// Wi-Fi came back meanwhile.
+    private func joinWoken(_ ssid: String, interfaceName iface: String, place: String) async -> WokenJoin {
+        let epoch = self.epoch
+        let outage = self.outage
+        let valid = { !Task.isCancelled && self.epoch == epoch && self.outage == outage }
+        Log.info("waking hotspot \(ssid) over Bluetooth\(place)")
+        let started = clock()
+        let woken = await waker.wake(ssid)
+        guard valid() else { return .gone }
+        guard let woken else {
+            Log.info("hotspot \(ssid) did not wake; trying its saved password")
+            return .notWoken
+        }
+        handedOver[HotspotSSID.folded(ssid)] = woken
+        Log.info("hotspot \(woken.ssid) woke after \(String(format: "%.1f", clock().timeIntervalSince(started))) s")
+        for look in 1...wokenJoinTries {
+            Log.info("joining woken hotspot \(woken.ssid) on \(iface) (look \(look) of \(wokenJoinTries)\(place))")
+            if await failoverJoin(woken, interfaceName: iface, label: "woken hotspot \(woken.ssid)") { return .joined }
+            guard valid() else { return .gone }
+            if look < wokenJoinTries {
+                try? await Task.sleep(for: wokenJoinWait)
+                guard valid() else { return .gone }
+            }
+        }
+        return .notJoined
+    }
+
+    private enum JoinOutcome { case joined, notFound, failed(any Error) }
+
+    /// Joins `credentials`; once joined, it is the hotspot Insomnia joined.
+    private func join(_ credentials: HotspotCredentials, interfaceName iface: String) async -> JoinOutcome {
+        do {
+            guard try await hotspotJoiner.join(ssid: credentials.ssid, password: credentials.password, interfaceName: iface) else { return .notFound }
+            joinedHotspot = credentials.ssid
+            return .joined
+        } catch {
+            return .failed(error)
+        }
+    }
+
+    /// A failover join of `credentials`, its failure logged about `label`.
+    private func failoverJoin(_ credentials: HotspotCredentials, interfaceName iface: String, label: String) async -> Bool {
+        switch await join(credentials, interfaceName: iface) {
+        case .joined:
+            return true
+        case .notFound:
+            Log.error("CoreWLAN scan found no network for \(label)")
+        case let .failed(error):
+            Log.error("CoreWLAN join of \(label) failed: \(error.localizedDescription)")
+        }
+        return false
+    }
+
+    /// "hotspot 2 of 3" for the log, matched whichever apostrophe; nil
+    /// with one hotspot configured, or for one not on the list.
+    static func place(of ssid: String, in hotspots: [String]) -> String? {
+        guard hotspots.count > 1, let index = hotspots.firstIndex(where: { HotspotSSID.matches($0, ssid) }) else { return nil }
+        return "hotspot \(index + 1) of \(hotspots.count)"
+    }
+
+    /// The network name and password to join the hotspot `ssid` with:
+    /// what the device hands over when woken (only when `waking`), else
+    /// what it handed over earlier this session, else its saved password.
+    private func credentials(for ssid: String, waking: Bool) async -> HotspotCredentials? {
+        if waking, let woken = await waker.wake(ssid) {
+            handedOver[HotspotSSID.folded(ssid)] = woken
+            return woken
+        }
+        if let earlier = handedOver[HotspotSSID.folded(ssid)] { return earlier }
+        if case let .success(password?) = await readPassword(for: ssid) {
+            return HotspotCredentials(ssid: ssid, password: password)
+        }
+        return nil
+    }
+
+    private func readPassword(for ssid: String) async -> Result<String?, any Error> {
+        let keychain = self.keychain
+        do {
+            return .success(try await keychainQueue.run { try keychain.get(service: KeychainStore.service, account: ssid) })
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    /// The join is skipped: log it, show it in the menu when `publish`,
+    /// and notify once per outage and hotspot. The log line names the
+    /// problem and the hotspot's place on the list, not the SSID. With
+    /// several hotspots configured (a `place`) the notification names the
+    /// one it is about.
+    private func report(_ problem: HotspotPasswordProblem, for ssid: String, place: String?, publish: Bool) {
+        Log.error("hotspot join skipped\(place.map { " (\($0))" } ?? ""): \(problem.explanation)")
+        if publish {
+            passwordReport = HotspotPasswordReport(ssid: ssid, problem: problem)
+        }
         guard notifiedThisOutage.insert(ssid).inserted else { return }
-        notifier.post(title: "Hotspot not joined", body: problem.explanation)
+        notifier.post(title: place != nil ? "Hotspot \"\(ssid)\" not joined" : "Hotspot not joined", body: problem.explanation)
     }
 
     private func recovered(start: Date, gap: TimeInterval) async {
@@ -1072,6 +1684,9 @@ final class NetworkFailover {
         let line = FailoverMachine.logLine(start: start, end: end, gap: gap)
         appendHandoff(line)
         Log.info("wifi path satisfied after \(FailoverMachine.humanGap(gap))")
+        if let iface = wifiInterface {
+            landed(on: await scanner.currentSSID(interfaceName: iface).map(HotspotSSID.normalized))
+        }
         let config = configProvider()
         if gap >= config.nudgeThreshold {
             // Each pane is only nudged while this session is still the live one.
@@ -1092,6 +1707,67 @@ final class NetworkFailover {
         // A stopped driver must not write into the next session's status.
         guard self.epoch == epoch else { return }
         onRecovered?(gap)
+    }
+
+    /// Logs the network an outage ended on, by its tag, and what that
+    /// means for the hotspot Insomnia joined: on any network but a listed
+    /// hotspot, the Mac has left it.
+    private func landed(on now: String?) {
+        let hotspots = configProvider().hotspotsToJoin
+        let listed = now.map { HotspotSSID.any(of: hotspots, matches: $0) } ?? false
+        if let h = handingBack {
+            handingBack = nil
+            if let now, !listed {
+                Log.info("handed back: macOS rejoined saved Wi-Fi \(tag(now))")
+            } else {
+                Log.info("hand-back to \(tag(h.network)): macOS joined \(now.map { tag($0) } ?? "a network it does not name") instead; no more hand-backs to it this session")
+                refusedHandBacks.append(h.network)
+                // Back on a listed hotspot because of the hand-back: it is
+                // still Insomnia's, so the next try comes after the cooldown.
+                if let now { joinedHotspot = now }
+            }
+            return
+        }
+        guard let now else {
+            Log.info("back online; macOS does not name the network")
+            return
+        }
+        Log.info("back online on \(tag(now))\(Self.place(of: now, in: hotspots).map { ", \($0)" } ?? "")")
+        observe(now)
+    }
+
+    /// The Mac is on `current`: on a network that is not a listed
+    /// hotspot, it has left the one Insomnia joined.
+    private func observe(_ current: String?) {
+        guard let current, let joined = joinedHotspot, !HotspotSSID.matches(current, joined),
+              !HotspotSSID.any(of: configProvider().hotspotsToJoin, matches: current) else { return }
+        joinedHotspot = nil
+    }
+
+    private struct JoinedHotspotRecord: Codable {
+        let ssid: String
+    }
+
+    private static func loadJoinedHotspot(_ paths: Paths) -> String? {
+        do {
+            return try Store(paths: paths).read(JoinedHotspotRecord.self, from: paths.joinedHotspotFile)?.ssid
+        } catch {
+            Log.error("joined-hotspot.json: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func saveJoinedHotspot() {
+        let store = Store(paths: paths)
+        do {
+            if let joinedHotspot {
+                try store.write(JoinedHotspotRecord(ssid: joinedHotspot), to: paths.joinedHotspotFile)
+            } else {
+                try store.remove(at: paths.joinedHotspotFile)
+            }
+        } catch {
+            Log.error("joined-hotspot.json: \(error.localizedDescription)")
+        }
     }
 
     /// Owner-only, rotated to handoffs.log.1 past OwnerOnly.maxLogBytes.

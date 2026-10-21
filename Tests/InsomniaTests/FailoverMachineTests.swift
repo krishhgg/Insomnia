@@ -17,6 +17,8 @@ final class RecordingHotspotJoiner: HotspotJoining, @unchecked Sendable {
         lock.withLock { _calls.append(Call(ssid: ssid, password: password, interfaceName: interfaceName)) }
         return result
     }
+
+    func leave(interfaceName: String) async throws {}
 }
 
 final class FailoverMachineTests: XCTestCase {

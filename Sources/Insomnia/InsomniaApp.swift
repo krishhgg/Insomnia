@@ -31,7 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     override init() {
         let manager = SessionManager.live()
         self.manager = manager
-        secrets = KeychainHotspotSecretStore(keychain: KeychainStore()) {
+        secrets = KeychainHotspotSecretStore(
+            keychain: KeychainStore(),
+            stillNamed: { ssid in manager.config.priorityHotspotList.contains(ssid) }
+        ) {
             manager.config.hotspotSSID
         }
         if let services = manager.services {

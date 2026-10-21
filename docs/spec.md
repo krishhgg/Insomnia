@@ -655,8 +655,14 @@ provided by the standalone backstop. Performance effects depend on workload.
 ### 7. Network failover
 
 - `NWPathMonitor` on the Wi-Fi interface. Event-driven.
-- Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
-  scan, then join with `associate(to:password:)`. The password is read from
+- Path unsatisfied for more than 5 s when the outage started on the
+  hotspot Insomnia joined (`joinedHotspot`) or with `aggressiveHotspotJoin`
+  on, and for 20 s otherwise (`FailoverMachine.patientDelay`): macOS gets
+  that long to rejoin the network it dropped by itself, since a join
+  meanwhile failed with "Resource busy" and woke a hotspot for nothing
+  (measured 2026-10-20: home Wi-Fi blips took macOS 14 s). Then use
+  CoreWLAN to run an SSID-filtered scan and join with
+  `associate(to:password:)`. The password is read from
   the login Keychain (generic-password service `insomnia-hotspot`, account =
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
@@ -772,6 +778,112 @@ provided by the standalone backstop. Performance effects depend on workload.
     Check GUI agents."
 - Recommended one-time setting, documented in docs/extras.md: System Settings >
   Wi-Fi > "Ask to join hotspots" = Automatically.
+- Priority list (`hotspotPriorityEnabled`, off by default; `priorityHotspots`,
+  highest first). With it on, an outage tries the list in place of
+  `hotspotSSID` (`Config.hotspotsToJoin`: trimmed, without blanks or
+  repeats). Turning it on with an empty list starts it with `hotspotSSID`.
+  Each hotspot's password is the same keychain item as above, account = its
+  SSID, so one shared with `hotspotSSID` is one item. An item is deleted
+  only when neither `hotspotSSID` nor the list names it
+  (`Config.namesHotspot`): removing a hotspot from the list keeps the
+  single hotspot's item, and editing `hotspotSSID` away keeps one the list
+  names. A listed SSID never changes: renaming is remove and add, so a
+  keychain answer in Settings is never about a name edited while it waited.
+  Each join attempt starts with no Wi-Fi scan: one did, and in the field
+  (macOS 27, lid closed, no network) every join right after it failed with
+  POSIX EBUSY, "Resource busy". It asks `HotspotWaking.nearbyNames` which
+  hotspots macOS sees over Bluetooth. Those go first, in list order, then
+  the rest in list order. A hotspot seen nearby is woken
+  (`HotspotWaking.wake`, `SharingHotspotWaker` in the app and
+  `NoHotspotWaker` by default, so no test wakes a real device) and joined
+  with the network and password it hands over, up to
+  `wokenJoinTries` (3) looks `wokenJoinWait` (3 s) apart; one never found
+  moves on to the next hotspot, and one that does not wake falls back to
+  its saved password. Otherwise each is read from the keychain and joined
+  until one joins. Names match with the apostrophes folded
+  (`HotspotSSID.matches`), and the join scans for the other apostrophe's
+  spelling when the first finds nothing. A CoreWLAN scan or association
+  that fails with EBUSY is tried up to 3 times, 2 s apart. What a woken
+  device hands over is kept in memory for the session (`handedOver`,
+  cleared by `stop()`, never written), and a hotspot not woken is joined
+  with it before the keychain is read. On the list a missing password is
+  no problem: the hotspot is skipped with a log line, with no report and no
+  notification, and Settings adds a name without a password. A hotspot
+  with an unreadable password, one the join's scan does not find, and one
+  whose association throws are each skipped for the next. The first problem of
+  an attempt becomes the `HotspotPasswordReport`, and a readable password
+  clears only a report about that hotspot or about one no longer
+  configured. Each skipped hotspot is notified once per outage; with
+  several configured, the notification and the menu line name it. After
+  every keychain read and every join the attempt checks again that the
+  session and the outage are the same, and after a read that the hotspot
+  is still configured. With one hotspot, the same: it is woken when seen
+  nearby, and the notification keeps the wording of the bullets above.
+- Switch-up (`hotspotSwitchUp`, on by default, active only with the list on
+  and only during a session). A 30 s timer, which exists only while the list
+  and switch-up or the hand-back are on (`NetworkFailover.syncHotspotChecks`,
+  rerun when Settings changes any of them), reads the current SSID through
+  CoreWLAN. On a lower hotspot of
+  the list, and outside an outage, it scans for the hotspots above
+  (`SwitchUpMachine`). A hotspot found at -70 dBm or stronger in two
+  consecutive scans is the target, the highest such one. The counting and
+  the cooldown are `SightingCounter`'s, shared with the hand-back. The move gets
+  both passwords first (`credentials`: the target is woken; otherwise
+  what a device handed over this session, otherwise the keychain), then
+  joins the target, whose own SSID-filtered
+  scan runs before the Mac leaves its network. A join refused after
+  leaving it, with the Mac on no network, rejoins the hotspot it left at
+  once. Every move, made or not, starts a 5 minute cooldown. While a move
+  or a hand-back runs (`changingNetwork`), the failover's join attempts
+  are skipped and their retries stay.
+  An outage, a change of network and `stop()` reset the count of
+  sightings.
+- Hand-back (`hotspotReturnToWiFi`, on by default, same timer and limits).
+  Only on the hotspot Insomnia joined last (`joinedHotspot`, set by every
+  join the failover, a move or a rejoin makes, matched whichever
+  apostrophe). It is kept in `joined-hotspot.json` (owner-only, written
+  through `Store`), outlives `stop()` and the process, and is cleared by a
+  hand-back and whenever the Mac is seen on a network that is not a listed
+  hotspot (`observe`: at `start()`, by a check, and after an outage). The check scans for saved networks
+  (`HotspotScanning.savedSignal`: one unfiltered scan intersected with
+  the interface configuration's network profiles, minus the listed
+  hotspots; empty while macOS hides names). `HandBackMachine` picks the
+  strongest one found at -70 dBm or stronger in two consecutive scans. It
+  runs before switch-up, so a saved network beats a higher hotspot.
+  CoreWLAN refuses `associate` without the password (error -3900, measured
+  on macOS 27), so the hand-back only disassociates
+  (`HotspotJoining.leave`). macOS's auto-join rejoined the saved network
+  14 s later. For `HandBackMachine.grace` (30 s) the failover's joins are
+  held and their retries stay. After that the failover joins as usual.
+  A listed hotspot the Mac landed on stays Insomnia's for the next try.
+  A saved network macOS did not rejoin, by the end of the grace or by
+  joining another network, goes on `refusedHandBacks` and is not handed
+  back to again until `stop()`. Every hand-back, made or not, starts
+  a 5 minute cooldown. `stop()` resets all of it.
+- Every recovery logs the network the Mac is on by its `NetworkTag`
+  ("network 3f9a1c07", plus "hotspot 2 of 3" for a listed one), and so
+  do the hand-back's lines about the saved network: the first 4 bytes of
+  an HMAC-SHA256 of the folded name, keyed with 32 random bytes made once
+  per install (`network-tag-key.json`, owner-only, through `Store`). Tags
+  tell networks apart within one Mac's log; without the key no list of
+  names reverses them. A recovery on a network that is not a listed
+  hotspot clears `joinedHotspot`.
+- Nearby names in Settings (priority list only, on the user's click). Two
+  sources: the phones and tablets sharingd lists for Instant Hotspot,
+  read through the private `SFRemoteHotspotSession` (browse while the
+  popover is open, up to 10 s; each `session:updatedFoundDevices:` list,
+  with `deviceName`, `signalStrength` and `batteryLife`, shows as it
+  comes; every class and selector is checked before use, and a missing
+  one yields no devices), and CoreWLAN: `cachedScanResults()` lists at
+  once, then an unfiltered scan adds to it without removing a name.
+  Measured on macOS 27: an ad-hoc signed process may browse and gets
+  sharingd's cached list at once; the cache reads in 0.03 s, while the
+  first scan in a process took 9 to 12 s. Settings never calls the
+  session's `enableHotspotForDevice:withCompletionHandler:`; the failover
+  does (above). Measured on macOS 27 from an ad-hoc signed process with
+  the lid closed: the completion came 2.7 s after the call with the
+  network name and the password, both strings, and a scan then found the
+  hotspot at -51 dBm. The password is never logged.
 
 ### 8. Reconcile and backstop (recovery goals)
 
@@ -1085,7 +1197,9 @@ older build is tightened when the app reads it:
   and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
-- hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
+- hotspot SSID (password entered once, stored in Keychain), or the priority
+  list on/off (default off) with its hotspots in order, each with its own
+  Keychain item, and switch-up on/off (default on); `nudgeThreshold`
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
@@ -1242,6 +1356,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
 | hotspot retry | only during an outage | none otherwise |
 | update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |
+| hotspot check (switch-up, hand-back) | 30 s timer, only during a session with the priority list and switch-up or the hand-back on | one wake and one read of the current SSID per 30 s; a scan only while the Mac is on a lower hotspot of the list or on the hotspot Insomnia joined |
 
 ## Repository layout
 
@@ -1279,7 +1394,9 @@ Insomnia/
       LidObserver.swift
       LidSimulation.swift
       LocationPermission.swift
+      NearbyHotspotDevices.swift
       NetworkFailover.swift
+      NetworkTag.swift
       Notifier.swift
       PowerMonitor.swift
       ShellTimeout.swift
@@ -1292,6 +1409,7 @@ Insomnia/
       MenuBarModel.swift
       Motion.swift
       PillView.swift
+      PriorityHotspotList.swift
       ReleaseCheck.swift
       ReminderScheduler.swift
       StatusMenu.swift
@@ -1308,6 +1426,7 @@ Insomnia/
     FloorRulesTests.swift
     FreezerTests.swift
     HardwarePortsParserTests.swift
+    HotspotPriorityTests.swift
     IntegrationWiringTests.swift
     LaunchdBackstopTests.swift
     LidActionsTests.swift

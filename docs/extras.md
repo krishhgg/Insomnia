@@ -42,6 +42,102 @@ when-in-use grant, so System Settings records it as Location Services access
 for Insomnia. Insomnia uses it only to read Wi-Fi network names through
 CoreWLAN and never requests your location.
 
+## Several hotspots in priority order
+
+Turn on **Join several hotspots in priority order** in Settings to replace the
+single hotspot with a list, highest priority first. The list starts with the
+hotspot already set, and its saved password comes with it. Add each other
+hotspot by name, and use the arrows to order them. An iPhone or iPad needs no
+password: Insomnia wakes it over Bluetooth and it hands its password over.
+Enter a password for any other hotspot, or as a fallback for a device
+Bluetooth can't reach.
+**Nearby…** lists names to pick from, so a device name with the curly
+apostrophe iOS puts in it does not have to be typed by hand. Under "Phones and
+tablets" are the devices macOS sees over Bluetooth, signed in to your Apple
+Account or in your family, even with their hotspot off; a device's hotspot
+uses its name. Insomnia reads that list through `SFRemoteHotspotSession` in
+the private Sharing framework, the list the Wi-Fi menu shows; Settings only
+browses it. On a macOS where that class is not
+as measured, the section is empty. Under "Wi-Fi networks" are the names
+macOS found in its own last scan, listed at once, and then those a fresh scan
+adds, which can take 10 s or more; both need Location permission. Another
+hotspot shows up there while it broadcasts. Each password is a login Keychain item under service `insomnia-hotspot`
+with the hotspot's name as the account, the same kind of item the single
+hotspot uses, with the same access list. Saving a name already on the list
+replaces its password. Removing a hotspot deletes its item, unless the single
+hotspot setting still names it. Turning the list off goes back to the single
+hotspot and keeps the list for later.
+
+When the Wi-Fi drops during a session, Insomnia waits 5 s, as with one
+hotspot, so macOS can rejoin a network itself. An iPhone or iPad keeps its
+hotspot off the air while nothing uses it, even with "Allow Others to Join"
+on, so a Wi-Fi scan cannot find it. So Insomnia first asks which listed
+devices macOS sees over Bluetooth, and tries those first, in list order: it
+asks the device to turn its hotspot on, as the Wi-Fi menu does when you pick
+it, and joins with the network name and password the device hands back,
+looking for it up to 3 times while it comes on the air. The rest follow in
+list order. Each is joined with the password it handed over earlier in the
+session, else with its saved password. Insomnia keeps a handed-over password in
+memory until the session ends and never writes it anywhere. Names match
+whichever apostrophe they use. A hotspot that didn't wake and has no saved
+password is skipped quietly. One whose saved password is unreadable is skipped
+too. The menu names the first such one, and each gets one notification per
+outage, with its name. Retries follow the same backoff: 5,
+10, 20, then every 30 s.
+
+**Move to a higher hotspot when it is back in range** is on by default with
+the list. Every 30 s during a session, while the Mac is on a lower hotspot on
+the list, Insomnia scans for the hotspots above it. Once two scans in a row
+find one at -70 dBm or stronger, Insomnia wakes the higher device for its
+password (else uses one it handed over or a saved one), then joins the
+higher hotspot. The join scans for it once more before it leaves the current
+network, so a hotspot that went away in the meantime costs no time offline. If
+the join is refused and leaves the Mac on no network, Insomnia rejoins the
+hotspot it left at once. After a move, made or not, the next one waits 5
+minutes. On the top hotspot, or on a network that is not on the list, a check
+reads only the current network's name and scans nothing. With the list or
+the move turned off there is no check at all. Each move takes the Mac offline
+for as long as the join takes, and `handoffs.log` records that gap like any
+other outage.
+
+**Return to a saved Wi-Fi network when one is back in range** is also on by
+default with the list. It covers getting home with the Mac still on a hotspot.
+Every 30 s during a session, while the Mac is on a hotspot Insomnia joined,
+Insomnia scans for the Wi-Fi networks macOS has saved, other than the hotspots
+on the list. Once two scans in a row find one at -70 dBm or stronger,
+Insomnia leaves the hotspot and macOS's own auto-join rejoins the saved
+network, about 15 s offline. Insomnia never has that network's password, so
+it does not join it itself. For 30 s after it leaves, the failover holds its
+joins while macOS rejoins. If the Mac is still offline after that, the failover
+joins a hotspot as in any other outage. A saved network takes precedence over
+a higher hotspot. A hotspot you or macOS joined is left alone. Insomnia remembers which hotspot it
+joined in `joined-hotspot.json`, so a restart, a reinstall or a new session
+still hands back. It forgets once a check finds the Mac on a network that is
+not one of the listed hotspots. After a
+hand-back, made or not, the next one waits 5 minutes, and a network macOS did
+not rejoin is not handed back to again that session. Any saved network
+counts, including a café's with a sign-in page, so turn this off if that gets
+in the way.
+
+Insomnia does not change macOS's own **Ask to join hotspots** setting. CoreWLAN
+can scan for a hotspot and join it, but it has no call to wake one. macOS can
+wake a nearby iPhone or iPad hotspot over Bluetooth (Instant Hotspot). So leave
+that setting on Automatically: macOS gets the first seconds of an outage,
+Insomnia takes over after that, and the move up the list corrects macOS if it
+picked a lower hotspot.
+
+When the Wi-Fi network that drops is one macOS joined, such as your home
+network, Insomnia waits 20 s before it wakes a hotspot, so a brief blip ends
+with macOS rejoining that network and no hotspot turned on. When a hotspot
+Insomnia joined drops, it moves on after 5 s. Turn on **Join a hotspot as soon
+as Wi-Fi drops (aggressive)** for the 5 s wait in every outage.
+
+insomnia.log does not name the Wi-Fi networks the Mac lands on or hands back
+to. Each one appears as a tag such as `network 3f9a1c07`, made with a key kept
+only on this Mac (`network-tag-key.json`), so a tag tells two networks apart
+but can't be traced back to a network's name. Hotspots on the list keep their
+names.
+
 ## tmux nudge
 
 After a long outage (90 seconds by default) Insomnia types `continue` into
