@@ -110,9 +110,9 @@ final class LidActionsTests: XCTestCase {
 
     /// The live defect: the lid closes after the panel idle-dimmed and
     /// slept. The display reads its dim value and the keyboard reads 0.
-    /// Restoring those would leave a dim panel and a dead backlight; the
-    /// last trusted sample is journaled instead. Both are still set to 0.
-    func testAsleepAndSuppressedAtCloseJournalsTheLastTrustedSample() async throws {
+    /// Restore the display sample; leave an already-zero keyboard alone,
+    /// since suppression also describes a keyboard the user turned off.
+    func testAsleepDisplayUsesSampleAndZeroKeyboardIsLeftAlone() async throws {
         let idle = Locked<Double>(3)
         let sampler = makeSampler(idle: idle)
         let (m, actions) = await make(sampler: sampler)
@@ -128,14 +128,14 @@ final class LidActionsTests: XCTestCase {
 
         let s = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(s.savedDisplayBrightness, 0.7, "the idle-dim value was journaled")
-        XCTAssertEqual(s.savedKeyboardBrightness, 0.5, "the suppressed 0 was journaled")
+        XCTAssertNil(s.savedKeyboardBrightness)
         XCTAssertEqual(h.display.sets, [0])
-        XCTAssertEqual(h.keyboard.sets, [0])
+        XCTAssertEqual(h.keyboard.sets, [])
         XCTAssertNil(m.lastError)
 
         await actions.onOpen()
         XCTAssertEqual(h.display.sets, [0, 0.7])
-        XCTAssertEqual(h.keyboard.sets, [0, 0.5])
+        XCTAssertEqual(h.keyboard.sets, [])
     }
 
     /// Nothing trustworthy is known for the keyboard and it reads 0 under
@@ -157,7 +157,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.7)
         XCTAssertEqual(h.procs.suspended.count, 2)
         XCTAssertNil(m.lastError)
-        XCTAssertTrue(logText().contains("keyboard backlight suppressed by display sleep and no trusted sample; leaving it to macOS"), logText())
+        XCTAssertTrue(logText().contains("keyboard backlight already reads zero; leaving its automatic or user-off state untouched"), logText())
 
         await actions.onOpen()
         XCTAssertEqual(h.keyboard.sets, [])
@@ -649,7 +649,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [0, 0.5, 0])
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.7, "the second close is journaled")
         let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
-        XCTAssertTrue(log.contains("display restore re-assert skipped: darkened again"), log)
+        XCTAssertTrue(log.contains("pending brightness re-assert canceled: lid closed again"), log)
         XCTAssertFalse(log.contains("display restore re-asserted"), log)
     }
 
