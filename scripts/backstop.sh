@@ -18,7 +18,8 @@
 # state.json, decide, undo, publish the new journal atomically, release. If
 # the lock is not free within LOCK_TIMEOUT_SECONDS the run does nothing and
 # exits 75; launchd retries a minute later. The lock file is never unlinked
-# or replaced here, so every party locks the same inode.
+# or replaced here, so every party locks the same inode. The one run that
+# skips the lock is the idle one (see Idle below).
 #
 # Locking detail: the script opens the lock file on fd 9 and locks that fd
 # with `lockf <fd>`. If a caller (uninstall.sh) already holds the lock and
@@ -120,9 +121,11 @@
 #                              defaults delete <bundleId> NSAppSleepDisabled
 #                              when the key was absent. A delete that fails
 #                              counts as done only when defaults read then
-#                              says the key does not exist; a read that
-#                              fails any other way proves nothing and the
-#                              entry stays.
+#                              says the key is not there ("does not exist"
+#                              up to macOS 26, "Could not find key" or
+#                              "Domain ... not found" on macOS 27); a read
+#                              that fails any other way proves nothing and
+#                              the entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
@@ -220,6 +223,36 @@ log() { # level message
   "$MKDIR" -p "$LOG_DIR"
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
+
+# --- Idle ---------------------------------------------------------------------
+# launchd runs this every 60 s, and between sessions there is nothing to do:
+# no session.json, and the clean journal the app leaves behind. That run ends
+# here, before the lock and without starting a process. The journal must match
+# token for token; anything else, and every --force run, goes the full way.
+#
+# No lock is needed: the app publishes each file with one rename, and this
+# pair means nothing to undo on either side of a transaction. tighten is
+# skipped too; install.sh's --force run and every non-idle run still do it.
+if (( force == 0 )) && [[ ! -e "$SESSION" && ! -L "$SESSION" && -f "$STATE" ]]; then
+  idle_ws=$'[ \t\r\n]*'
+  idle_clean="^$idle_ws"
+  for idle_token in '\{' \
+      '"appNapOverrides"' : '\[' '\]' ',' \
+      '"dockerFrozen"' : false ',' \
+      '"frozenProcesses"' : '\[' '\]' ',' \
+      '"lowPowerSetByUs"' : false ',' \
+      '"savedAudioOutputs"' : '\[' '\]' ',' \
+      '"sleepDisabledByUs"' : false \
+      '\}'; do
+    idle_clean+="$idle_token$idle_ws"
+  done
+  idle_clean+='$'
+  idle_journal=""
+  # read returns non-zero at end of file; zero means it stopped at a NUL byte.
+  if ! { IFS= read -r -d '' idle_journal < "$STATE"; } 2>/dev/null && [[ "$idle_journal" =~ $idle_clean ]]; then
+    exit 0
+  fi
+fi
 
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
@@ -1352,7 +1385,9 @@ if (( app_nap_count > 0 )); then
       # The key was absent before, so it goes. `defaults delete` fails when
       # the key is already gone, which is the wanted state. A failed delete
       # clears the entry only when `defaults read` then says in so many
-      # words that the key does not exist. A read that succeeds means the
+      # words that the key is not there: "does not exist" up to macOS 26,
+      # "Could not find key" for an existing domain and "Domain ... not
+      # found" for a missing one on macOS 27. A read that succeeds means the
       # key is still set; one that fails any other way (cfprefsd not
       # answering, a timeout) proves nothing, so the entry stays for the
       # next run.
@@ -1371,7 +1406,7 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif grep -q "does not exist" "$probe" 2>/dev/null; then
+        elif grep -qE "does not exist|Could not find key 'NSAppSleepDisabled' in domain '|Domain '[^']*' not found\." "$probe" 2>/dev/null; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else

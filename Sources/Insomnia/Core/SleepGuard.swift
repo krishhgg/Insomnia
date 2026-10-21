@@ -33,7 +33,7 @@ struct SleepDisableRevertedError: Error, LocalizedError, Sendable {
     let settle: TimeInterval
 
     var errorDescription: String? {
-        "macOS set SleepDisabled back to 0 within \(Int(settle)) s of `pmset -a disablesleep 1`, so closing the lid would still sleep this Mac"
+        "SleepDisabled read 0 again within \(Int(settle)) s of `pmset -a disablesleep 1`; another process may be resetting it, so closing the lid would still sleep this Mac"
     }
 }
 
@@ -49,10 +49,11 @@ struct PmsetSleepGuard: SleepGuarding {
     /// reported as still running. The same 3 s as KILL_GRACE_SECONDS in
     /// scripts/backstop.sh.
     static let stopGrace: TimeInterval = 3
-    /// How long after `pmset -a disablesleep 1` the bit is read back. On
-    /// macOS 26.6.2 (25G83) pmset exits 0 and `pmset -g` reads SleepDisabled
-    /// 1 for about 2 s, then powerd reloads the Energy Saver preferences and
-    /// it reads 0 for good, so a closed lid sleeps the Mac mid-session.
+    /// How long after `pmset -a disablesleep 1` the bit is read back. pmset
+    /// can exit 0 while another process puts the bit back: on one Mac a root
+    /// LaunchDaemon from another keep-awake tool ran `pmset -a disablesleep 0`
+    /// every 2 s outside its own schedule, so `pmset -g` read SleepDisabled 1
+    /// for about 2 s and then 0, and a closed lid slept the Mac mid-session.
     static let settle: TimeInterval = 5
 
     /// The app uses the defaults; tests point `sudo` at a fake, shorten the
@@ -139,7 +140,7 @@ struct PmsetSleepGuard: SleepGuarding {
     /// The first `SleepDisabled` line in `pmset -g` output: true for `1`,
     /// false for `0`, nil when there is no such line or its value is
     /// anything else. The read back after a disable uses this, so output it
-    /// cannot read is not reported as macOS putting the bit back.
+    /// cannot read is not reported as the bit being put back.
     static func readSleepDisabled(_ output: String) -> Bool? {
         for rawLine in output.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)

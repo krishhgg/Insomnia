@@ -2,8 +2,8 @@ import XCTest
 @testable import Insomnia
 
 /// `pmset -a disablesleep 1` exiting 0 does not prove that sleep is disabled:
-/// on macOS 26.6.2 (25G83) `pmset -g` reads SleepDisabled 1 for about 2 s,
-/// then 0 for good. `sudo` and `pmset` are tiny `/bin/sh` scripts in a
+/// another process can put SleepDisabled back to 0 a moment later, as a
+/// keep-awake LaunchDaemon did every 2 s on one Mac. `sudo` and `pmset` are tiny `/bin/sh` scripts in a
 /// private temp dir that record their calls, so nothing here runs sudo or
 /// pmset or changes a power setting.
 final class SleepGuardReadBackTests: XCTestCase {
@@ -38,7 +38,7 @@ final class SleepGuardReadBackTests: XCTestCase {
     }
 
     /// A sudo that exits 0, and a pmset whose `-g` reads SleepDisabled 1
-    /// until the settle wait has run, as on 25G83, then prints `afterSettle`
+    /// until the settle wait has run, as on that Mac, then prints `afterSettle`
     /// and exits `status` (to stderr when `status` is not 0). The wait does
     /// not sleep: it records `wait <seconds>` and marks the time as passed.
     /// All three append to `calls`.
@@ -90,9 +90,9 @@ final class SleepGuardReadBackTests: XCTestCase {
         let sleepGuard = try fakeGuard(afterSettle: sleepDisabled("0"))
         do {
             try await disableSleep(sleepGuard)
-            XCTFail("a disable that macOS put back returned")
+            XCTFail("a disable that was put back returned")
         } catch let error as SleepDisableRevertedError {
-            XCTAssertEqual(error.localizedDescription, "macOS set SleepDisabled back to 0 within 5 s of `pmset -a disablesleep 1`, so closing the lid would still sleep this Mac")
+            XCTAssertEqual(error.localizedDescription, "SleepDisabled read 0 again within 5 s of `pmset -a disablesleep 1`; another process may be resetting it, so closing the lid would still sleep this Mac")
         }
         XCTAssertEqual(try calls(), expectedCalls)
     }
@@ -103,8 +103,8 @@ final class SleepGuardReadBackTests: XCTestCase {
         XCTAssertEqual(try calls(), expectedCalls)
     }
 
-    /// Output with no SleepDisabled 0 or 1 is not proof that macOS put the
-    /// bit back. The disable still throws, but says the read failed.
+    /// Output with no SleepDisabled 0 or 1 is not proof that the bit was put
+    /// back. The disable still throws, but says the read failed.
     func testUnreadableReadBackIsAReadErrorNotARevert() async throws {
         for output in ["System-wide power settings:\n standby 1\n", "", sleepDisabled("2")] {
             try? FileManager.default.removeItem(atPath: file("calls"))

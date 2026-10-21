@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import XCTest
 import InsomniaTestHome
 @testable import Insomnia
@@ -759,6 +760,17 @@ final class FakeBackstop: BackstopScheduling, @unchecked Sendable {
         if failArm { throw BackstopError(message: "fake launchd refused") }
         lock.withLock { _arms += 1 }
     }
+}
+
+/// The Security framework's message for `status`, in the language the test
+/// process runs in. `CodeRequirement` and `KeychainError` word their errors
+/// with it, so a test that checks which failure an error names compares
+/// against this, not the English text, and passes on a Mac set to another
+/// language. Not for text a child process prints: `codesign` and the other
+/// command line tools answer in English whatever the language, so a test
+/// that reads their output keeps the literal text.
+func securityMessage(_ status: OSStatus) -> String {
+    SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
 }
 
 /// A mutable fake clock usable from the @Sendable clock closure.
