@@ -98,7 +98,10 @@ struct DurationInput: Equatable, Sendable {
     /// non-zero has been entered.
     var total: TimeInterval? {
         guard Field.allCases.allSatisfy(isValid) else { return nil }
-        let seconds = TimeInterval((days ?? 0) * 86_400 + (hours ?? 0) * 3_600 + (minutes ?? 0) * 60)
+        let d: Int = (days ?? 0) * 86_400
+        let h: Int = (hours ?? 0) * 3_600
+        let m: Int = (minutes ?? 0) * 60
+        let seconds = TimeInterval(d + h + m)
         return seconds > 0 ? seconds : nil
     }
 
@@ -203,5 +206,30 @@ enum DurationParser {
         }
         guard number.isEmpty, sawUnit, total > 0 else { return nil }
         return TimeInterval(total)
+    }
+}
+
+/// Saved by name ("days", "hours", "minutes") so config.json stays readable
+/// and does not depend on the order of the cases.
+extension DurationInput.Field: Codable {
+    private var name: String {
+        switch self {
+        case .days: "days"
+        case .hours: "hours"
+        case .minutes: "minutes"
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let name = try decoder.singleValueContainer().decode(String.self)
+        guard let field = Self.allCases.first(where: { $0.name == name }) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "unknown field \(name)"))
+        }
+        self = field
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(name)
     }
 }

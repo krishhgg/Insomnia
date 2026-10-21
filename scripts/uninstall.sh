@@ -647,10 +647,12 @@ journal_problems() {
 # known to put back, so nothing is changed; the exact command to undo each
 # one is printed instead, shell-quoted, since the list editor takes any
 # string. Checked: the shipped list plus config.json's agentList. Only a
-# read that says "does not exist" counts as clear; a read that fails any
-# other way is reported, not counted. Each read is bounded; one that does
-# not answer in time (cfprefsd stuck) ends the check, since the rest would
-# wait the same way, and uninstall goes on.
+# read that says the key is not there counts as clear ("does not exist" up
+# to macOS 26, "Could not find key" or "Domain ... not found" on
+# macOS 27); a read that fails any other way is reported, not counted.
+# Each read is bounded; one that does not answer in time (cfprefsd stuck)
+# ends the check, since the rest would wait the same way, and uninstall
+# goes on.
 list_unrecorded_app_nap() {
   local ids="" i=0 id value rc found=0 checked=0 unreadable=0 stuck="" skipped=0
   for id in "${DEFAULT_AGENTS[@]}"; do ids="$ids$id"$'\n'; done
@@ -673,7 +675,7 @@ list_unrecorded_app_nap() {
       continue
     fi
     if (( rc != 0 )); then
-      if [[ "$value" == *"does not exist"* ]]; then
+      if [[ "$value" == *"does not exist"* || "$value" == *"Could not find key 'NSAppSleepDisabled' in domain '"* || "$value" == *"Domain '"*"' not found."* ]]; then
         checked=$((checked + 1))
       else
         unreadable=$((unreadable + 1))

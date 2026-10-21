@@ -146,6 +146,15 @@ a `build-app.sh` was added to its folder after unpacking. A checkout of
 `v0.1.0` has the installer of that release; its README describes it.
 [docs/releasing.md](releasing.md) describes the release pipeline.
 
+If the build stops in `Package.swift` with "reference to member 'v26' cannot
+be resolved" or "has no member 'swiftLanguageMode'" although `swift --version`
+reports 6.2 or later, the toolchain read a PackageDescription interface from an
+older Swift. An update of the Command Line Tools or Xcode can leave the
+previous version's `.private.swiftinterface` files beside the new ones, and
+Swift reads those first. After a failed build, `build-app.sh` lists any it finds
+and prints the `sudo rm` command that deletes exactly those files; reinstalling
+the Command Line Tools or Xcode removes them too.
+
 ## What gets installed
 
 This describes releases built by the Release workflow and builds of the
@@ -203,6 +212,11 @@ plist, load its own agent, quit the app and launch a replacement, and run the
 four `pmset` commands itself.
 
 ## Upgrades
+
+Settings > App shows the installed version. "Check for updates" there asks
+GitHub once, when you click, for the release marked Latest and for the
+newest nightly, and tells you both tags and whether a newer stable release
+exists. It installs nothing; an upgrade is the steps above run again.
 
 An upgrade asks the running app to quit and stops if it refuses. The new
 bundle is built in a staging directory next to the app and moved into place in
