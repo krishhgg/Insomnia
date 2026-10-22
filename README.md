@@ -26,7 +26,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/License-MIT-536D78?style=flat-square"></a>
-  <img alt="macOS 26 or later" src="https://img.shields.io/badge/macOS-26%2B-303336?style=flat-square">
+  <img alt="macOS 14 or later" src="https://img.shields.io/badge/macOS-14%2B-303336?style=flat-square">
   <img alt="Experimental source build" src="https://img.shields.io/badge/Status-experimental-536D78?style=flat-square">
 </p>
 
@@ -41,7 +41,7 @@
 
 ## Install
 
-Requires macOS 26 or later on an Apple Silicon Mac.
+Requires macOS 14 or later on an Apple Silicon Mac.
 
 Paste this into your coding agent:
 

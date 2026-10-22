@@ -29,8 +29,19 @@ enum StatusMenu {
         let kind: Kind
     }
 
-    static let settingsTitle = "Settings\u{2026}"
-    static let quitTitle = "Quit Insomnia"
+    static let settingsTitle = String(localized: "Settings\u{2026}")
+    static let quitTitle = String(localized: "Quit Insomnia")
+
+    /// Warning lines. `systemOrange` is what macOS uses for attention in
+    /// text, but on the light menu material it is too pale to read: a deeper
+    /// amber carries the same meaning there, and the dark menu keeps the
+    /// system colour.
+    static let warningColor = NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua {
+            return .systemOrange
+        }
+        return NSColor(srgbRed: 0.72, green: 0.33, blue: 0.0, alpha: 1)
+    }
 
     /// Disabled status lines, a separator, then Settings… and Quit. Empty
     /// lines are dropped, and the separator only appears when something
@@ -79,7 +90,7 @@ enum StatusMenu {
             // live item so the relaunch is still one click away, as it was
             // from the popover this menu replaced.
             for browser in throttledBrowsers {
-                out.append(Item(title: "Relaunch \(browser.name) unthrottled", kind: .relaunchBrowser(browser)))
+                out.append(Item(title: String(localized: "Relaunch \(browser.name) unthrottled"), kind: .relaunchBrowser(browser)))
             }
         }
         for problem in relaunchProblems.compactMap(present) {
@@ -104,7 +115,7 @@ enum StatusMenu {
         }
         for waiting in outputsWaiting {
             out.append(Item(title: "\u{26A0} \(SessionManager.stillMutedLine(waiting))", kind: .warning))
-            out.append(Item(title: "Stop waiting for \(waiting.label)", kind: .stopWaitingForOutput(waiting)))
+            out.append(Item(title: String(localized: "Stop waiting for \(waiting.label)"), kind: .stopWaitingForOutput(waiting)))
         }
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))
@@ -142,11 +153,14 @@ enum StatusMenu {
                 let entry = NSMenuItem(title: item.title, action: nil, keyEquivalent: "")
                 entry.isEnabled = false
                 // NSMenuItem has no font of its own; the attributed title is
-                // the only way to make one line smaller or orange.
-                var attributes: [NSAttributedString.Key: Any] = [.font: lineFont]
-                if item.kind == .warning {
-                    attributes[.foregroundColor] = NSColor.systemOrange
-                }
+                // the only way to make one line smaller or orange. The color
+                // is set explicitly for both kinds: a disabled item without
+                // one is painted in AppKit's dimmed control color, which on a
+                // light menu bar left the status line barely readable.
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: lineFont,
+                    .foregroundColor: item.kind == .warning ? warningColor : NSColor.labelColor,
+                ]
                 entry.attributedTitle = NSAttributedString(string: item.title, attributes: attributes)
                 menu.addItem(entry)
             case .settings:
@@ -180,14 +194,14 @@ enum StatusMenu {
 /// anything. Pure so the copy is testable; the controller shows it as an
 /// NSAlert.
 struct RelaunchPrompt: Equatable {
-    static let confirmTitle = "Quit and relaunch"
-    static let cancelTitle = "Cancel"
+    static let confirmTitle = String(localized: "Quit and relaunch")
+    static let cancelTitle = String(localized: "Cancel")
 
     let title: String
     let message: String
 
     init(browser name: String) {
-        title = "Quit and relaunch \(name)?"
-        message = "Insomnia quits \(name) and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if \(name) is set to reopen them on startup. If \(name) has not quit after \(Int(BrowserThrottle.quitTimeout)) s, nothing is relaunched."
+        title = String(localized: "Quit and relaunch \(name)?")
+        message = String(localized: "Insomnia quits \(name) and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if \(name) is set to reopen them on startup. If \(name) has not quit after \(Int(BrowserThrottle.quitTimeout)) s, nothing is relaunched.")
     }
 }

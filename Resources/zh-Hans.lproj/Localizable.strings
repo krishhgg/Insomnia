@@ -1,0 +1,103 @@
+/* Insomnia 简体中文翻译。
+   键就是源码里的英文字面量本身，英文界面在缺少本文件时原样回退。 */
+
+/* 菜单栏的三个输入格 */
+"Days" = "天";
+"Hours" = "时";
+"Minutes" = "分";
+"Up to %lld days" = "最多 %lld 天";
+
+/* 倒计时占位 */
+"Starting…" = "启动中…";
+
+/* 右键菜单 */
+"Settings…" = "设置…";
+"Quit Insomnia" = "退出 Insomnia";
+"Relaunch %@ unthrottled" = "以不限流模式重启 %@";
+"Stop waiting for %@" = "不再等待 %@";
+"Quit and relaunch" = "退出并重启";
+"Cancel" = "取消";
+"Quit and relaunch %@?" = "退出并重启 %@？";
+"Insomnia quits %@ and opens it again with the two flags that stop it throttling hidden windows. Your windows and tabs come back only if %@ is set to reopen them on startup. If %@ has not quit after %lld s, nothing is relaunched." = "Insomnia 会退出 %@，再用两个阻止其限流隐藏窗口的参数重新打开它。只有当 %@ 被设置为启动时恢复窗口，你的窗口和标签页才会回来。如果 %@ 在 %lld 秒后仍未退出，则不会重启任何东西。";
+
+/* 菜单状态行 */
+"Sleep held per journal — not verified live" = "日志显示睡眠已被阻止 — 未实时验证";
+"Sleep is not held — this session is not keeping the Mac awake" = "睡眠未被阻止 — 本次会话没有让 Mac 保持唤醒";
+"Sleep still held with no session" = "没有会话，但睡眠仍被阻止";
+"⚠ %@ is throttled" = "⚠ %@ 正在被限流";
+"⚠ %@ are throttled" = "⚠ %@ 正在被限流";
+"%@ and %@" = "%@ 和 %@";
+"%@, and %@" = "%@、%@";
+", " = "、";
+"%@ is still muted from a lid close; Insomnia restores it when it reconnects" = "%@ 因合盖仍处于静音状态；重新连接后 Insomnia 会恢复它的音量";
+"Lid simulation build: scripts/simulate-lid.sh is honoured during sessions" = "合盖模拟版本：会话期间会响应 scripts/simulate-lid.sh";
+
+/* —— 菜单状态行 —— */
+"Lid: open" = "上盖：打开";
+"Lid: closed" = "上盖：合盖";
+"charging" = "充电中";
+"Wi-Fi: %@" = "Wi-Fi：%@";
+"1 app frozen" = "1 个应用已冻结";
+"%lld apps frozen" = "%lld 个应用已冻结";
+"Docker paused" = "Docker 已暂停";
+"last gap %llds" = "上次间隔 %lld 秒";
+
+/* —— 设置窗口：分组与标签 —— */
+"Session" = "会话";
+"default" = "默认";
+"Add" = "添加";
+"Add preset (30m, 2h, 1h30m, 3d)" = "添加预设（30m、2h、1h30m、3d）";
+"Default preset" = "默认预设";
+"Default field" = "默认输入格";
+"The pill that is focused when the pills open" = "打开输入格时默认聚焦的那一格";
+"Dismiss" = "忽略";
+"Lid-close actions" = "合盖动作";
+"Turn off the display and keyboard backlight" = "关闭屏幕与键盘背光";
+"Freeze every other app while the lid is closed" = "合盖期间冻结其它所有 App";
+"Pause Docker Desktop when no containers are running" = "没有容器运行时暂停 Docker Desktop";
+"Mute audio on lid close" = "合盖时静音";
+"Low Power Mode while the lid is closed" = "合盖期间启用低电量模式";
+"Agent apps" = "代理类 App";
+"Turn App Nap off for these apps during a session" = "会话期间为这些 App 关闭 App Nap";
+"Battery and thermal" = "电池与温度";
+"Low Power Mode below" = "低于此值启用低电量模式";
+"End session below" = "低于此值结束会话";
+"Maximum session" = "最长会话";
+"Nudge tmux after" = "离线多久后提醒 tmux";
+"Hotspot SSID" = "热点 SSID";
+"Thermal rules (Low Power Mode when hot, end when critical)" = "温度规则（过热转低电量模式，危急时结束）";
+"Open Location Services" = "打开定位服务";
+"Network failover" = "网络故障切换";
+"Press Enter after continue" = "输入 continue 后按回车";
+"tmux target (session:window.pane)" = "tmux 目标（session:window.pane）";
+"App" = "应用";
+"Launch at login" = "登录时启动";
+"Open releases page" = "打开发布页";
+"Open Login Items" = "打开登录项";
+"Bundle identifier" = "Bundle 标识符";
+"No other apps running" = "没有其它正在运行的 App";
+"Remove" = "移除";
+"End session" = "结束会话";
+"Hold to end the session" = "按住以结束会话";
+"Press and hold" = "按住不放";
+"Start failed" = "启动失败";
+"Version" = "版本";
+"Config" = "配置";
+"Asks GitHub when you click, and installs nothing. To upgrade, run the installer again." = "点击时才会向 GitHub 查询，不会安装任何东西。要升级请重新运行安装脚本。";
+"Waiting for approval in System Settings > General > Login Items. Turn the switch off to withdraw it." = "正在等待「系统设置 > 通用 > 登录项」中的批准。关闭开关即可撤回。";
+"Login item: macOS reports it %@. Turn the switch on to register it again." = "登录项：macOS 报告的状态是 %@。打开开关可重新注册。";
+"Location: %@" = "定位：%@";
+"Could not check: %@" = "检查失败：%@";
+"Login item: %@" = "登录项：%@";
+
+/* —— 设置窗口：说明段落 —— */
+"Off by default. When on, Docker Desktop is paused only if a second check right before the pause still finds no running container; a container that starts in that last moment is paused with it." = "默认关闭。打开后，只有在暂停前的那一刻再次确认仍没有正在运行的容器时，才会暂停 Docker Desktop；若容器恰好在最后一刻启动，也会一并被暂停。";
+"Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps such as Zoom, Teams, Webex, Wispr Flow, Granola, Otter, OBS and Loom). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key." = "合盖期间，上面列表里的 App 会被 SIGSTOP 暂停，开盖时恢复。打开「合盖期间冻结其它所有 App」（默认关闭）后，其它所有 Dock 中的 App 也会被暂停，但代理类 App、Apple 自家 App、Docker Desktop 以及内置的保护名单（编辑器、终端、浏览器、AI 应用、密码管理器、本地数据库、Tailscale、本地模型服务，以及 Zoom、Teams、Webex、Wispr Flow、Granola、Otter、OBS、Loom 这类会议、录屏与听写应用）除外。代理类 App 永不冻结。屏幕亮度与键盘背光会被保存、置零，并在开盖时恢复。若开盖时 Insomnia 没有运行，按一下提高亮度键即可恢复。";
+"Writes NSAppSleepDisabled = YES into each listed app's preferences when a session starts and puts the previous value back when it ends." = "会话开始时，把 NSAppSleepDisabled = YES 写入列表里每个 App 的偏好设置，结束时恢复原来的值。";
+"Agent apps are never frozen or throttled. Editors, AI apps, terminals, browsers, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps are also protected from the automatic lid-close scope even when they are not listed here; adding one to the freeze list above overrides that." = "代理类 App 永远不会被冻结或限流。编辑器、AI 应用、终端、浏览器、密码管理器、本地数据库、Tailscale、本地模型服务，以及会议、录屏与听写应用，即使没有列在这里，也不会被合盖时的自动冻结波及；但把它们加到上面的冻结列表则可以覆盖这一保护。";
+"0 turns the battery end off. The end floor stays below the Low Power Mode floor. Moving one onto the other moves it along." = "设为 0 表示不按电量结束会话。结束阈值始终低于低电量模式的阈值；把其中一个移到另一个上，另一个会跟着移动。";
+"macOS records this grant as Location Services access for Insomnia. Insomnia uses it only to read Wi-Fi network names and never requests your location." = "macOS 会把这次授权记为 Insomnia 的定位服务访问权限。Insomnia 只用它读取 Wi-Fi 网络名称，从不请求你的位置。";
+"After that long offline, Insomnia types \"continue\" into each pane listed below. Only a pane you have marked with this tmux command is nudged. Mark a dedicated pane, not one you type in." = "离线超过这个时长后，Insomnia 会向下面列出的每个窗格输入 \"continue\"。只有用这条 tmux 命令标记过的窗格才会被提醒。请标记一个专用窗格，不要标记你平时打字的窗格。";
+"Enter submits whatever is already typed in that pane, including a line that was never finished. When off, \"continue\" is typed and nothing submits it." = "回车会把该窗格里已经输入的内容提交出去，包括尚未写完的一行。关闭此项时，只输入 \"continue\" 而不提交。";
+"The password is kept in the login keychain, readable without a prompt only by the build of Insomnia that saved it; after a reinstall, enter it again. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot." = "密码保存在登录钥匙串中，只有保存它的那个 Insomnia 构建能在不弹提示的情况下读取；重装之后需要重新输入。定位权限能让 macOS 显示 Wi-Fi 网络名称并找到已配置的热点。";
+"On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic." = "在配备 Apple 芯片或 T2 芯片的 Mac 笔记本上，合盖会在硬件层面断开内置麦克风。合盖状态下要录音频会议，需要 AirPods 或外接麦克风。";

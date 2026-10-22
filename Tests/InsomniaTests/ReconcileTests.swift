@@ -216,6 +216,39 @@ final class ReconcileTests: XCTestCase {
         XCTAssertEqual(h.procs.resumed, [])
     }
 
+    // (c4) a wake owed from a lid close whose other entries are already gone:
+    // the reconcile with the lid open wakes the panel and clears the record,
+    // without calling anything privileged. With the lid closed it keeps the
+    // record, since waking a closed panel is what the close was avoiding.
+    func testNoSessionWithASoleWakeRecordWakesTheDisplayAndClearsIt() async throws {
+        var st = RuntimeState()
+        st.displaySleepRequested = true
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.wakes, 1, "the panel this app turned off is woken")
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).displaySleepRequested)
+        XCTAssertEqual(h.guardFake.calls, ["pmset -g"], "nothing privileged")
+        XCTAssertNil(m.lastError)
+    }
+
+    func testNoSessionWithASoleWakeRecordKeepsItWhileTheLidIsClosed() async throws {
+        var st = RuntimeState()
+        st.displaySleepRequested = true
+        try h.store.saveState(st)
+        h.clamshell.closed = true
+
+        let m = h.makeManager()
+        await m.reconcile()
+
+        XCTAssertEqual(h.display.wakes, 0, "a closed panel is left alone")
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).displaySleepRequested, "the open still owes the wake")
+        XCTAssertNil(m.lastError)
+    }
+
     // (d) savedOutputVolume / savedMuted are restored through AudioControlling
     // and cleared; if the restore fails they stay on disk for the next run.
     func testSavedVolumeIsRestoredAndCleared() async throws {

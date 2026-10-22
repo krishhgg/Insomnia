@@ -637,6 +637,20 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("malformed"), fx.log())
     }
 
+    /// The scripts read the journal too: a key the app writes as a boolean
+    /// must not arrive as a string here, or the backstop would carry on with
+    /// a journal the app cannot decode.
+    func testANonBooleanDisplaySleepRequestedMakesTheJournalMalformed() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"displaySleepRequested":"yes"}"#)
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertNotEqual(r.status, 0, "an undecodable journal stops the backstop")
+        XCTAssertEqual(fx.calls(), [], "no privileged command with an unreadable journal")
+        XCTAssertTrue(fx.log().contains("displaySleepRequested is a string, not a bool"), fx.log())
+    }
+
     func testExpiredSessionWithMissingJournalRunsNothingPrivileged() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
 
@@ -7576,7 +7590,11 @@ private final class ScriptFixture {
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
-        posix_spawn_file_actions_addchdir(&actions, root.path)
+        // Darwin's `_np` spelling: the POSIX `addchdir` arrived in the macOS
+        // 26 SDK, and this target compiles at the deployment target
+        // Package.swift names, so the older symbol is the one that builds
+        // and runs on both a macOS 26/27 runner and an older toolchain.
+        posix_spawn_file_actions_addchdir_np(&actions, root.path)
 
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)

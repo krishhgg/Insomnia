@@ -22,8 +22,11 @@ protocol DisplayDimming: Sendable {
     func setBrightness(_ value: Float) throws
     /// Ask the display to sleep now. macOS ignores it while any process holds a display assertion.
     func requestSleep() throws
-    /// Declare local user activity so a sleeping display wakes. Best effort, never throws.
-    func wake()
+    /// Declare local user activity so a sleeping display wakes. Never throws;
+    /// false when the request failed, so a record of the sleep request is not
+    /// cleared as if the panel had come back.
+    @discardableResult
+    func wake() -> Bool
     /// Whether the built-in display is asleep (`CGDisplayIsAsleep`). While it
     /// is, `readBrightness()` returns the idle-dim value, not the user's.
     /// No display: false.
@@ -149,7 +152,8 @@ struct NoopDisplayDimmer: DisplayDimming {
     func readBrightness() throws -> Float { throw DisplayPowerError(what: "no display control") }
     func setBrightness(_ value: Float) throws {}
     func requestSleep() throws {}
-    func wake() {}
+    @discardableResult
+    func wake() -> Bool { true }
     func isAsleep() -> Bool { false }
 }
 
@@ -216,12 +220,15 @@ final class DisplayServicesDimmer: DisplayDimming, @unchecked Sendable {
         guard kr == KERN_SUCCESS else { throw DisplayPowerError(what: "IORequestIdle refused (\(kr))") }
     }
 
-    func wake() {
+    @discardableResult
+    func wake() -> Bool {
         var id: IOPMAssertionID = 0
         let kr = IOPMAssertionDeclareUserActivity("Insomnia lid open" as CFString, kIOPMUserActiveLocal, &id)
-        if kr != kIOReturnSuccess {
+        guard kr == kIOReturnSuccess else {
             Log.error("display wake failed: IOPMAssertionDeclareUserActivity returned \(kr)")
+            return false
         }
+        return true
     }
 
     /// Public CoreGraphics; needs no private symbol. A missing display

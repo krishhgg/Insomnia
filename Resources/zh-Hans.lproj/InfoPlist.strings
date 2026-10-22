@@ -1,0 +1,5 @@
+/* Insomnia 简体中文 Info.plist 文案 */
+
+"NSLocationUsageDescription" = "Insomnia 需要定位权限，macOS 才会让它看到 Wi-Fi 网络名称并重新连接你的热点。";
+"NSLocationWhenInUseUsageDescription" = "Insomnia 需要定位权限，macOS 才会让它看到 Wi-Fi 网络名称并重新连接你的热点。";
+"CFBundleDisplayName" = "Insomnia";

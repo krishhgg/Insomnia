@@ -52,7 +52,8 @@ struct BrightnessOnlyDimmer: DisplayDimming {
     func readBrightness() throws -> Float { try inner.readBrightness() }
     func setBrightness(_ value: Float) throws { try inner.setBrightness(value) }
     func requestSleep() throws { try power.requestSleep() }
-    func wake() { power.wake() }
+    @discardableResult
+    func wake() -> Bool { power.wake() }
     func isAsleep() -> Bool { power.isAsleep() }
     func refusal() -> String? { inner.refusal() }
 }
@@ -276,10 +277,11 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
     }
 
-    /// Both devices refused: nothing is darkened or journaled, so nothing
-    /// on open would wake the display. The close does not ask it to sleep,
-    /// and the open has nothing to wake.
-    func testBothRefusedLeavesTheDisplayAwake() async throws {
+    /// Both devices refused: nothing is darkened or journaled, so the public
+    /// sleep request is the only thing that turns the panel off. The close
+    /// journals that request, and the open wakes the display for it: without
+    /// the request the panel would stay lit behind a closed lid.
+    func testBothRefusedSleepsTheDisplayThroughTheRequestAndWakesItOnOpen() async throws {
         let (m, actions) = makeDarkeningOnly(
             display: refusedDisplay,
             keyboard: CoreBrightnessKeyboardBacklight(loadClass: { ChangedSignatureKeyboardClient.self })
@@ -288,16 +290,43 @@ final class RefusedDarkeningTests: XCTestCase {
 
         await actions.onClose()
 
-        XCTAssertEqual(h.display.sleepRequests, 0, "no journaled brightness, so no wake on open: no sleep request")
+        XCTAssertEqual(h.display.sleepRequests, 1, "nothing to darken, so the sleep request is what turns the panel off")
         let state = try XCTUnwrap(try h.store.loadState())
         XCTAssertFalse(state.brightnessJournaled)
-        XCTAssertTrue(logText().contains("display sleep not requested: no display or keyboard brightness is journaled"), logText())
+        XCTAssertTrue(state.displaySleepRequested, "the open wakes what this close turned off")
+        XCTAssertTrue(logText().contains("display sleep requested"), logText())
         XCTAssertNil(m.lastError)
 
         await actions.onOpen()
 
-        XCTAssertEqual(h.display.wakes, 0)
+        XCTAssertEqual(h.display.wakes, 1)
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).displaySleepRequested)
         XCTAssertNil(m.lastError)
+    }
+
+    /// A wake that fails keeps the record on disk: the panel the close turned
+    /// off may still be asleep, so the next open has to try again rather than
+    /// find the journal clean.
+    func testAFailedWakeKeepsTheRecordForTheNextOpen() async throws {
+        let (m, actions) = makeDarkeningOnly(
+            display: refusedDisplay,
+            keyboard: CoreBrightnessKeyboardBacklight(loadClass: { ChangedSignatureKeyboardClient.self })
+        )
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).displaySleepRequested)
+
+        h.display.wakeFails = true
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 1, "the open asked for the wake")
+        XCTAssertTrue(try XCTUnwrap(try h.store.loadState()).displaySleepRequested, "a failed wake keeps the record")
+
+        h.display.wakeFails = false
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 2)
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).displaySleepRequested, "the retry cleared it")
     }
 
     /// The app dies between a close that journaled only the keyboard (the

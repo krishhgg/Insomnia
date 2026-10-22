@@ -93,9 +93,7 @@ struct StatusRootView: View {
         .frame(height: NSStatusBar.system.thickness)
         .fixedSize()
         .contentShape(Rectangle())
-        .onGeometryChange(for: CGFloat.self) { proxy in
-            proxy.size.width
-        } action: { width in
+        .onLayoutWidthChange { width in
             onWidthChange(width)
         }
         // The host is kept as wide as the widest content it has held, so the
@@ -147,9 +145,7 @@ struct StatusRootView: View {
                 reduceMotion: reduceMotion,
                 onTap: { onTapPill(field) }
             )
-            .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.size.width
-            } action: { width in
+            .onLayoutWidthChange { width in
                 pillWidths[field] = width
             }
             .scaleEffect(scale, anchor: .leading)

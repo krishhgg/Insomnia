@@ -402,7 +402,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     /// stops on any other Mac.
     func testTheNotesAndTheReadmeStateTheAppleSiliconRequirement() throws {
         for id in ["stable", "nightly"] {
-            XCTAssertTrue(try job(id).joined(separator: "\n").contains(#"echo "Insomnia $VERSION for Apple Silicon Macs with macOS 26 or later."#), "the \(id) notes' first line")
+            XCTAssertTrue(try job(id).joined(separator: "\n").contains(#"echo "Insomnia $VERSION for Apple Silicon Macs with macOS 14 or later."#), "the \(id) notes' first line")
         }
         XCTAssertTrue(try readmeInstallSection().contains("Apple Silicon"), "the README's Install section")
     }
