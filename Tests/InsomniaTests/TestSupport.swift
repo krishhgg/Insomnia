@@ -1,4 +1,5 @@
 import Foundation
+import IOKit
 import Security
 import XCTest
 import InsomniaTestHome
@@ -722,6 +723,68 @@ final class FakeClamshell: @unchecked Sendable {
     }
 }
 
+/// Records each sleep request and what held at that moment. Refuses it
+/// while sleep is disabled, as the kernel does.
+final class FakeClosedLidSleep: ClosedLidSleeping, @unchecked Sendable {
+    struct Request: Equatable {
+        let sleepDisabled: Bool
+        let lockHeld: Bool
+    }
+
+    private let lock = NSLock()
+    private let sleepGuard: FakeSleepGuard
+    private let recoveryLock: URL
+    private var _causesSleep: Bool? = true
+    private var _requests: [Request] = []
+
+    init(sleepGuard: FakeSleepGuard, recoveryLock: URL) {
+        self.sleepGuard = sleepGuard
+        self.recoveryLock = recoveryLock
+    }
+
+    var causesSleep: Bool? {
+        get { lock.withLock { _causesSleep } }
+        set { lock.withLock { _causesSleep = newValue } }
+    }
+    var requests: [Request] { lock.withLock { _requests } }
+
+    func lidCloseCausesSleep() -> Bool? { causesSleep }
+
+    func requestSleep() throws {
+        let disabled = sleepGuard.sleepDisabled
+        var held = true
+        if let handle = try? RecoveryLock(url: recoveryLock).tryAcquire() {
+            handle.release()
+            held = false
+        }
+        lock.withLock { _requests.append(Request(sleepDisabled: disabled, lockHeld: held)) }
+        if disabled { throw ClosedLidSleepError(call: "IOPMSleepSystem", code: kIOReturnNotPermitted) }
+    }
+}
+
+/// Stands in for the `LidObserver` the manager watches the lid with while
+/// a closed lid's sleep is owed. `deliver` is a change that held through
+/// the debounce; like the kernel's message, it reaches the manager only
+/// while the watcher runs.
+@MainActor
+final class FakeLidWatcher: LidWatching {
+    var onChange: ((Bool) -> Void)?
+    private(set) var running = false
+    private(set) var starts = 0
+
+    func start() {
+        running = true
+        starts += 1
+    }
+
+    func stop() { running = false }
+
+    func deliver(closed: Bool) {
+        guard running else { return }
+        onChange?(closed)
+    }
+}
+
 /// What the process table holds, for `SessionManager.processLookup`: a pid
 /// not listed is gone.
 final class FakeProcessTable: @unchecked Sendable {
@@ -799,6 +862,9 @@ struct Harness {
     let appNap: FakeAppNapPreferences
     let notifier: RecordingNotifier
     let clamshell: FakeClamshell
+    let lidSleep: FakeClosedLidSleep
+    /// Shared by every manager this harness makes.
+    let lidWatcher: FakeLidWatcher
     let processes: FakeProcessTable
 
     init(now: Date = Date(timeIntervalSince1970: 1_800_000_000)) {
@@ -814,7 +880,16 @@ struct Harness {
         appNap = FakeAppNapPreferences()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
+        lidSleep = FakeClosedLidSleep(sleepGuard: guardFake, recoveryLock: home.paths.recoveryLock)
+        lidWatcher = FakeLidWatcher()
         processes = FakeProcessTable()
+    }
+
+    /// The lid moves and stays there past the debounce: the reading
+    /// changes, and the lid watcher delivers it if it is running.
+    func moveLid(closed: Bool) {
+        clamshell.closed = closed
+        lidWatcher.deliver(closed: closed)
     }
 
     /// `lockTimeout` is short so contention tests fail closed quickly;
@@ -853,6 +928,8 @@ struct Harness {
             appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
+            closedLidSleep: lidSleep,
+            closedLidWatcher: lidWatcher,
             clock: { c.now },
             processLookup: { table.lookup($0) },
             recoveryLockTimeout: lockTimeout,

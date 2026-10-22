@@ -19,6 +19,15 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
+
+    /// The timer and floor-rule ends. With the lid closed they also ask
+    /// macOS to sleep (`SessionManager.sleepClosedLidIfOwed`).
+    var sleepsAClosedLid: Bool {
+        switch self {
+        case .timer, .thermalCritical, .batteryFloor, .batteryUnreadable: true
+        case .user, .quit, .backstop, .recoveryUnavailable, .startFailed: false
+        }
+    }
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -374,6 +383,10 @@ final class SessionManager {
     private let appNap: any AppNapPreferencing
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
+    private let closedLidSleep: any ClosedLidSleeping
+    /// Runs only while a closed lid's sleep is owed, so that an open in
+    /// that time drops it (`oweClosedLidSleep`).
+    private let closedLidWatcher: any LidWatching
     private let clock: @Sendable () -> Date
     /// What the process table says a pid is now. Read only, to tell whether
     /// a recorded command is still running (`recordedLockHolder`).
@@ -441,6 +454,16 @@ final class SessionManager {
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
+    /// Set by a timer or floor-rule end of a session, and by the launch
+    /// reconcile of a session whose timer ran out. Cleared once the sleep
+    /// is asked, the lid opens, macOS keeps the closed Mac awake, a start
+    /// begins, or macOS has refused it `closedLidSleepRefusalLimit` times
+    /// (`dropClosedLidSleep`). Only this process asks, so a quit waits
+    /// while it is set.
+    @ObservationIgnored private(set) var closedLidSleepOwed = false
+    @ObservationIgnored private var closedLidSleepRetry: Timer?
+    /// How many times macOS has refused the sleep owed now.
+    @ObservationIgnored private var closedLidSleepRefusals = 0
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -463,6 +486,8 @@ final class SessionManager {
     @ObservationIgnored private(set) var pendingEnd: EndReason?
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
+    /// Lifecycle operations queued or running.
+    @ObservationIgnored private var lifecycleOperations = 0
     /// Detail of the last unreadable-journal notification, so a journal
     /// that stays broken is announced once, not on every transaction.
     @ObservationIgnored private var announcedCorruption: String?
@@ -541,6 +566,8 @@ final class SessionManager {
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
+        closedLidSleep: any ClosedLidSleeping = NoopClosedLidSleep(),
+        closedLidWatcher: any LidWatching = NoopLidWatcher(),
         clock: @escaping @Sendable () -> Date = { Date() },
         processLookup: @escaping @Sendable (Int32) -> ProcessLookup = { SignalProcessControl.processTableState(pid: $0) },
         recoveryLockTimeout: TimeInterval = 10,
@@ -562,6 +589,8 @@ final class SessionManager {
         self.appNap = appNap
         self.notifier = notifier
         self.clamshell = clamshell
+        self.closedLidSleep = closedLidSleep
+        self.closedLidWatcher = closedLidWatcher
         self.clock = clock
         self.processLookup = processLookup
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
@@ -642,7 +671,9 @@ final class SessionManager {
             display: display,
             keyboard: keyboard,
             appNap: CFAppNapPreferences(),
-            notifier: notifier
+            notifier: notifier,
+            closedLidSleep: IOKitClosedLidSleep(),
+            closedLidWatcher: LidObserver()
         )
         let services = AppServices(
             paths: paths,
@@ -692,6 +723,8 @@ final class SessionManager {
     /// the refusal itself, before the caller resumes: the command can exit
     /// and its holder settle in between, and must find the work then.
     private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
+        lifecycleOperations += 1
+        defer { lifecycleOperations -= 1 }
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
@@ -1191,6 +1224,8 @@ final class SessionManager {
             Log.info("start abandoned: an end was requested first")
             return
         }
+        // The person wants the Mac awake now.
+        dropClosedLidSleep()
         let now = clock()
         let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A
@@ -1313,6 +1348,11 @@ final class SessionManager {
     func end(reason: EndReason) async -> EndOutcome {
         endTicket += 1
         if reason == .quit { quitRequested = true }
+        // Only an end that finds the session owes the sleep. A retry of an
+        // end that has already run (session.json kept in place, a restore
+        // left to this process) finds none, so the sleep that end owed is
+        // asked once, not again on every retry.
+        if reason.sleepsAClosedLid, session != nil { oweClosedLidSleep() }
         retryTimer?.invalidate()
         retryTimer = nil
         let outcome: EndOutcome
@@ -1348,7 +1388,117 @@ final class SessionManager {
             // are refused and quit is deferred until then.
             break
         }
+        switch outcome {
+        case .restored, .incomplete, .sessionRetained: sleepClosedLidIfOwed()
+        // Nothing was undone yet. The end that runs later asks.
+        case .locked, .journalUnreadable, .privilegedCommandRunning: break
+        }
+        // The app stays to ask, so starts are no longer refused for the quit.
+        if reason == .quit, closedLidSleepOwed { quitRequested = false }
         return outcome
+    }
+
+    /// Whether a quit may go ahead after its end returned `outcome`
+    /// (`AppDelegate.applicationShouldTerminate`): the end lets it go
+    /// (`EndOutcome.letsQuitGo`) and no closed lid's sleep is owed, since
+    /// only this process asks for it.
+    func letsQuitGo(after outcome: EndOutcome) -> Bool {
+        outcome.letsQuitGo && !closedLidSleepOwed
+    }
+
+    /// How many refusals end the owed sleep. Asked every 30 s, 10 is at most
+    /// about 5 minutes, while the recovery agent tries to restore sleep
+    /// every 60 s after a failed `disablesleep 0`. A quit or an end's retry
+    /// asks too, and its refusal counts the same, so the bound can come
+    /// sooner. An ask postponed for a lifecycle operation or a live
+    /// `sudo pmset` is not a refusal. Still refused by then, sleep is not
+    /// coming back (the sudoers rule is gone, say), and owing it would hold
+    /// every quit, a restart's included.
+    static let closedLidSleepRefusalLimit = 10
+
+    private func oweClosedLidSleep() {
+        guard !closedLidSleepOwed else { return }
+        closedLidSleepOwed = true
+        closedLidSleepRefusals = 0
+        // The session's lid observer stops with the end, and an ask is
+        // repeated only every `recoveryRetryDelay`. Unwatched, a lid opened
+        // and closed again between two asks, or while the end waits for a
+        // command left running, would go unseen, and the next ask would
+        // put the Mac to sleep. The watcher starts from the lid as it is
+        // now; a lid already open is left to the ask's own check.
+        closedLidWatcher.onChange = { [weak self] closed in
+            if !closed { self?.lidOpenedWhileClosedLidSleepOwed() }
+        }
+        closedLidWatcher.start()
+    }
+
+    /// Stops owing the sleep: asked, given up, or no longer wanted. No ask
+    /// stays scheduled and the lid is no longer watched.
+    private func dropClosedLidSleep() {
+        closedLidSleepOwed = false
+        closedLidSleepRetry?.invalidate()
+        closedLidSleepRetry = nil
+        closedLidWatcher.stop()
+        closedLidWatcher.onChange = nil
+    }
+
+    /// The person is at the Mac, so the owed sleep is dropped and stays
+    /// dropped if the lid closes again (spec section 6). macOS asks for
+    /// that close's sleep itself; sleep still disabled by a failed restore
+    /// refuses it, as after any end that owes nothing.
+    private func lidOpenedWhileClosedLidSleepOwed() {
+        guard closedLidSleepOwed else { return }
+        Log.info("lid opened, so the sleep owed for the closed lid is no longer requested")
+        dropClosedLidSleep()
+    }
+
+    /// macOS asks for a closed lid's sleep once, at the close, and the sleep
+    /// guard refuses it. Turning the guard off does not make macOS ask
+    /// again, so a timer or floor-rule end asks here (spec section 6).
+    /// macOS refuses while sleep is still disabled, as after a failed
+    /// `disablesleep 0` that the recovery agent retries, so a refusal asks
+    /// again later, up to `closedLidSleepRefusalLimit` refusals.
+    private func sleepClosedLidIfOwed(retrying: Bool = false) {
+        closedLidSleepRetry?.invalidate()
+        closedLidSleepRetry = nil
+        guard closedLidSleepOwed, session == nil else { return }
+        // Never in the middle of a start, an end or a `sudo pmset` left
+        // running. Its record is cleared only once the lock it holds is
+        // released and the end it held up has begun (`holdLock`), so a
+        // retry that fires just after the command exits waits for that end.
+        guard lifecycleOperations == 0, unfinishedCommand == nil else {
+            return askForClosedLidSleepLater()
+        }
+        // False with an external display in clamshell mode.
+        guard clamshell() == true, closedLidSleep.lidCloseCausesSleep() == true else {
+            Log.info("session end: the lid is open, or macOS keeps this closed Mac awake, so no sleep is requested")
+            dropClosedLidSleep()
+            return
+        }
+        do {
+            try closedLidSleep.requestSleep()
+            dropClosedLidSleep()
+            Log.info("session end with the lid closed: sleep requested")
+        } catch {
+            closedLidSleepRefusals += 1
+            if closedLidSleepRefusals >= Self.closedLidSleepRefusalLimit {
+                dropClosedLidSleep()
+                Log.error("session end with the lid closed: sleep request refused \(closedLidSleepRefusals) times, so Insomnia stops asking and a quit no longer waits for it: \(error.localizedDescription)")
+                return
+            }
+            if !retrying {
+                Log.error("session end with the lid closed: sleep request refused (\(closedLidSleepRefusals) of \(Self.closedLidSleepRefusalLimit)), asking again every \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            }
+            askForClosedLidSleepLater()
+        }
+    }
+
+    private func askForClosedLidSleepLater() {
+        let timer = Timer(timeInterval: recoveryRetryDelay, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.sleepClosedLidIfOwed(retrying: true) }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        closedLidSleepRetry = timer
     }
 
     private func performEnd(reason: EndReason) async -> EndOutcome {
@@ -2515,6 +2665,8 @@ final class SessionManager {
             // No session: the journal held no claim, or an end restores it.
             if session == nil { earlierCommandCheckOwed = false }
             await settleEarlierCommand()
+            // An expired session's end owes the sleep; the lock is free now.
+            sleepClosedLidIfOwed()
         case .success(false):
             break
         case .failure:
@@ -2676,6 +2828,11 @@ final class SessionManager {
         let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
         if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
+            // The timer ran out while the app was not running. Its end owes
+            // the sleep as in `end`, asked once the lock is free
+            // (`reconcile(ticket:isRetry:)`, or the end its command's exit
+            // runs again).
+            oweClosedLidSleep()
             if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
         } else if owesEnd {
             Log.info(keptSessionFile != nil

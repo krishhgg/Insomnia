@@ -38,10 +38,16 @@ final class LidObserver {
     /// Pure registry read: true = closed, false = open, nil = unavailable
     /// (no IOPMrootDomain or no clamshell, e.g. a desktop).
     nonisolated static func readClamshellState() -> Bool? {
+        readRootDomainBool(clamshellKey)
+    }
+
+    /// A boolean property of IOPMrootDomain; nil when the service or the
+    /// property is missing.
+    nonisolated static func readRootDomainBool(_ key: String) -> Bool? {
         let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
         guard service != 0 else { return nil }
         defer { IOObjectRelease(service) }
-        guard let value = IORegistryEntryCreateCFProperty(service, clamshellKey as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
+        guard let value = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else {
             return nil
         }
         return (value as? Bool) ?? ((value as? NSNumber)?.boolValue)
@@ -162,4 +168,26 @@ final class LidObserver {
         settledWaiter = nil
         waiter?(delivered)
     }
+}
+
+/// Lid changes that held through the debounce, delivered on the main
+/// actor. `SessionManager` watches the lid with one while a closed lid's
+/// sleep is owed, apart from the session's own observer, which stops with
+/// the end.
+@MainActor
+protocol LidWatching: AnyObject {
+    /// Called with `true` for closed.
+    var onChange: ((Bool) -> Void)? { get set }
+    func start()
+    func stop()
+}
+
+extension LidObserver: LidWatching {}
+
+/// Delivers nothing, for a manager built without a lid.
+@MainActor
+final class NoopLidWatcher: LidWatching {
+    var onChange: ((Bool) -> Void)?
+    func start() {}
+    func stop() {}
 }
