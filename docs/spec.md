@@ -59,6 +59,21 @@ closed bag. Its design goals are to:
 
 ## Core model
 
+The recovery agent starts the app's headless `--backstop` command only when
+the bundle advertises that command in `InsomniaBackstopCommand` and its
+pinned requirement consists entirely of cdhash clauses, and a bounded
+`csrutil status` call reports SIP enabled. `SpawnConstraint`
+lets launchd enforce those hashes before any app code executes; the command
+then runs the existing full-bundle verifier before the sealed script. Both
+the installer and `arm()` use the external shell verifier for older bundles
+or other requirement formats, or disabled, custom or unreadable SIP status,
+including a `swift run` build targeting an
+older installed app. The executable name comes from `CFBundleExecutable`.
+The native bundle path gives Background Task Management the app identity;
+`AssociatedBundleIdentifiers` also names the app, but is not proof of
+attribution for ad-hoc signatures with no Team ID. Appearance still needs
+the real-Mac check, and no Developer ID identity is implied.
+
 ```
 Session {
   startedAt:   Date
@@ -852,8 +867,10 @@ Backstop, independent of the app:
   journal, any `session.json` and `--force` take the full run.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
-  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
-  build's cdhash) and execs the script when that passes; otherwise it logs
+  plist (strict Security framework validation in the native command, or
+  `codesign --verify --strict -R=...` in the external fallback; for an ad-hoc
+  build, that build's cdhash) and directly execs `/bin/bash` with the sealed
+  script path when that passes; otherwise it logs
   one line and exits without running anything. No executable lives in a
   writable directory. The plist is a per-user file like any LaunchAgent; at
   the next arm the app rewrites a plist that does not match, and reloads a
