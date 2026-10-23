@@ -1215,9 +1215,10 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   opening; 0.8 / 0.95 closing) so the lid lift and the lash hand-over are
   seen; the pupil scales in from 0.6 on its own bouncier spring 0.2 s later
   and eases out to 0.6 on close, clipped to the lens.
-- Typing happens in a non-activating key panel: the app in front stays
-  frontmost; only key status moves to the pills while typing, as with
-  Spotlight, and it returns when the pills close.
+- Typing activates Insomnia and its key panel; closing the pills returns
+  focus to the previous app if Insomnia still owns it. Switching to another
+  window closes the pills without taking focus back. The right-click menu
+  also closes the pills before it starts handling keys.
 - Number changes in the countdown use `.contentTransition(.numericText())`.
 - Focus ring is a soft glow that breathes in, not a hard outline.
 - Respect Reduce Motion: springs become short crossfades (0.15 s; the

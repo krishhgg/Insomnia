@@ -222,6 +222,8 @@ below cover what only a real Mac shows.
 
 ### Sessions and recovery
 
+- With a text field focused in another app, open the duration pills and type digits, Tab, Backspace and Esc: only Insomnia changes, and Esc returns focus to the previous app. Repeat for extending a session and after a refused start. Switching apps closes the pills without taking focus back. Clicking an already-open Settings window keeps keyboard focus in Settings; opening Settings/Quit closes the pills and gives the menu its own keyboard input. Repeat on another display/Space. Do not send Enter to a chat or terminal as a test.
+
 - Normal end, deadline expiry, and repeated Quit restore live power state
 - Sleep guard read back: on a Mac where another process sets SleepDisabled back to 0 about 2 s after `pmset -a disablesleep 1` (for example a root LaunchDaemon that loops `pmset -a disablesleep 0`), Start fails after about 5 s with "SleepDisabled read 0 again" and no session runs; on a Mac where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
 - Force-quit followed by launchd deadline recovery and retry after failure
