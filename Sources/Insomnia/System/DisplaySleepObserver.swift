@@ -9,7 +9,9 @@ import AppKit
 @MainActor
 final class DisplaySleepObserver {
     private let center: NotificationCenter
-    private var tokens: [NSObjectProtocol] = []
+    /// Set once in `init` and read once more in `deinit`, which does not
+    /// run on the main actor; `removeObserver` is safe from any thread.
+    nonisolated(unsafe) private var tokens: [NSObjectProtocol] = []
 
     /// `center` is NSWorkspace's and `asleepNow` reads the displays; tests
     /// pass their own.
@@ -36,7 +38,10 @@ final class DisplaySleepObserver {
         return ids.prefix(Int(count)).allSatisfy { CGDisplayIsAsleep($0) != 0 }
     }
 
-    isolated deinit {
+    /// Not `isolated deinit`: on macOS 26.2 the Swift runtime frees a
+    /// pointer it never allocated while it runs an isolated deinit
+    /// (`swift_task_deinitOnExecutorImpl`), and the process aborts.
+    deinit {
         tokens.forEach(center.removeObserver)
     }
 }
