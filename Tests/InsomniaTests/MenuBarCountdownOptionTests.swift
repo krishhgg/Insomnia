@@ -97,6 +97,23 @@ final class MenuBarCountdownOptionTests: XCTestCase {
         ], "the countdown is in the bar; End session stays in the menu")
     }
 
+    /// With the countdown off, VoiceOver reads the time left on the eye, or
+    /// the end time when the bar is set to it: nothing ticks then, so a time
+    /// left would go stale.
+    func testTheEyeReadsTheEndTimeWhenTheBarIsSetToIt() {
+        func value(shows: Bool = false, running: Bool = true, style: CountdownStyle) -> String {
+            StatusRootView.eyeAccessibilityValue(showsCountdown: shows, running: running, style: style, remaining: "2h 14m", endTime: "6:30 PM")
+        }
+        XCTAssertEqual(value(style: .remaining), "Time left: 2h 14m")
+        XCTAssertEqual(value(style: .endTime), "Ends at 6:30 PM")
+        XCTAssertEqual(value(shows: true, style: .endTime), "", "the bar shows it")
+        XCTAssertEqual(value(running: false, style: .endTime), "")
+        XCTAssertEqual(
+            StatusRootView.eyeAccessibilityValue(showsCountdown: false, running: true, style: .endTime, remaining: "2h 14m", endTime: ""),
+            "Time left: 2h 14m"
+        )
+    }
+
     // MARK: Status item
 
     /// With the countdown off the item is as wide as the bare mark while a

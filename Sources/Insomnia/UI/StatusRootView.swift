@@ -132,8 +132,29 @@ struct StatusRootView: View {
     }
 
     private var eyeAccessibilityValue: String {
-        guard !manager.config.showMenuBarCountdown, isRunning, !manager.remainingText.isEmpty else { return "" }
-        return StatusMenu.remainingLine(manager.remainingText)
+        Self.eyeAccessibilityValue(
+            showsCountdown: manager.config.showMenuBarCountdown,
+            running: isRunning,
+            style: manager.config.countdownStyle,
+            remaining: manager.remainingText,
+            endTime: manager.countdownText
+        )
+    }
+
+    /// What VoiceOver reads on the eye when the bar shows no countdown.
+    /// With the end time nothing ticks, so a time left would go stale; the
+    /// end time stays right without a redraw. Static so it can be pinned
+    /// without a view.
+    static func eyeAccessibilityValue(
+        showsCountdown: Bool,
+        running: Bool,
+        style: CountdownStyle,
+        remaining: String,
+        endTime: String
+    ) -> String {
+        guard !showsCountdown, running, !remaining.isEmpty else { return "" }
+        if style == .endTime, !endTime.isEmpty { return "Ends at \(endTime)" }
+        return StatusMenu.remainingLine(remaining)
     }
 
     /// All three slots are in the layout whenever they are present;
