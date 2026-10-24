@@ -33,8 +33,10 @@ final class SettingsTests: XCTestCase {
     func testAppSummaryNamesUpToThreeInstalledApps() {
         XCTAssertEqual(RunningApps.summary(of: []), "None on this Mac")
         XCTAssertEqual(RunningApps.summary(of: ["test.insomnia.missing"]), "None on this Mac")
+        // The name the system gives Finder, which is localized.
         XCTAssertEqual(
-            RunningApps.summary(of: ["test.insomnia.missing", "com.apple.finder"]), "Finder")
+            RunningApps.summary(of: ["test.insomnia.missing", "com.apple.finder"]),
+            RunningApps.displayName(for: "com.apple.finder"))
         let four = [
             "com.apple.finder", "com.apple.calculator", "com.apple.TextEdit",
             "com.apple.Preview", "test.insomnia.missing",
