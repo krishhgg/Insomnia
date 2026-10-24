@@ -2903,7 +2903,8 @@ final class SessionManager {
         } else if !countdownPaused, session != nil {
             refreshCountdown()
             armCountdownTimer()
-            Log.info("display awake: countdown redraw restarted")
+            // The end time has no redraw to restart.
+            if countdownTimer != nil { Log.info("display awake: countdown redraw restarted") }
         }
     }
 

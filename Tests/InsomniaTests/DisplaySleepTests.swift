@@ -26,6 +26,25 @@ final class DisplaySleepTests: XCTestCase {
         XCTAssertEqual(m.countdownText, "0:58:30")
     }
 
+    /// The end time has no redraw: a wake arms none. Switching to the time
+    /// left while the displays sleep waits for their wake to arm one.
+    func testWithTheEndTimeAWakeArmsNothingAndASwitchWaitsForTheWake() async throws {
+        let m = h.makeManager()
+        m.config.countdownStyle = .endTime
+        await m.start(duration: 3600)
+        XCTAssertFalse(m.countdownTimerArmed)
+        m.displaysAsleepChanged(true)
+        m.displaysAsleepChanged(false)
+        XCTAssertFalse(m.countdownTimerArmed)
+
+        m.displaysAsleepChanged(true)
+        m.config.countdownStyle = .remaining
+        m.countdownStyleChanged()
+        XCTAssertFalse(m.countdownTimerArmed, "the displays still sleep")
+        m.displaysAsleepChanged(false)
+        XCTAssertTrue(m.countdownTimerArmed)
+    }
+
     func testAWakeWithTheLidClosedLeavesTheRedrawStopped() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
