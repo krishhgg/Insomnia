@@ -233,7 +233,7 @@ below cover what only a real Mac shows.
 - Reboot/login with active or dirty journals
 - Backstop resuming a frozen test process through the installed `Insomnia --resume-frozen`, and keeping the entry when the bundle is removed or its Info.plist lacks `InsomniaResumeFrozenVersion`
 - Existing Low Power Mode preference and saved audio restoration
-- Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Low Power Mode while the lid is closed" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
+- Low Power Mode on macOS 27, where `pmset -g custom` prints `powermode` and no `lowpowermode` (a session on battery with the lid closed and "Turn on Low Power Mode" on, or below the Low Power floor): the log has no "could not read low power mode" line, `pmset -g custom` shows `powermode 1` under Battery Power while the mode is on, and the session end leaves it at `0`; with High Power set beforehand (`powermode 2` under Battery Power), the read is refused, the log says so, and `powermode 2` is still set after the session
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
 - App Nap on macOS 27, where `defaults read` of a missing key prints "Could not find key 'NSAppSleepDisabled' in domain '<id>'." or "Domain '<id>' not found.": an `appNapOverrides` entry whose key is already gone (deleted by hand after a force-quit) is cleared by the agent with "the key is already absent" and the run exits 0, and uninstall counts agent apps without the key as checked, not unreadable; with a sandboxed agent app on the list (one with `~/Library/Containers/<id>`), its container's preferences have no `NSAppSleepDisabled` left after the agent clears its entry
 - Battery/thermal event behavior on supported hardware
@@ -243,7 +243,7 @@ below cover what only a real Mac shows.
 - After that command exits: Low Power Mode ownership matches the mode, and a lid open made meanwhile is undone
 - `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
-- Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
+- Settings battery menus keep the end floor below the Low Power Mode floor by moving the other menu
 - "Show the countdown in the menu bar" off: a start leaves only the eye, open, with no countdown or end control and the item no wider than idle; the right-click menu leads with the time left and End session ends the session and closes the eye; clicking the eye still opens the extend pills; turning the setting on or off mid-session changes the bar at once
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
 
@@ -320,10 +320,17 @@ below cover what only a real Mac shows.
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
 
+### Settings
+
+- Settings… from the menu bar icon opens the window in front of the active app; it fits without scrolling in light and dark appearance, with minimize and zoom dimmed. On a screen shorter than the window (a 13-inch MacBook Air with the Dock at the bottom, or a display set to Larger Text), it opens no taller than the screen and the form scrolls to Open at login
+- Edit Apps: an app added from the running-apps menu or with Choose…, including one never opened (just unzipped), shows once with its name and icon, set to Keep running; switching it to Freeze when lid closes moves it from `agentList` to `freezeList` in config.json and the next lid close freezes it; Apple apps and Docker Desktop cannot be set to freeze. An app config.json names on both `agentList` and `freezeList` shows once, as Keep running, in Edit Apps and in the summary lines on the page; choosing Keep running for it leaves it only on `agentList`. An Apple app or Docker Desktop that config.json names on `freezeList` alone shows as Keep running, and its Remove button takes it off
+- Hotspot name: the field suggests networks this Mac has joined; typing a straight apostrophe offers an iPhone's curly name, choosing it saves that exact name, and the next outage joins it
+- Hotspot sheet with many tmux panes: with 30 tmux targets in config.json and the tmux section open, the sheet ends inside the Settings window, Done stays on screen, and the form scrolls to the last target and the Add row
+
 ### Install, upgrade and uninstall
 
 - Install/upgrade/uninstall with recoverable failure conditions
-- Settings > App shows the version from the installed bundle's Info.plist, and the launch line in insomnia.log carries the same; "Check for updates" names the newest stable and nightly tags as the releases page shows them and says whether the installed version is behind, and with Wi-Fi off it shows "Could not check" with the reason, the log has the failure line, and nothing else changes
+- Settings > General shows the version from the installed bundle's Info.plist, and the launch line in insomnia.log carries the same; "Check for updates" names the newest stable and nightly tags as the releases page shows them and says whether the installed version is behind, and with Wi-Fi off it shows "Could not check" with the reason, the log has the failure line, and nothing else changes
 - Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why
 - Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it
 - Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac
