@@ -106,6 +106,18 @@ final class SessionCommandTests: XCTestCase {
         XCTAssertNil(endNothing, "ending with no session is already done")
     }
 
+    /// At the cap an extension moves nothing, so the command line hears
+    /// that instead of a success.
+    func testAnExtendAtTheCapIsNotReportedAsDone() async throws {
+        let m = h.makeManager()
+        let started = await m.run(.start(seconds: Int(m.config.maxDuration)))
+        XCTAssertNil(started)
+        let endsAt = try XCTUnwrap(m.session?.endsAt)
+        let answer = await m.run(.extend(seconds: 3600))
+        XCTAssertEqual(answer, "the session was not extended; it may already be as long as a session can be")
+        XCTAssertEqual(m.session?.endsAt, endsAt)
+    }
+
     func testAFailedStartAnswersWithTheReason() async throws {
         h.guardFake.throwOn = ["disablesleep 1"]
         let m = h.makeManager()
