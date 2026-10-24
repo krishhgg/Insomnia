@@ -443,8 +443,9 @@ final class SessionManager {
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
     /// True from the moment every display sleeps until one wakes. Kept
-    /// across sessions: it is the displays' state, not the session's.
-    @ObservationIgnored private var displaysAsleep = false
+    /// across sessions: it is the displays' state, not the session's. The
+    /// status item watches it to stop its own tick for a pending start.
+    private(set) var displaysAsleep = false
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -2894,7 +2895,8 @@ final class SessionManager {
     /// sleep, so its redraw stops then, as for a closed lid. A wake redraws
     /// at once and restarts it, unless the lid keeps it stopped.
     func displaysAsleepChanged(_ asleep: Bool) {
-        displaysAsleep = asleep
+        // Assigned only on a change, so a repeated report wakes no observer.
+        if displaysAsleep != asleep { displaysAsleep = asleep }
         if asleep {
             guard let timer = countdownTimer else { return }
             timer.invalidate()

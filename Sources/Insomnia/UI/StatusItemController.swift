@@ -86,6 +86,7 @@ final class StatusItemController: NSObject {
         installHostingView()
         observeManager()
         observeCountdownStyle()
+        observeDisplaySleep()
     }
 
     // MARK: Status item
@@ -236,6 +237,21 @@ final class StatusItemController: NSObject {
                 guard let self else { return }
                 self.restylePendingCountdown()
                 self.observeCountdownStyle()
+            }
+        }
+    }
+
+    /// The projected countdown stops redrawing while the displays sleep,
+    /// like the manager's, and catches up as soon as one wakes.
+    private func observeDisplaySleep() {
+        withObservationTracking {
+            _ = manager.displaysAsleep
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                if !self.manager.displaysAsleep { self.refreshPendingCountdown() }
+                self.syncPendingTick()
+                self.observeDisplaySleep()
             }
         }
     }
@@ -617,10 +633,10 @@ final class StatusItemController: NSObject {
 
     /// 1 Hz redraw of the projected countdown, aligned to whole wall-clock
     /// seconds like the manager's live one. Runs only while the phase is
-    /// `.starting` and the countdown shows the time left; stopped on
-    /// confirmation, refusal or reopening. The timer runs on the real run
-    /// loop, so it is scheduled from `Date()`; the text it draws reads
-    /// `clock`.
+    /// `.starting`, the countdown shows the time left and a display is
+    /// awake; stopped on confirmation, refusal or reopening. The timer runs
+    /// on the real run loop, so it is scheduled from `Date()`; the text it
+    /// draws reads `clock`.
     private func armPendingTick() {
         stopPendingTick()
         let first = SessionMath.nextSecondBoundary(after: Date())
@@ -638,7 +654,11 @@ final class StatusItemController: NSObject {
     }
 
     private func syncPendingTick() {
-        if model.phase == .starting, manager.config.countdownStyle == .remaining { armPendingTick() } else { stopPendingTick() }
+        if model.phase == .starting, manager.config.countdownStyle == .remaining, !manager.displaysAsleep {
+            armPendingTick()
+        } else {
+            stopPendingTick()
+        }
     }
 
     private func refreshPendingCountdown() {

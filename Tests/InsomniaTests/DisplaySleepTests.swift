@@ -45,6 +45,49 @@ final class DisplaySleepTests: XCTestCase {
         XCTAssertTrue(m.countdownTimerArmed)
     }
 
+    /// The status item's own tick for a start still in flight stops too, and
+    /// a wake redraws the projected countdown at once.
+    func testDisplaySleepStopsThePendingStartsTickToo() async throws {
+        _ = NSApplication.shared
+        let m = h.makeManager()
+        let clock = h.clock
+        let controller = StatusItemController(manager: m, status: PlaceholderStatus(), showSettings: {}, clock: { clock.now })
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
+        controller.expand(mode: .start)
+        controller.focus(.hours)
+        XCTAssertTrue(controller.model.input.append(digit: 1, to: .hours))
+        controller.commit()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(controller.model.phase, .starting)
+        XCTAssertTrue(controller.pendingTickArmed)
+
+        func settles(_ armed: Bool) async -> Bool {
+            let deadline = Date().addingTimeInterval(2)
+            while controller.pendingTickArmed != armed, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return controller.pendingTickArmed == armed
+        }
+        m.displaysAsleepChanged(true)
+        let stopped = await settles(false)
+        XCTAssertTrue(stopped)
+        clock.advance(90)
+        m.displaysAsleepChanged(false)
+        let restarted = await settles(true)
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(controller.model.pendingCountdown, "0:58:30")
+
+        await gate.open()
+        let deadline = Date().addingTimeInterval(2)
+        while controller.model.phase != .running, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(controller.model.phase, .running)
+        XCTAssertFalse(controller.pendingTickArmed)
+        await m.end(reason: .user)
+    }
+
     func testAWakeWithTheLidClosedLeavesTheRedrawStopped() async throws {
         let m = h.makeManager()
         await m.start(duration: 3600)
