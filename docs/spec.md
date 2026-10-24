@@ -101,6 +101,12 @@ recovery; newly written journals use `frozenProcesses`.
   timer runs at 1 Hz and stops while the lid is closed.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
+- "Show the countdown in the menu bar" (`showMenuBarCountdown`, default on,
+  also for a config.json without the key). Off: the status item is the eye
+  alone, open while a session runs and closed otherwise, with no countdown
+  and no end control. The right-click menu then leads with the time left
+  (minute granularity, "2h 14m remaining"); End session is there, as for
+  every running session. Clicking the eye still opens an extension.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
   the backstop is armed. If pmset fails, or `pmset -g` no longer reads

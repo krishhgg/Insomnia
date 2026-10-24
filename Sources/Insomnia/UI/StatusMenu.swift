@@ -1,7 +1,8 @@
 import AppKit
 
 /// The right-click menu on the status item: a read-only status block, then
-/// End session while running, Settings and Quit.
+/// End session while a session runs, Settings and Quit. With the menu bar
+/// countdown turned off, the time left heads the status block.
 ///
 /// The item list is pure so the ordering and the omission rules can be
 /// tested without a menu bar; the menu builder is the only part that
@@ -12,6 +13,8 @@ enum StatusMenu {
             case info
             case warning
             case separator
+            /// End the running session. Offered whenever a session runs; with
+            /// the menu bar countdown off it stands in for the hold-to-end ring.
             case endSession
             case settings
             case quit
@@ -34,6 +37,12 @@ enum StatusMenu {
     static let settingsTitle = "Settings\u{2026}"
     static let quitTitle = "Quit Insomnia"
 
+    /// The time-left line, from the session's minute-granularity text
+    /// ("2h 14m").
+    static func remainingLine(_ remaining: String) -> String {
+        "\(remaining) remaining"
+    }
+
     /// Disabled status lines, a separator, then session and app actions. Empty
     /// lines are dropped, and the separator only appears when something
     /// precedes it, so the menu never opens with a stray rule at the top.
@@ -48,6 +57,8 @@ enum StatusMenu {
     /// `outputsWaiting` are output devices still muted from a lid close
     /// because they were not connected to get their volume back; each gets
     /// a line and an item to stop waiting for it.
+    /// `remaining` is the time left, given while the menu bar countdown is
+    /// turned off and a session runs; it heads the menu.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -60,9 +71,13 @@ enum StatusMenu {
         commandRunning: String? = nil,
         foreignSleep: String? = nil,
         outputsWaiting: [SavedAudioOutput] = [],
-        lidSimulationBuild: Bool = false
+        lidSimulationBuild: Bool = false,
+        remaining: String? = nil
     ) -> [Item] {
         var out: [Item] = []
+        if let remaining = present(remaining) {
+            out.append(Item(title: remainingLine(remaining), kind: .info))
+        }
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
             out.append(Item(title: held.text, kind: held.isWarning ? .warning : .info))
         }

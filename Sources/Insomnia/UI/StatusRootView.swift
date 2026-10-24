@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// Everything drawn inside the status item: the mark, the three pill slots
-/// while entering, or the countdown while a session runs or starts.
+/// while entering, or the countdown while a session runs or starts (unless
+/// Settings turns the countdown off, which leaves the mark alone).
 ///
 /// The layout here changes only on state the controller sets outside any
 /// animation transaction (`slotsPresent`, `phase` and `startError`), and
@@ -45,8 +46,12 @@ struct StatusRootView: View {
     /// countdown for a session that is already gone.
     private var showsRunningControls: Bool { model.phase.showsRunningControls && isRunning }
     /// A pending start shows its projected countdown; a confirmed session its
-    /// live one.
-    private var showsCountdown: Bool { model.phase == .starting || showsRunningControls }
+    /// live one. With the countdown turned off in Settings neither is drawn,
+    /// nor the end ring beside it: the eye alone says a session is running,
+    /// and the time left and End session are in the right-click menu.
+    private var showsCountdown: Bool {
+        manager.config.showMenuBarCountdown && (model.phase == .starting || showsRunningControls)
+    }
     /// The eye opens the moment Enter starts a session, not when the manager
     /// confirms it: the blink is the first thing that answers the keystroke.
     /// A refused start closes it again with the pills coming back.
@@ -109,6 +114,9 @@ struct StatusRootView: View {
 
     /// A closed eye while idle; it opens while sleep is held, so the app
     /// visibly does something even when Low Power Mode is not showing.
+    /// Without the countdown beside it, the eye carries the time left for
+    /// VoiceOver, from the minute-granularity text so the bar is not
+    /// redrawn every second for it.
     private var icon: some View {
         EyeMarkView(isRunning: eyeOpen, reduceMotion: reduceMotion)
             .frame(width: 20, height: 20)
@@ -120,6 +128,12 @@ struct StatusRootView: View {
             }
             .onTapGesture(perform: onTapIcon)
             .accessibilityLabel("Insomnia")
+            .accessibilityValue(eyeAccessibilityValue)
+    }
+
+    private var eyeAccessibilityValue: String {
+        guard !manager.config.showMenuBarCountdown, isRunning, !manager.remainingText.isEmpty else { return "" }
+        return StatusMenu.remainingLine(manager.remainingText)
     }
 
     /// All three slots are in the layout whenever they are present;

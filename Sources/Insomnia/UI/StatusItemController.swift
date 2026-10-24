@@ -654,6 +654,9 @@ final class StatusItemController: NSObject {
         // Same for the foreign-sleep line: re-read the bit now, and let the
         // next opening drop the line if sleep is enabled again.
         Task { await manager.recheckForeignSleep() }
+        // The time left is read now too: the redraw timer stops while the
+        // lid is closed, and the menu can open then on an external display.
+        manager.refreshCountdown()
         let menu = StatusMenu.menu(
             Self.menuItems(manager: manager, status: status),
             target: self,
@@ -668,8 +671,11 @@ final class StatusItemController: NSObject {
 
     /// The menu's lines from what the session and the status source report
     /// now. Static, so a test can check them without a status item.
+    /// With the menu bar countdown off, the menu also carries the time left
+    /// while a session runs, since the bar shows only the eye.
     static func menuItems(manager: SessionManager, status: any StatusSource) -> [StatusMenu.Item] {
-        StatusMenu.items(
+        let inMenu = manager.isActive && !manager.config.showMenuBarCountdown
+        return StatusMenu.items(
             sessionActive: manager.isActive,
             sleepHeld: manager.state.sleepDisabledByUs,
             machine: StatusLines.machine(
@@ -695,7 +701,8 @@ final class StatusItemController: NSObject {
             commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
             outputsWaiting: manager.outputsWaitingForRestore,
-            lidSimulationBuild: LidSimulationBuild.isCompiledIn
+            lidSimulationBuild: LidSimulationBuild.isCompiledIn,
+            remaining: inMenu ? manager.remainingText : nil
         )
     }
 
