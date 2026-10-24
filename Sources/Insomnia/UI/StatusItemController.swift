@@ -874,8 +874,7 @@ final class StatusItemController: NSObject {
         keyMonitor = nil
         localMouseMonitor = nil
         globalMouseMonitor = nil
-        refocusWatch?.invalidate()
-        refocusWatch = nil
+        stopRefocusWatch()
         let panel = keyCatcher
         keyCatcher = nil
         panel?.onFocusLost = nil
@@ -886,34 +885,51 @@ final class StatusItemController: NSObject {
     /// The catcher lost key status. On macOS 27 a press on the status item
     /// does that by itself: it deactivates the app while the button is still
     /// down, so collapsing here would fold the pills before a pill could take
-    /// the click. A press on the item is waited out instead. A pill takes
-    /// focus back (`focus(_:)`) and the eye commits or collapses
-    /// (`iconTapped`); if the catcher is still not key 0.2 s after the
-    /// release, the pills close, so typing never goes to another app while
-    /// they show. Focus lost anywhere else (another app, Cmd-Tab) collapses
-    /// at once.
+    /// the click. A press on the item is waited out instead (`RefocusWait`).
+    /// A pill takes focus back (`focus(_:)`) and the eye commits or collapses
+    /// (`iconTapped`); if the catcher is still not key once the button has
+    /// been up for `RefocusWait.grace`, the pills close, so typing never goes
+    /// to another app while they show. Focus lost anywhere else (another app,
+    /// Cmd-Tab) collapses at once.
     private func focusLost(_ panel: KeyCatcherPanel) {
         guard Self.isClickOnItem(at: NSEvent.mouseLocation, itemFrame: button?.window?.frame) else {
             collapse(returnFocus: false)
             return
         }
-        refocusWatch?.invalidate()
+        // One watch at a time, and nothing queued behind it: a second press
+        // replaces the first press's watch rather than racing it.
+        stopRefocusWatch()
+        var wait = RefocusWait()
         let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self, weak panel] _ in
             MainActor.assumeIsolated {
-                guard let self, NSEvent.pressedMouseButtons & 1 == 0 else { return }
-                self.refocusWatch?.invalidate()
-                self.refocusWatch = nil
-                // The held-back release (`StatusHostingView`) and the pill's
-                // tap land within a frame or two, and activation takes a few
-                // milliseconds more.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    guard let panel, self.keyCatcher === panel, !panel.isKeyWindow else { return }
+                guard let self else { return }
+                guard let panel, self.keyCatcher === panel else {
+                    self.stopRefocusWatch()
+                    return
+                }
+                let step = wait.step(
+                    buttonDown: NSEvent.pressedMouseButtons & 1 != 0,
+                    catcherIsKey: panel.isKeyWindow,
+                    now: ProcessInfo.processInfo.systemUptime
+                )
+                switch step {
+                case .wait:
+                    break
+                case .refocused:
+                    self.stopRefocusWatch()
+                case .collapse:
+                    self.stopRefocusWatch()
                     self.collapse(returnFocus: false)
                 }
             }
         }
         RunLoop.main.add(timer, forMode: .common)
         refocusWatch = timer
+    }
+
+    private func stopRefocusWatch() {
+        refocusWatch?.invalidate()
+        refocusWatch = nil
     }
 
     /// On macOS 27 a click on the status item reaches the global monitor as

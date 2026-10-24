@@ -11,7 +11,10 @@ import AppKit
 /// Activate Insomnia while typing, then yield to the previous app when the
 /// pills close. A non-activating panel can leave input in the previous app.
 final class KeyCatcherPanel: NSPanel {
-    private var previousApplication: NSRunningApplication?
+    /// The app to give focus back to: the one in front when the pills first
+    /// took focus, or none when that was Insomnia itself.
+    private(set) var previousApplication: NSRunningApplication?
+    private var choseReturnTarget = false
     var onFocusLost: (() -> Void)?
 
     /// A borderless window refuses key status by default.
@@ -38,10 +41,18 @@ final class KeyCatcherPanel: NSPanel {
     }
 
     func takeFocus() {
-        let front = NSWorkspace.shared.frontmostApplication
-        if front != .current { previousApplication = front }
+        rememberReturnTarget(front: NSWorkspace.shared.frontmostApplication)
         NSApp.activate(ignoringOtherApps: true)
         makeKeyAndOrderFront(nil)
+    }
+
+    /// Only the first call picks. A pill click takes focus again, and on
+    /// macOS 27 the press has already made another app frontmost by then
+    /// (Finder, in a VM run), which is not the app the user was in.
+    func rememberReturnTarget(front: NSRunningApplication?) {
+        guard !choseReturnTarget else { return }
+        choseReturnTarget = true
+        if front != .current { previousApplication = front }
     }
 
     func returnFocus() {
