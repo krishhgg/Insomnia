@@ -41,6 +41,9 @@ final class StatusItemController: NSObject {
     private var globalMouseMonitor: Any?
     /// Holds keyboard focus while the pills are open; see `KeyCatcherPanel`.
     private var keyCatcher: KeyCatcherPanel?
+    /// Waits out a press on the status item that took focus from the
+    /// catcher; see `focusLost(_:)`.
+    private var refocusWatch: Timer?
     /// 1 Hz redraw of the projected countdown while a start is pending, so
     /// it does not sit frozen for the seconds the recovery agent and pmset
     /// take and then jump on confirmation. The end time has nothing to tick.
@@ -838,7 +841,10 @@ final class StatusItemController: NSObject {
         let panel = KeyCatcherPanel()
         if let button { panel.move(toStatusButton: button) }
         keyCatcher = panel
-        panel.onFocusLost = { [weak self] in self?.collapse(returnFocus: false) }
+        panel.onFocusLost = { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            self.focusLost(panel)
+        }
         panel.takeFocus()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Local monitors always run on the main thread.
@@ -868,11 +874,46 @@ final class StatusItemController: NSObject {
         keyMonitor = nil
         localMouseMonitor = nil
         globalMouseMonitor = nil
+        refocusWatch?.invalidate()
+        refocusWatch = nil
         let panel = keyCatcher
         keyCatcher = nil
         panel?.onFocusLost = nil
         panel?.orderOut(nil)
         if returnFocus { panel?.returnFocus() }
+    }
+
+    /// The catcher lost key status. On macOS 27 a press on the status item
+    /// does that by itself: it deactivates the app while the button is still
+    /// down, so collapsing here would fold the pills before a pill could take
+    /// the click. A press on the item is waited out instead. A pill takes
+    /// focus back (`focus(_:)`) and the eye commits or collapses
+    /// (`iconTapped`); if the catcher is still not key 0.2 s after the
+    /// release, the pills close, so typing never goes to another app while
+    /// they show. Focus lost anywhere else (another app, Cmd-Tab) collapses
+    /// at once.
+    private func focusLost(_ panel: KeyCatcherPanel) {
+        guard Self.isClickOnItem(at: NSEvent.mouseLocation, itemFrame: button?.window?.frame) else {
+            collapse(returnFocus: false)
+            return
+        }
+        refocusWatch?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self, weak panel] _ in
+            MainActor.assumeIsolated {
+                guard let self, NSEvent.pressedMouseButtons & 1 == 0 else { return }
+                self.refocusWatch?.invalidate()
+                self.refocusWatch = nil
+                // The held-back release (`StatusHostingView`) and the pill's
+                // tap land within a frame or two, and activation takes a few
+                // milliseconds more.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    guard let panel, self.keyCatcher === panel, !panel.isKeyWindow else { return }
+                    self.collapse(returnFocus: false)
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        refocusWatch = timer
     }
 
     /// On macOS 27 a click on the status item reaches the global monitor as
