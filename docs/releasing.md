@@ -258,6 +258,13 @@ below cover what only a real Mac shows.
   the setting while the session runs changes the bar at once. Start a
   session, wait 10 s, then sample `ps -o %cpu= -p <pid>` every 0.5 s for 20 s:
   the mean stays near zero (under about 0.1%)
+- With a session running and the lid open, put the displays to sleep
+  (`pmset displaysleepnow`) and touch nothing for a minute: insomnia.log
+  says `displays asleep: countdown redraw stopped`, and the app's CPU time
+  (`ps -o time= -p <pid>`) barely moves over that minute. Force-quit the app
+  and open it again while they sleep: the resumed session's CPU time barely
+  moves either. On wake it says `display awake: countdown redraw restarted`
+  and the countdown shows the time left at once
 
 ### Lid close
 
