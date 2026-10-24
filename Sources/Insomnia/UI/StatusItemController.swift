@@ -44,6 +44,10 @@ final class StatusItemController: NSObject {
     /// Waits out a press on the status item that took focus from the
     /// catcher; see `focusLost(_:)`.
     private var refocusWatch: Timer?
+    /// The pointer in screen coordinates, read when the catcher loses focus.
+    /// Tests pin it, so the real pointer resting on the item does not change
+    /// which branch they take.
+    var pointerLocation: () -> NSPoint = { NSEvent.mouseLocation }
     /// 1 Hz redraw of the projected countdown while a start is pending, so
     /// it does not sit frozen for the seconds the recovery agent and pmset
     /// take and then jump on confirmation. The end time has nothing to tick.
@@ -892,7 +896,7 @@ final class StatusItemController: NSObject {
     /// to another app while they show. Focus lost anywhere else (another app,
     /// Cmd-Tab) collapses at once.
     private func focusLost(_ panel: KeyCatcherPanel) {
-        guard Self.isClickOnItem(at: NSEvent.mouseLocation, itemFrame: button?.window?.frame) else {
+        guard Self.isClickOnItem(at: pointerLocation(), itemFrame: button?.window?.frame) else {
             collapse(returnFocus: false)
             return
         }
