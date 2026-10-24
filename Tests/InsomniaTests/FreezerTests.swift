@@ -236,12 +236,28 @@ final class FreezerTests: XCTestCase {
                    "com.brave.Browser", "com.vivaldi.Vivaldi", "com.operasoftware.Opera", "org.mozilla.firefox",
                    "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly", "app.zen-browser.zen", "ai.perplexity.comet",
                    "io.tailscale.ipn.macsys", "ai.elementlabs.lmstudio", "com.electron.ollama", "com.electron.dockerdesktop",
-                   "com.1password.1password", "com.bitwarden.desktop", "com.postgresapp.Postgres2", "dev.kdrag0n.MacVirt"] {
+                   "com.1password.1password", "com.bitwarden.desktop", "com.postgresapp.Postgres2", "dev.kdrag0n.MacVirt",
+                   "com.trycua.spaces.macos"] {
             XCTAssertTrue(FreezePlanner.isBuiltInProtected(id), id)
         }
         XCTAssertFalse(FreezePlanner.isBuiltInProtected("dev.orbstack.OrbStack"), "OrbStack's real id is dev.kdrag0n.MacVirt; the guessed one must not linger")
         XCTAssertFalse(FreezePlanner.builtInProtected.contains { $0.hasPrefix("com.apple.") })
         XCTAssertFalse(FreezePlanner.builtInProtectedPrefixes.contains { $0.hasPrefix("com.apple.") })
+    }
+
+    /// Cua Spaces is a regular Dock app that hosts the sandboxes an agent
+    /// drives, so SIGSTOP on it stops the work the session is being kept
+    /// awake for. The automatic scope must leave it alone, and an explicit
+    /// freeze-list entry must still win.
+    func testSandboxHostIsExcludedAutomaticallyButIncludedWhenOnFreezeList() {
+        let cua = RunningApp(pid: 1200, bundleId: "com.trycua.spaces.macos", name: "Cua Spaces")
+        var c = Config()
+        c.freezeAllApps = true
+        c.freezeList = []
+        c.agentList = []
+        XCTAssertEqual(scope(c, [cua, spotify]), ["com.spotify.client"])
+        c.freezeList = ["com.trycua.spaces.macos"]
+        XCTAssertEqual(scope(c, [cua, spotify]), ["com.trycua.spaces.macos", "com.spotify.client"])
     }
 
     /// JetBrains ships one bundle id per product under `com.jetbrains.`;

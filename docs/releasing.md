@@ -255,6 +255,7 @@ below cover what only a real Mac shows.
 
 - Lid-close/open and safe recovery of explicitly selected test processes
 - Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched)
+- Real lid close with freeze-all on while an agent drives a Cua Spaces sandbox: none of Cua Spaces' processes stopped (`ps -o stat` shows no `T`), the sandbox work continues, other Dock apps frozen; again with `com.trycua.spaces.macos` on the explicit freeze list: it is stopped and resumed at the lid open
 - Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched)
 - Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted
 - Upgrade notice: install over a build whose config.json has `freezeAllApps: true` and `muteOnLidClose: false`; the first launch posts one "Lid-close settings changed" notification and shows the same line in Settings (also with notifications off for Insomnia), both settings change and config.json gets `lidCloseDefaultsApplied: true`; a setting turned back stays back after a relaunch with no second notice; Dismiss removes the line; a fresh install shows no notice
