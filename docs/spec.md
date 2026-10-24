@@ -1077,8 +1077,9 @@ older build is tightened when the app reads it:
   shows during a session: the time left, or the end time; the time left by
   default). The end time is the clock time in the system's 12 or 24 hour
   style, with the weekday when it is another day and the date a week or more
-  away. It changes only when the session does, so no timer redraws the
-  status item, and the right-click menu gains a "Time left" line. A change
+  away. No timer redraws the status item: the text is formatted again only
+  when the session changes or the time zone, the clock, the day or the
+  locale does. The right-click menu gains a "Time left" line. A change
   reaches a running session at once. A value this build does not know reads
   as the time left.
 - freeze list (bundle ids), freeze every other app on/off (default off),
