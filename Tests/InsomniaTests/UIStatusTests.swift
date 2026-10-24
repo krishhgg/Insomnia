@@ -1410,6 +1410,9 @@ final class UIStatusTests: XCTestCase {
         let h = Harness()
         defer { h.home.destroy() }
         let controller = StatusItemController(manager: h.makeManager(), status: PlaceholderStatus(), showSettings: {})
+        // Off the item. On it, a lost focus waits out the press instead
+        // (RefocusWait), which PillRefocusTests covers.
+        controller.pointerLocation = { NSPoint(x: -10_000, y: -10_000) }
         controller.expand(mode: .start)
         let panel = NSApp.windows.compactMap { $0 as? KeyCatcherPanel }.first { $0.isVisible }
         XCTAssertNotNil(panel)
