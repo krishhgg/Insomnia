@@ -98,7 +98,8 @@ final class SessionManager {
     var config: Config
     /// Minute-granularity remaining time for the popover ("2h 14m").
     private(set) var remainingText: String = ""
-    /// Live `H:MM:SS` countdown for the status item, updated at 1 Hz.
+    /// Countdown text for the status item: `H:MM:SS` updated at 1 Hz, or the
+    /// end time (`Config.countdownStyle`).
     private(set) var countdownText: String = ""
 
     /// Why the display or the keyboard backlight is left alone on lid close
@@ -441,6 +442,10 @@ final class SessionManager {
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
+    /// True from the moment every display sleeps until one wakes. Kept
+    /// across sessions: it is the displays' state, not the session's. The
+    /// status item watches it to stop its own tick for a pending start.
+    private(set) var displaysAsleep = false
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -2869,11 +2874,40 @@ final class SessionManager {
         countdownTimer = nil
     }
 
-    /// Restart the countdown redraw. The lid observer calls this on lid open.
+    /// Restart the countdown redraw. The lid observer calls this on lid open,
+    /// which wakes the displays too, so it does not wait for their wake.
     func resumeCountdown() {
         countdownPaused = false
+        displaysAsleep = false
         refreshCountdown()
         armCountdownTimer()
+    }
+
+    /// Settings calls this when the countdown style changes, so a running
+    /// session reads the new one now and gets or loses its tick with it.
+    func countdownStyleChanged() {
+        refreshCountdown()
+        if !countdownPaused { armCountdownTimer() }
+    }
+
+    /// Every display went to sleep, or the first one woke
+    /// (`DisplaySleepObserver`). Nothing can see the countdown while they
+    /// sleep, so its redraw stops then, as for a closed lid. A wake redraws
+    /// at once and restarts it, unless the lid keeps it stopped.
+    func displaysAsleepChanged(_ asleep: Bool) {
+        // Assigned only on a change, so a repeated report wakes no observer.
+        if displaysAsleep != asleep { displaysAsleep = asleep }
+        if asleep {
+            guard let timer = countdownTimer else { return }
+            timer.invalidate()
+            countdownTimer = nil
+            Log.info("displays asleep: countdown redraw stopped")
+        } else if !countdownPaused, session != nil {
+            refreshCountdown()
+            armCountdownTimer()
+            // The end time has no redraw to restart.
+            if countdownTimer != nil { Log.info("display awake: countdown redraw restarted") }
+        }
     }
 
     /// Recompute `remainingText` and `countdownText` from the injected clock.
@@ -2885,10 +2919,10 @@ final class SessionManager {
             countdownText = ""
             return
         }
-        let remaining = s.remaining(at: clock())
-        let minute = SessionMath.formatRemaining(remaining)
+        let now = clock()
+        let minute = SessionMath.formatRemaining(s.remaining(at: now))
         if remainingText != minute { remainingText = minute }
-        let second = SessionMath.formatCountdown(remaining: remaining, shape: s.countdownShape)
+        let second = SessionMath.countdownText(endsAt: s.endsAt, shape: s.countdownShape, style: config.countdownStyle, now: now)
         if countdownText != second { countdownText = second }
     }
 
@@ -2936,7 +2970,8 @@ final class SessionManager {
 
     /// 1 Hz redraw aligned to whole wall-clock seconds so the digits change
     /// in step with the menu bar clock. `pauseCountdown()` stops it entirely
-    /// while the lid is closed.
+    /// while the lid is closed, and `displaysAsleepChanged` while the
+    /// displays sleep.
     private func armCountdownTimer() {
         countdownTimer?.invalidate()
         countdownTimer = nil
@@ -2944,7 +2979,9 @@ final class SessionManager {
         // `resumeCountdown` covers every caller: a session that ends while the
         // lid is shut would otherwise leave lid-open arming a 1 Hz timer that
         // wakes the run loop forever to format an empty string.
-        guard session != nil else { return }
+        guard session != nil, !displaysAsleep else { return }
+        // The end time changes only with the session, so it has no tick.
+        guard config.countdownStyle == .remaining else { return }
         let first = SessionMath.nextSecondBoundary(after: clock())
         let timer = Timer(fire: first, interval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshCountdown() }

@@ -222,6 +222,8 @@ below cover what only a real Mac shows.
 
 ### Sessions and recovery
 
+- With a text field focused in another app, open the duration pills and type digits, Tab, Backspace and Esc: only Insomnia changes, and Esc returns focus to the previous app. Repeat for extending a session and after a refused start. Switching apps closes the pills without taking focus back. Clicking an already-open Settings window keeps keyboard focus in Settings; opening Settings/Quit closes the pills and gives the menu its own keyboard input. Repeat on another display/Space. Do not send Enter to a chat or terminal as a test.
+
 - Normal end, deadline expiry, and repeated Quit restore live power state
 - Sleep guard read back: on a Mac where another process sets SleepDisabled back to 0 about 2 s after `pmset -a disablesleep 1` (for example a root LaunchDaemon that loops `pmset -a disablesleep 0`), Start fails after about 5 s with "SleepDisabled read 0 again" and no session runs; on a Mac where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
 - Force-quit followed by launchd deadline recovery and retry after failure
@@ -242,6 +244,7 @@ below cover what only a real Mac shows.
 - `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
+- "Show the countdown in the menu bar" off: a start leaves only the eye, open, with no countdown or end control and the item no wider than idle; the right-click menu leads with the time left and End session ends the session and closes the eye; clicking the eye still opens the extend pills; turning the setting on or off mid-session changes the bar at once
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
 
 ### Menu bar
@@ -250,6 +253,18 @@ below cover what only a real Mac shows.
   10 s, then sample `ps -o %cpu= -p <pid>` every 0.5 s for 20 s. The mean
   stays under about 5%, and the countdown still changes every second. It read
   about 46% before the countdown stopped animating its digits
+- With Countdown set to End time in Settings, a running session shows its end
+  time in the bar, the right-click menu has a Time left line, and switching
+  the setting while the session runs changes the bar at once. Start a
+  session, wait 10 s, then sample `ps -o %cpu= -p <pid>` every 0.5 s for 20 s:
+  the mean stays near zero (under about 0.1%)
+- With a session running and the lid open, put the displays to sleep
+  (`pmset displaysleepnow`) and touch nothing for a minute: insomnia.log
+  says `displays asleep: countdown redraw stopped`, and the app's CPU time
+  (`ps -o time= -p <pid>`) barely moves over that minute. Force-quit the app
+  and open it again while they sleep: the resumed session's CPU time barely
+  moves either. On wake it says `display awake: countdown redraw restarted`
+  and the countdown shows the time left at once
 
 ### Lid close
 
@@ -293,6 +308,11 @@ below cover what only a real Mac shows.
 - A kept display brightness read above 0 that a close under the closing lid reads at 0 (as in the row above, after the launch that leaves the entry waiting, keep the display asleep until the session starts, wake it with auto-brightness on, then close the lid in a dark room before the next re-read): the close logs "where auto-brightness under the closing lid may have pulled it down" and "stays journaled and undecided", nothing is written at the close or the open, and while the panel reads 0 the open and every re-read log "only a reading above 0 tells them apart" and the entry stays in state.json; once the panel reads above 0, "set since its restore" with that level, and the kept value is never written
 - The same entry across a relaunch (as in the row above, quit Insomnia after the close with the lid still closed, open the lid, and relaunch Insomnia while the panel still reads 0): the launch logs "only a reading above 0 tells them apart" while the panel reads 0, nothing is written, and once the panel reads above 0, "set since its restore" with that level
 - Backstop and uninstall with a hand-edited state.json whose `keptDisplayReadLit` is `1e-400` (a copy of a journal from the restart row above, in a test home): the backstop logs "is unreadable or malformed; nothing undone, evidence kept", uninstall prints "state.json is unreadable or malformed" and removes nothing, and state.json is unchanged
+
+### Menu bar
+
+- On macOS 27, with a light and a dark menu bar: the eye, countdown, end ring and pills read on both; holding the ring ends the session after about 0.6 s with the button still down; a short tap or sliding off the ring does nothing; the countdown and the eye still open the pills
+- On macOS 26: a click on the countdown opens the pills even if the pointer moves on right after it; sliding off the ring just before it closes does not end the session
 
 ### Hotspot
 
