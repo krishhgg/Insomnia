@@ -651,6 +651,7 @@ final class StatusItemController: NSObject {
         let menu = StatusMenu.menu(
             Self.menuItems(manager: manager, status: status),
             target: self,
+            endSession: #selector(menuEndSession),
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
             relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
@@ -724,6 +725,13 @@ final class StatusItemController: NSObject {
         // forward so the alert is not behind whatever is frontmost.
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// A normal menu click ends through the same restoration path as the hold
+    /// control. A menu kept open after timer expiry must not end an idle session.
+    @objc func menuEndSession() {
+        guard manager.isActive else { return }
+        endNow()
     }
 
     @objc private func menuQuit() {
