@@ -11,6 +11,8 @@ struct Config: Codable, Equatable, Sendable {
     /// The pill that is focused when the pills open, for a start and for an
     /// extend.
     var defaultFocusField: DurationInput.Field = .hours
+    /// What the menu bar countdown reads during a session.
+    var countdownStyle: CountdownStyle = .remaining
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
 
@@ -155,6 +157,8 @@ struct Config: Codable, Equatable, Sendable {
         // A value this build does not know falls back to hours; it must not
         // cost the user the rest of the config.
         defaultFocusField = (try? c.decodeIfPresent(DurationInput.Field.self, forKey: .defaultFocusField)) ?? d.defaultFocusField
+        // Same for a style this build does not know: back to the time left.
+        countdownStyle = (try? c.decodeIfPresent(CountdownStyle.self, forKey: .countdownStyle)) ?? d.countdownStyle
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
@@ -179,6 +183,14 @@ struct Config: Codable, Equatable, Sendable {
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }
+}
+
+/// How the menu bar countdown reads during a session.
+enum CountdownStyle: String, Codable, CaseIterable, Sendable {
+    case remaining
+    /// The clock time the session ends at. It changes only when the session
+    /// does, so nothing redraws the status item in between.
+    case endTime
 }
 
 // MARK: Lid-close update

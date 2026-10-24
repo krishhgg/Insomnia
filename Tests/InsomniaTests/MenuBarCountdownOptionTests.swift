@@ -36,7 +36,7 @@ final class MenuBarCountdownOptionTests: XCTestCase {
             remaining: "2h 14m"
         )
         XCTAssertEqual(items, [
-            StatusMenu.Item(title: "2h 14m remaining", kind: .info),
+            StatusMenu.Item(title: "Time left: 2h 14m", kind: .info),
             StatusMenu.Item(title: "Sleep held per journal \u{2014} not verified live", kind: .info),
             StatusMenu.Item(title: "Lid: open \u{00B7} 82%", kind: .info),
             StatusMenu.Item(title: "", kind: .separator),
@@ -78,7 +78,7 @@ final class MenuBarCountdownOptionTests: XCTestCase {
         let status = PlaceholderStatus()
         func extras() -> [StatusMenu.Item] {
             StatusItemController.menuItems(manager: manager, status: status)
-                .filter { $0.kind == .endSession || $0.title.hasSuffix(" remaining") }
+                .filter { $0.kind == .endSession || $0.title.hasPrefix("Time left") }
         }
 
         manager.config.showMenuBarCountdown = false
@@ -87,7 +87,7 @@ final class MenuBarCountdownOptionTests: XCTestCase {
         await manager.start(duration: 3600)
         XCTAssertTrue(manager.isActive)
         XCTAssertEqual(extras(), [
-            StatusMenu.Item(title: "1h remaining", kind: .info),
+            StatusMenu.Item(title: "Time left: 1h", kind: .info),
             StatusMenu.Item(title: StatusMenu.endSessionTitle, kind: .endSession),
         ])
 

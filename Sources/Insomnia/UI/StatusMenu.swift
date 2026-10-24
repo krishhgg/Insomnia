@@ -40,7 +40,7 @@ enum StatusMenu {
     /// The time-left line, from the session's minute-granularity text
     /// ("2h 14m").
     static func remainingLine(_ remaining: String) -> String {
-        "\(remaining) remaining"
+        "Time left: \(remaining)"
     }
 
     /// Disabled status lines, a separator, then session and app actions. Empty
@@ -57,8 +57,9 @@ enum StatusMenu {
     /// `outputsWaiting` are output devices still muted from a lid close
     /// because they were not connected to get their volume back; each gets
     /// a line and an item to stop waiting for it.
-    /// `remaining` is the time left, given while the menu bar countdown is
-    /// turned off and a session runs; it heads the menu.
+    /// `remaining` is the time left, given while a session runs and the bar
+    /// does not show it: the countdown is turned off, or it shows the end
+    /// time. It heads the menu.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -75,7 +76,7 @@ enum StatusMenu {
         remaining: String? = nil
     ) -> [Item] {
         var out: [Item] = []
-        if let remaining = present(remaining) {
+        if sessionActive, let remaining = present(remaining) {
             out.append(Item(title: remainingLine(remaining), kind: .info))
         }
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
