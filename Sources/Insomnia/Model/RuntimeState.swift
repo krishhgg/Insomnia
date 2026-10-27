@@ -87,8 +87,10 @@ struct AppNapOverride: Codable, Equatable, Hashable, Sendable {
 /// (spec section 4). Restored on that device only, never on another
 /// output; kept while the device is not connected. `name` is for the
 /// warning that names a device still waiting, and left out of the JSON
-/// when it could not be read. `volume` is left out for a device without a
-/// settable volume, which lid close still mutes. `saveID` is drawn afresh by each lid close
+/// when it could not be read. A device without a settable volume, which
+/// lid close still mutes, has `volume` nil: written as 0 with
+/// `noVolume: true`, so a build or script that requires a number still
+/// reads the journal. `saveID` is drawn afresh by each lid close
 /// that writes an entry, so a later save for the same device, with the
 /// same values or not, is never taken for this one, whichever copy of the
 /// app wrote it. nil, and left out of the JSON, in an entry written
@@ -107,6 +109,30 @@ struct SavedAudioOutput: Codable, Equatable, Hashable, Sendable {
         self.volume = volume
         self.muted = muted
         self.saveID = saveID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case deviceUID, name, volume, noVolume, muted, saveID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceUID = try c.decode(String.self, forKey: .deviceUID)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        let volume = try c.decode(Float.self, forKey: .volume)
+        self.volume = try c.decodeIfPresent(Bool.self, forKey: .noVolume) == true ? nil : volume
+        muted = try c.decode(Bool.self, forKey: .muted)
+        saveID = try c.decodeIfPresent(String.self, forKey: .saveID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(deviceUID, forKey: .deviceUID)
+        try c.encodeIfPresent(name, forKey: .name)
+        try c.encode(volume ?? 0, forKey: .volume)
+        if volume == nil { try c.encode(true, forKey: .noVolume) }
+        try c.encode(muted, forKey: .muted)
+        try c.encodeIfPresent(saveID, forKey: .saveID)
     }
 
     /// The name, or the UID when the name could not be read.

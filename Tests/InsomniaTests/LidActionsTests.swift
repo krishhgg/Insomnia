@@ -1740,6 +1740,22 @@ final class LidActionsTests: XCTestCase {
         XCTAssertNil(m.lastError)
     }
 
+    /// A mute that cannot be set at lid open (the device still waking, or
+    /// held by another app) fails the restore: the entry stays for a retry
+    /// instead of being cleared with the device still muted.
+    func testARestoreThatCannotSetTheMuteKeepsTheEntry() async throws {
+        let (m, actions) = await make()
+        h.audio.connect("LG-HDMI", name: "LG UltraGear", volume: nil)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        h.audio.connect("LG-HDMI", name: "LG UltraGear", volume: nil, muted: nil)
+
+        await actions.onOpen()
+
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.deviceUID), ["LG-HDMI"])
+        XCTAssertNotNil(m.lastError)
+    }
+
     /// An output with neither control is skipped, with nothing journaled.
     func testAnOutputWithoutVolumeOrMuteIsSkipped() async throws {
         let (m, actions) = await make()

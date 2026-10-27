@@ -25,7 +25,7 @@ protocol AudioControlling: Sendable {
     func read(deviceUID: String) throws -> AudioOutput
     /// Sets the device with this UID, or the default output device when
     /// nil (a journal entry from a build that did not record the device).
-    /// A nil volume, or a control the device does not have, is left alone.
+    /// A nil volume is left alone; the mute is always set.
     /// Throws `AudioDeviceMissingError` when no connected device has the UID.
     func apply(volume: Float?, muted: Bool, deviceUID: String?) throws
     /// Mutes the device with this UID; throws `AudioDeviceMissingError`
@@ -78,14 +78,12 @@ struct CoreAudioControl: AudioControlling {
 
     func apply(volume: Float?, muted: Bool, deviceUID: String?) throws {
         let device = try deviceUID.map { try self.device(withUID: $0) } ?? defaultOutputDevice()
-        if let volume, settable(device, Self.volumeAddress) {
+        if let volume {
             var v = Float32(min(max(volume, 0), 1))
             try set(device, Self.volumeAddress, &v, "set volume")
         }
-        if settable(device, Self.muteAddress) {
-            var m: UInt32 = muted ? 1 : 0
-            try set(device, Self.muteAddress, &m, "set mute")
-        }
+        var m: UInt32 = muted ? 1 : 0
+        try set(device, Self.muteAddress, &m, "set mute")
     }
 
     func mute(deviceUID: String) throws {

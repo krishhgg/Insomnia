@@ -469,8 +469,10 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
         try lock.withLock {
             let uid = deviceUID ?? _defaultUID
             guard let d = _devices[uid] else { throw AudioDeviceMissingError(deviceUID: uid) }
-            if let volume, d.volume != nil { _devices[uid]?.volume = volume }
-            if d.muted != nil { _devices[uid]?.muted = muted }
+            if volume != nil, d.volume == nil { throw AudioControlError(what: "set volume", status: 2003332927) }
+            guard d.muted != nil else { throw AudioControlError(what: "set mute", status: 2003332927) }
+            if let volume { _devices[uid]?.volume = volume }
+            _devices[uid]?.muted = muted
             _applied.append((volume, muted, deviceUID))
         }
         onApply?(deviceUID)

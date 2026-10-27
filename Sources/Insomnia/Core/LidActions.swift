@@ -335,7 +335,7 @@ final class LidActions {
         do {
             let current = try audio.read()
             guard let wasMuted = current.muted else {
-                Log.info("output \(current.name ?? current.deviceUID) has no mute control; not muted")
+                Log.info("output \(current.name ?? current.deviceUID) has no mute control it can set; not muted")
                 return
             }
             try manager.journal { s in
