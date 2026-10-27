@@ -27,15 +27,18 @@ struct HoldToEndButton: View {
 
     var body: some View {
         ZStack {
+            // `Color.primary`, not white: the button sits on the menu bar
+            // itself, not inside a pill, so a light bar made a white ring and
+            // glyph invisible. Primary follows the bar's appearance.
             Circle()
-                .stroke(Color.white.opacity(0.14), lineWidth: lineWidth)
+                .stroke(Color.primary.opacity(0.28), lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: progress)
                 .stroke(Color(brand: BrandPalette.violet), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
             Image(systemName: "xmark")
                 .font(.system(size: 7, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.85))
+                .foregroundStyle(Color.primary.opacity(0.75))
         }
         .frame(width: ringDiameter, height: ringDiameter)
         .scaleEffect(holding && !reduceMotion ? 1.12 : 1)

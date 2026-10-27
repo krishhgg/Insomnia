@@ -34,7 +34,7 @@ enum LidSimulationBuild {
     /// scripts/check-lid-simulation-gate.sh fails on any copy. So the text
     /// is compiled in only with the watcher.
     #if DEBUG || INSOMNIA_LID_SIMULATION
-    static let marker = "Lid simulation build: scripts/simulate-lid.sh is honoured during sessions"
+    static let marker = String(localized: "Lid simulation build: scripts/simulate-lid.sh is honoured during sessions")
     #else
     static let marker = ""
     #endif

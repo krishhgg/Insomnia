@@ -2101,8 +2101,16 @@ final class SessionManager {
         // Brightness entries are read with the owed edits applied: an entry
         // this process already settled is not restored again.
         let kept = effectiveState
-        if kept.brightnessJournaled {
-            display.wake()
+        let wantsWake = kept.brightnessJournaled || kept.displaySleepRequested
+        let woke = wantsWake ? display.wake() : false
+        // A panel this put to sleep with no brightness journaled (the
+        // private calls were refused, so only the public sleep request ran)
+        // has nothing else to undo it, so the request is recorded and
+        // cleared here: lid open, the reconcile at launch, and restoreAll
+        // all reach this. A wake that failed leaves the entry journaled for
+        // the next one to retry, as every failed undo does.
+        if kept.displaySleepRequested, woke {
+            _ = clearUndone("display woken after a lid close turned it off") { $0.displaySleepRequested = false }
         }
         // Read before the entries are cleared: the re-assert below needs them.
         var restoredDisplay: Float?
@@ -2689,16 +2697,25 @@ final class SessionManager {
             // announce on every launch: each device is tried, and one still
             // not connected keeps its entry and its menu line.
             let refusedKept = state.hasRefusedBrightness
+            // A wake owed from a lid close whose other entries are already
+            // gone (the backstop cleared them, or the session ended first).
+            // It is undone only with the lid open: waking a closed panel is
+            // the opposite of what the close was for.
+            let owesWake = state.displaySleepRequested && clamshell() == false
             if state.displayRestoredUnderLowPower != nil {
                 dropDisplayWrite(reason: "no session and the mode is not ours")
-            } else if savedOutputs.isEmpty, !refusedKept {
+            } else if savedOutputs.isEmpty, !refusedKept, !owesWake {
                 Log.info("reconcile: no session, nothing to restore")
             }
-            if refusedKept {
-                // This launch may be the build or macOS that can make the
-                // call; still refused, the entry stays. The undo restores
-                // the saved output volumes too.
-                Log.info("reconcile: no session; trying again the brightness kept after a refused restore")
+            if refusedKept || owesWake {
+                if refusedKept {
+                    // This launch may be the build or macOS that can make the
+                    // call; still refused, the entry stays. The undo restores
+                    // the saved output volumes too.
+                    Log.info("reconcile: no session; trying again the brightness kept after a refused restore")
+                } else {
+                    Log.info("reconcile: no session; waking the display a lid close turned off")
+                }
                 undoLidActionsInJournal()
                 // A write that failed made the entry an ordinary failed
                 // restore: ended as for any dirty journal, so the agent is
@@ -3188,7 +3205,7 @@ final class SessionManager {
 
     /// The menu line for an output device still waiting for its volume.
     nonisolated static func stillMutedLine(_ output: SavedAudioOutput) -> String {
-        "\(output.label) is still muted from a lid close; Insomnia restores it when it reconnects"
+        String(format: NSLocalizedString("%@ is still muted from a lid close; Insomnia restores it when it reconnects", comment: "menu line for an output device"), output.label)
     }
 
     private func endBody(_ reason: EndReason, outputsWaiting: Bool) -> String {

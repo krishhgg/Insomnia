@@ -703,7 +703,10 @@ journal_shape_problems() { # file
     echo "state.json is not a JSON object"
     return 0
   fi
-  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused; do
+  # displaySleepRequested is the app's own record that it turned the panel
+  # off on a lid close; nothing here acts on it, but it must still decode, or
+  # the app cannot read a journal this script kept going with.
+  for key in sleepDisabledByUs lowPowerSetByUs dockerFrozen savedMuted displayRestoreRefused keyboardRestoreRefused displaySleepRequested; do
     t="$(type_of "$f" "$key")"
     [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "$key is a $t, not a bool"
   done
