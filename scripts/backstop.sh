@@ -71,7 +71,8 @@
 #       savedOutputVolume / savedMuted -> CoreAudio; only the app can restore
 #                              these. Kept for the app's reconcile.
 #       savedAudioOutputs   -> CoreAudio volume and mute of each output
-#                              device a lid close muted, by device UID; only
+#                              device a lid close muted, by device UID (no
+#                              volume for a device without one); only
 #                              the app can restore these, and only while the
 #                              device is connected. Kept for the app, and on
 #                              their own they leave the journal clean: an
