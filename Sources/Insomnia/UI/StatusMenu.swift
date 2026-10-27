@@ -46,6 +46,8 @@ enum StatusMenu {
     /// `outputsWaiting` are output devices still muted from a lid close
     /// because they were not connected to get their volume back; each gets
     /// a line and an item to stop waiting for it.
+    /// `remaining` is the time left, offered while a session runs when the
+    /// bar shows the end time instead.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -58,11 +60,15 @@ enum StatusMenu {
         commandRunning: String? = nil,
         foreignSleep: String? = nil,
         outputsWaiting: [SavedAudioOutput] = [],
-        lidSimulationBuild: Bool = false
+        lidSimulationBuild: Bool = false,
+        remaining: String? = nil
     ) -> [Item] {
         var out: [Item] = []
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
             out.append(Item(title: held.text, kind: held.isWarning ? .warning : .info))
+        }
+        if sessionActive, let remaining = present(remaining) {
+            out.append(Item(title: "Time left: \(remaining)", kind: .info))
         }
         if let machine = present(machine) {
             out.append(Item(title: machine, kind: .info))

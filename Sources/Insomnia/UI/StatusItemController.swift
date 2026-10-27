@@ -43,7 +43,7 @@ final class StatusItemController: NSObject {
     private var keyCatcher: KeyCatcherPanel?
     /// 1 Hz redraw of the projected countdown while a start is pending, so
     /// it does not sit frozen for the seconds the recovery agent and pmset
-    /// take and then jump on confirmation.
+    /// take and then jump on confirmation. The end time has nothing to tick.
     private var pendingTick: Timer?
     var pendingTickArmed: Bool { pendingTick != nil }
     /// Invalidates in-flight stagger steps when expand/collapse interleave.
@@ -85,6 +85,7 @@ final class StatusItemController: NSObject {
         super.init()
         installHostingView()
         observeManager()
+        observeCountdownStyle()
     }
 
     // MARK: Status item
@@ -223,6 +224,29 @@ final class StatusItemController: NSObject {
                 self.observeManager()
             }
         }
+    }
+
+    /// Settings can change the countdown style while a start or an extension
+    /// is pending; the projected text and its tick follow it at once.
+    private func observeCountdownStyle() {
+        withObservationTracking {
+            _ = manager.config.countdownStyle
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.restylePendingCountdown()
+                self.observeCountdownStyle()
+            }
+        }
+    }
+
+    private func restylePendingCountdown() {
+        let style = manager.config.countdownStyle
+        guard let projection = model.pendingProjection, projection.style != style else { return }
+        let restyled = MenuBarModel.StartProjection(endsAt: projection.endsAt, shape: projection.shape, style: style)
+        model.pendingProjection = restyled
+        model.pendingCountdown = restyled.countdown(at: clock())
+        syncPendingTick()
     }
 
     private func managerChanged() {
@@ -503,15 +527,25 @@ final class StatusItemController: NSObject {
             // session so the countdown already has the final shape while the
             // manager catches up (pmset takes a moment).
             let projected = SessionMath.extended(s, by: duration, now: now, maxDuration: manager.config.maxDuration)
-            model.pendingProjection = nil
-            model.pendingCountdown = SessionMath.formatCountdown(remaining: projected.remaining(at: now), shape: projected.countdownShape)
+            let projection = MenuBarModel.StartProjection(
+                endsAt: projected.endsAt,
+                shape: projected.countdownShape,
+                style: manager.config.countdownStyle
+            )
+            model.pendingProjection = projection
+            model.pendingCountdown = projection.countdown(at: now)
         } else {
             // No session yet: the manager has to arm the recovery agent and
             // disable sleep first, and either can take seconds or refuse. Show
             // the countdown the session will read the moment it is confirmed,
             // ticking meanwhile; the phase stays pending, so nothing that acts
             // on a session (the end ring) is drawn until then.
-            let projection = MenuBarModel.projectedStart(now: now, duration: duration, maxDuration: manager.config.maxDuration)
+            let projection = MenuBarModel.projectedStart(
+                now: now,
+                duration: duration,
+                maxDuration: manager.config.maxDuration,
+                style: manager.config.countdownStyle
+            )
             model.pendingProjection = projection
             model.pendingCountdown = projection.countdown(at: now)
         }
@@ -521,7 +555,7 @@ final class StatusItemController: NSObject {
         // leave in one relayout and the countdown scales in. Enter during
         // the open stagger folds whatever is up.
         model.phase = mode == .extend && manager.isActive ? .running : .starting
-        if model.phase == .starting { armPendingTick() } else { stopPendingTick() }
+        syncPendingTick()
         withAnimation(Motion.base(reduceMotion: reduceMotion)) {
             model.focusVisible = false
         }
@@ -582,9 +616,10 @@ final class StatusItemController: NSObject {
 
     /// 1 Hz redraw of the projected countdown, aligned to whole wall-clock
     /// seconds like the manager's live one. Runs only while the phase is
-    /// `.starting`; stopped on confirmation, refusal or reopening. The timer
-    /// runs on the real run loop, so it is scheduled from `Date()`; the text
-    /// it draws reads `clock`.
+    /// `.starting` and the countdown shows the time left; stopped on
+    /// confirmation, refusal or reopening. The timer runs on the real run
+    /// loop, so it is scheduled from `Date()`; the text it draws reads
+    /// `clock`.
     private func armPendingTick() {
         stopPendingTick()
         let first = SessionMath.nextSecondBoundary(after: Date())
@@ -599,6 +634,10 @@ final class StatusItemController: NSObject {
     private func stopPendingTick() {
         pendingTick?.invalidate()
         pendingTick = nil
+    }
+
+    private func syncPendingTick() {
+        if model.phase == .starting, manager.config.countdownStyle == .remaining { armPendingTick() } else { stopPendingTick() }
     }
 
     private func refreshPendingCountdown() {
@@ -648,6 +687,9 @@ final class StatusItemController: NSObject {
         // Same for the foreign-sleep line: re-read the bit now, and let the
         // next opening drop the line if sleep is enabled again.
         Task { await manager.recheckForeignSleep() }
+        // The "Time left" line reads a text that nothing ticks while the bar
+        // shows the end time.
+        manager.refreshCountdown()
         let menu = StatusMenu.menu(
             Self.menuItems(manager: manager, status: status),
             target: self,
@@ -688,7 +730,9 @@ final class StatusItemController: NSObject {
             commandRunning: manager.commandWarning,
             foreignSleep: manager.foreignSleepWarning,
             outputsWaiting: manager.outputsWaitingForRestore,
-            lidSimulationBuild: LidSimulationBuild.isCompiledIn
+            lidSimulationBuild: LidSimulationBuild.isCompiledIn,
+            // The bar shows the time left itself unless it shows the end time.
+            remaining: manager.config.countdownStyle == .endTime ? manager.remainingText : nil
         )
     }
 

@@ -136,6 +136,13 @@ struct SettingsView: View {
                 }
             }
             .help("The pill that is focused when the pills open")
+            Picker("Countdown", selection: bind(\.countdownStyle)) {
+                Text("Time left").tag(CountdownStyle.remaining)
+                Text("End time").tag(CountdownStyle.endTime)
+            }
+            .help("What the menu bar shows during a session")
+            // Apply it now if a session is running.
+            .onChange(of: manager.config.countdownStyle) { manager.countdownStyleChanged() }
             LabeledContent("Maximum session") {
                 Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
             }
