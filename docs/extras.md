@@ -54,7 +54,11 @@ tmux set-option -p -t <session:window.pane> @insomnia-nudge on
 ```
 
 Mark a dedicated, disposable agent pane, not one you type in, because pending
-text is opaque to Insomnia. Enter is off by default, so the word is typed and
+text is opaque to Insomnia. A marked pane whose agent has exited and left a
+shell prompt is skipped, because the keys would go to the shell. tmux also
+shows the shell while a shell runs the agent without `exec`, as in
+`tmux new 'agent; exec zsh'` or a launcher script, so such a pane is skipped
+too. Start the agent from an interactive shell or as the pane's command. Enter is off by default, so the word is typed and
 nothing submits it. Turn on "Press Enter after continue" in Settings to submit
 it, knowing that Enter also submits anything already typed in that pane. The
 option must be on the pane itself (`-p`). One set on the session or window
