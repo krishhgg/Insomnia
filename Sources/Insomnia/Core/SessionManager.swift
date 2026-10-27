@@ -469,6 +469,11 @@ final class SessionManager {
     /// across sessions: it is the displays' state, not the session's. The
     /// status item watches it to stop its own tick for a pending start.
     private(set) var displaysAsleep = false
+    /// Why the last session ended: the reason of the end that found it
+    /// running. An end that found none (one queued behind the timer's,
+    /// say) leaves it alone. The status item plays its end sound only
+    /// when this is `.user`.
+    @ObservationIgnored private(set) var lastEndReason: EndReason?
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -1447,6 +1452,7 @@ final class SessionManager {
         endsRunning += 1
         defer { endsRunning -= 1 }
         let had = session != nil
+        if had { lastEndReason = reason }
         Log.info("session end (\(reason.rawValue))")
         stopTimers()
         countdownPaused = false

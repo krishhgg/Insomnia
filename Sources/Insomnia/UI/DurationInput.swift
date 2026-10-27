@@ -128,9 +128,12 @@ struct DurationInput: Equatable, Sendable {
 
     /// Fill the fields from a preset. Seconds are floored to the minute; fields
     /// that would be zero stay empty so the fields read like the chip did
-    /// ("2h" fills only Hours). Values beyond 30 days are clamped.
+    /// ("2h" fills only Hours). Values beyond 30 days are clamped, and so
+    /// is everything else before the Int conversion, which traps on NaN
+    /// or on a value a hand-edited config can hold, such as 1e300.
     static func from(seconds: TimeInterval) -> DurationInput {
-        let totalMinutes = min(max(Int(seconds / 60), 0), maxDays * 24 * 60)
+        let bounded = seconds.isNaN ? 0 : min(max(seconds, 0), TimeInterval(maxDays * 86_400))
+        let totalMinutes = Int(bounded / 60)
         let d = totalMinutes / (24 * 60)
         let h = (totalMinutes % (24 * 60)) / 60
         let m = totalMinutes % 60

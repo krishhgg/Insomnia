@@ -179,6 +179,21 @@ final class SettingsTests: XCTestCase {
         }
     }
 
+    /// The one-click switch's line says what a click does with it on and
+    /// off in each style, and that Minimal, where it is greyed out, ignores
+    /// it.
+    func testTheOneClickLineSaysWhatAClickDoesInEachStyle() {
+        let lines = Config.MenuBarMode.allCases.map(SettingsView.oneClickDescription)
+        XCTAssertEqual(Set(lines).count, lines.count)
+        for style in [Config.MenuBarMode.pills, .compact, .popover] {
+            let line = SettingsView.oneClickDescription(style)
+            XCTAssertTrue(line.hasPrefix("On: "), line)
+            XCTAssertTrue(line.contains("Option-click"), line)
+            XCTAssertTrue(line.contains(" Off: "), line)
+        }
+        XCTAssertTrue(SettingsView.oneClickDescription(.minimal).contains("does nothing in Minimal"))
+    }
+
     /// The titles of the Settings window's menus, top to bottom. On macOS 27
     /// SwiftUI draws a form's pickers itself, with no NSPopUpButton and no
     /// Accessibility element to read in the test process, so the tests that

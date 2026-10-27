@@ -5,8 +5,9 @@ import Foundation
 /// same pid after a reboot, cannot match all three.
 ///
 /// backstop.sh can only read whole seconds from `ps -o lstart`, so for an
-/// entry that records `startedAtMicros` it asks the installed app binary
-/// (`Insomnia --resume-frozen`, see `ResumeFrozenCommand`) to compare all
+/// entry that records `startedAtMicros` it asks the app binary in its own
+/// bundle, or the installed app's for a checkout's copy of the script
+/// (`Insomnia --resume-frozen`, see `ResumeFrozenCommand`), to compare all
 /// three and signal; the shell never signals such an entry itself. Only an
 /// entry written without microseconds (an older build) is compared by the
 /// shell on `startedAt` and `bootSession`, a one-second identity.

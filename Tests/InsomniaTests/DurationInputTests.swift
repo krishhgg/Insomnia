@@ -55,6 +55,28 @@ final class DurationInputTests: XCTestCase {
         XCTAssertEqual(DurationInput.from(seconds: 45 * 86_400), DurationInput(days: 30))
     }
 
+    // A hand-edited config can hold any Double, and the Int conversion
+    // traps on one out of its range. Each runs in a child process, so a
+    // trap fails that test rather than the whole run.
+
+    func testFromSecondsClampsAValueTooLargeForAnInt() async throws {
+        try await TrapProbe.run(name) {
+            XCTAssertEqual(DurationInput.from(seconds: 1e300), DurationInput(days: 30))
+        }
+    }
+
+    func testFromSecondsClampsANegativeValueTooLargeForAnInt() async throws {
+        try await TrapProbe.run(name) {
+            XCTAssertEqual(DurationInput.from(seconds: -1e300), DurationInput())
+        }
+    }
+
+    func testFromSecondsReadsNaNAsEmpty() async throws {
+        try await TrapProbe.run(name) {
+            XCTAssertEqual(DurationInput.from(seconds: .nan), DurationInput())
+        }
+    }
+
     func testPresetRoundTrips() {
         for p in Config.defaultPresets {
             XCTAssertEqual(DurationInput.from(seconds: p).total, p, "preset \(p)")

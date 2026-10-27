@@ -26,6 +26,9 @@ struct StatusRootView: View {
     var buttonIsDown: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
     /// Where the pointer is; a test replaces it.
     var pointerLocation: () -> CGPoint = { NSEvent.mouseLocation }
+    /// VoiceOver's press on the eye in Pills and Compact, which has no
+    /// mouse click. Nil sends it to `onTapIcon`.
+    var onActivateIcon: (() -> Void)? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotionEnv
 
@@ -246,6 +249,7 @@ struct StatusRootView: View {
                 Motion.snappy(reduceMotion: reduceMotion)
             }
             .onTapGesture(perform: onTapIcon)
+            .accessibilityAction { (onActivateIcon ?? onTapIcon)() }
             .accessibilityLabel("Insomnia")
             .accessibilityAddTraits(.isButton)
             .accessibilityValue(eyeAccessibilityValue)

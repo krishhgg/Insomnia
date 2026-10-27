@@ -36,6 +36,10 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     /// app delegate, which outlives any one status item.
     private let showSettings: () -> Void
     private let makeWidthWriter: WidthWriterFactory?
+    private let playSessionSound: @MainActor (SessionSoundCue) -> Void
+    /// Reads the lid from the registry before a sound plays (`playCue`):
+    /// true is closed, nil is no lid. Tests pass their own.
+    private let readLid: @MainActor () -> Bool?
     /// Asks before a browser is quit for a relaunch; true means go ahead.
     /// Injected so tests never see the NSAlert.
     private let confirmRelaunch: @MainActor (String) -> Bool
@@ -79,6 +83,10 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     /// How the popover moves focus between apps. Tests pass a recorder, so
     /// a run neither reads nor changes the app in front on the Mac.
     private let appFocus: CompactDropdownController.AppFocus
+    /// The modifier keys held now, read beside a click's own flags
+    /// (`popoverClicked`, `eyeTapped`, and the status view's press). Tests
+    /// pass their own, so a run never reads the Mac's keyboard.
+    private let heldModifiers: @MainActor () -> NSEvent.ModifierFlags
     /// The app the user was in when the popover opened, to give focus back
     /// to when it closes; nil when that was Insomnia itself.
     private(set) var popoverReturnApp: NSRunningApplication?
@@ -174,16 +182,22 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         confirmRelaunch: (@MainActor (String) -> Bool)? = nil,
         clock: @escaping @Sendable () -> Date = { Date() },
         secrets: (any HotspotSecretStore)? = nil,
-        appFocus: CompactDropdownController.AppFocus = CompactDropdownController.AppFocus()
+        appFocus: CompactDropdownController.AppFocus = CompactDropdownController.AppFocus(),
+        heldModifiers: @escaping @MainActor () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags },
+        readLid: @escaping @MainActor () -> Bool? = { LidObserver.readClamshellState() },
+        playSessionSound: @escaping @MainActor (SessionSoundCue) -> Void = { _ in }
     ) {
         self.manager = manager
         self.secrets = secrets
         self.appFocus = appFocus
+        self.heldModifiers = heldModifiers
         self.status = status
         self.showSettings = showSettings
         self.makeWidthWriter = makeWidthWriter
         self.confirmRelaunch = confirmRelaunch ?? Self.askBeforeRelaunch
         self.clock = clock
+        self.playSessionSound = playSessionSound
+        self.readLid = readLid
         Self.seedPreferredPositionIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.autosaveName = Self.autosaveName
@@ -387,13 +401,18 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         guard manager.config.menuBarMode == .minimal,
               !model.minimalBusy, !compactModel.isBusy, !sessionEndPending, model.phase != .starting else { return }
         let duration = manager.config.defaultPreset
-        // The session manager records the requested seconds as an Int.
-        // Settings cannot produce this value, but a hand-edited config can.
-        guard duration.isFinite, duration > 0, duration < Double(Int.max) else { return }
+        guard Self.canRequest(duration) else { return }
         keepForRetry(duration)
         model.startError = nil
         compactModel.error = nil
         run(mode: manager.isActive ? .extend : .start, duration: duration)
+    }
+
+    /// The session manager records the requested seconds as an Int.
+    /// Settings cannot produce a length this fails, but a hand-edited
+    /// config can. Every start a click makes without typing checks it.
+    static func canRequest(_ duration: TimeInterval) -> Bool {
+        duration.isFinite && duration > 0 && duration < Double(Int.max)
     }
 
     /// A request not typed into the pills (a Minimal click, a popover chip)
@@ -433,7 +452,9 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         stopPendingTick()
         sessionRequest = Task { @MainActor [weak self] in
             guard let self else { return }
-            await manager.end(reason: .user)
+            let wasActive = manager.isActive
+            let outcome = await manager.end(reason: .user)
+            playEndCue(wasActive: wasActive, outcome: outcome)
             model.pendingCountdown = nil
             model.pendingProjection = nil
             model.phase = Self.collapseTarget(sessionActive: manager.isActive)
@@ -534,14 +555,16 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         let root = StatusRootView(
             model: model,
             manager: manager,
-            onTapIcon: { [weak self] in self?.iconTapped() },
+            onTapIcon: { [weak self] in self?.eyeTapped() },
             onTapPill: { [weak self] field in self?.focus(field) },
             onTapCountdown: { [weak self] in self?.customExtend() },
             onHoldEnd: { [weak self] in self?.holdToEnd() },
-            onWidthChange: { [weak self] w in self?.widthChanged(w) }
+            onWidthChange: { [weak self] w in self?.widthChanged(w) },
+            onActivateIcon: { [weak self] in self?.eyeActivated() }
         )
         let host = Self.makeHostingView(root)
         host.onRightMouseDown = { [weak self] event in self?.showMenu(event: event) }
+        host.heldModifiers = heldModifiers
         host.translatesAutoresizingMaskIntoConstraints = true
         // The height follows the button; the width is set from the layout
         // (`retargetWidth`) and never from the button, whose width is the
@@ -641,6 +664,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     /// button has no action.
     private func routeClicks(toButton: Bool) {
         hostingView?.passesClicksThrough = toButton
+        // The new style's first click is its own.
+        hostingView?.forgetClick()
         guard let button else { return }
         button.target = toButton ? self : nil
         button.action = toButton ? #selector(buttonClicked) : nil
@@ -763,17 +788,33 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
 
     // MARK: Clicks
 
-    func iconTapped() {
+    /// The eye's tap in Pills, Compact and Minimal. SwiftUI calls it on the
+    /// release, and the keys held by then can already be up: a person lets
+    /// go of Option as they let go of the button. The click's keys are the
+    /// press's and the release's flags, which the host kept, with the keys
+    /// held now.
+    private func eyeTapped() {
+        let click = hostingView?.takeClickModifiers() ?? []
+        iconTapped(modifiers: click.union(heldModifiers()))
+    }
+
+    /// VoiceOver's press on the eye in Pills and Compact. No mouse click
+    /// made it, so it reads only the keys held now, never the keys the host
+    /// kept from a click that made no tap (a hold, or a click on a pill or
+    /// the countdown).
+    private func eyeActivated() {
+        iconTapped(modifiers: heldModifiers())
+    }
+
+    /// `modifiers` are the keys held for the click: Option keeps a
+    /// one-click start from taking it.
+    func iconTapped(modifiers: NSEvent.ModifierFlags = NSEvent.modifierFlags) {
         if manager.config.compactMode {
-            guard let button else { return }
-            let dropdown = makeCompactDropdown()
-            if dropdown.isShown {
+            guard button != nil else { return }
+            if makeCompactDropdown().isShown {
                 closeCompactDropdown()
-            } else {
-                compactModel.focusDefaultFieldIfUntouched(manager.config.defaultFocusField)
-                compactModel.setPresented(true)
-                dropdown.show(relativeTo: button)
-                button.highlight(dropdown.isShown)
+            } else if !(clickStartsASession(modifiers) && startDefaultLength()) {
+                showCompactDropdown()
             }
             return
         }
@@ -784,7 +825,11 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         model.iconBounce += 1
         switch model.phase {
         case .idle:
-            expand(mode: .start)
+            // A default length no session can hold opens the pills, so
+            // another length can be typed.
+            if !(clickStartsASession(modifiers) && startDefaultLength()) {
+                expand(mode: .start)
+            }
         case let .entering(mode):
             if model.pillsCollapsing {
                 // A close is in flight (Esc, a click away): the phase is
@@ -805,10 +850,83 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         }
     }
 
+    /// Whether a click starts the default length (Settings, "Start a
+    /// session with one click"). Only with the switch on, outside Minimal
+    /// (whose click always adds the default length), without Option, and
+    /// with no session running, starting or ending. Any other click does
+    /// what it does with the switch off; none of them ends a session.
+    private func clickStartsASession(_ modifiers: NSEvent.ModifierFlags) -> Bool {
+        manager.config.oneClickStart && manager.config.menuBarMode != .minimal
+            && !modifiers.contains(.option)
+            && !manager.isActive && model.phase == .idle
+            && !sessionEndPending && !model.endUnderway(manager) && !compactModel.isBusy
+    }
+
+    /// One click starts the default length. Like a Minimal click, it asks
+    /// only for a length the manager can record, and keeps that length for
+    /// a retry: a refused 30 days and 1 minute is retried as that, not as
+    /// the 30 days the pills can show. False when nothing was asked for.
+    private func startDefaultLength() -> Bool {
+        let duration = manager.config.defaultPreset
+        guard Self.canRequest(duration) else { return false }
+        keepForRetry(duration)
+        // The pills open on a refusal with this length and keep the field
+        // focused (`reopenAfterFailure`). Typing goes to the field Settings
+        // names, as on any open, not to the one focused when they last
+        // closed. The popover's Custom row has its own focus.
+        model.focused = manager.config.defaultFocusField
+        if manager.config.compactMode {
+            // The panel keeps a draft across closes and opens on a refusal,
+            // where Return retries its entry: it holds this length and the
+            // default field, not an older draft and the draft's field. Set
+            // with the request, as `compactSubmit` leaves the entry; the
+            // panel takes no keys until the start answers.
+            compactModel.entry.input = model.input
+            compactModel.entry.keptRequest = model.keptRequest
+            compactModel.entry.focused = model.focused
+        }
+        model.startError = nil
+        compactModel.error = nil
+        run(mode: .start, duration: duration, showsRefusal: true)
+        return true
+    }
+
+    private func showCompactDropdown() {
+        guard let button else { return }
+        let dropdown = makeCompactDropdown()
+        guard !dropdown.isShown else { return }
+        compactModel.focusDefaultFieldIfUntouched(manager.config.defaultFocusField)
+        compactModel.setPresented(true)
+        dropdown.show(relativeTo: button)
+        button.highlight(dropdown.isShown)
+    }
+
     // MARK: Popover
 
     @objc private func buttonClicked() {
         guard manager.config.menuBarMode == .popover else { return }
+        popoverClicked(NSApp.currentEvent)
+    }
+
+    /// A plain left click on the closed popover's item starts the default
+    /// length when one-click start is on (`clickStartsASession`). A right
+    /// click, a Control-click, an Option-click and every other click flip
+    /// the popover, as they do with the switch off. The keys held are the
+    /// event's flags and the keys down now, which Pills and Compact read:
+    /// on macOS 27.0.1 the button's event for an Option-click carried no
+    /// Option, and the click started a session. A click whose keys are
+    /// lost (`StatusHostingView.keysAreLost`) counts as an Option-click.
+    func popoverClicked(_ event: NSEvent?) {
+        var held = (event?.modifierFlags ?? []).union(heldModifiers())
+        if let event, event.type == .leftMouseDown, hostingView?.keysAreLost(event) == true {
+            held.insert(.option)
+            Log.info("status item: a click handled late counts as an Option-click")
+        }
+        if !model.popoverShown, let event, event.type == .leftMouseDown,
+           !held.contains(.control),
+           clickStartsASession(held), startDefaultLength() {
+            return
+        }
         togglePopover()
     }
 
@@ -1519,8 +1637,11 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     }
 
     /// `fromPopoverFields`: the popover's Start or Return asked for what
-    /// its fields hold, not a chip.
-    private func run(mode: MenuBarModel.Mode, duration: TimeInterval, fromPopoverFields: Bool = false) {
+    /// its fields hold, not a chip. `showsRefusal` is for a start with
+    /// nothing open to say why it was refused (a one-click start): a
+    /// refusal opens the popover or the Compact panel, which then shows the
+    /// reason. Pills reopens the pills with it either way.
+    private func run(mode: MenuBarModel.Mode, duration: TimeInterval, fromPopoverFields: Bool = false, showsRefusal: Bool = false) {
         guard !sessionEndPending else { return }
         let submittedFromCompact = manager.config.compactMode
         let submittedFromPopover = manager.config.menuBarMode == .popover
@@ -1588,13 +1709,15 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
 
         sessionRequest = Task { @MainActor in
             guard generation == startGeneration else { return }
+            var started = false
             switch mode {
-            case .start: await manager.start(duration: duration)
+            case .start: started = await manager.tryStart(duration: duration)
             case .extend: await manager.extend(by: duration)
             }
             guard generation == startGeneration else { return }
             compactModel.isBusy = false
             model.minimalBusy = sessionEndPending
+            if started { playCue(.activated) }
             stopPendingTick()
             model.pendingCountdown = nil
             model.pendingProjection = nil
@@ -1605,7 +1728,12 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                 if model.phase == .starting {
                     model.phase = .running
                 }
-                if manager.lastError == nil {
+                // A one-click start that went through has spent the length
+                // `startDefaultLength` put in the panel's entry for a retry,
+                // also with a warning, which the panel reads from the
+                // manager. Kept, the entry opened as an extension by that
+                // length.
+                if manager.lastError == nil || (started && showsRefusal) {
                     compactModel.isEditing = false
                     compactModel.entry.input = DurationInput()
                     compactModel.entry.keptRequest = nil
@@ -1639,9 +1767,18 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                         model.texts = typed
                         model.customShown = true
                     }
+                    // A one-click start opens the popover to say why. A
+                    // closed popover's fields hold nothing it asked for: a
+                    // draft or a time refused before would come back beside
+                    // the reason, and Return would start that.
+                    if showsRefusal, !model.popoverShown {
+                        model.clearFields()
+                        openPopover()
+                    }
                 } else if manager.config.menuBarMode != .pills {
                     model.phase = .idle
                     compactModel.error = manager.lastError == nil ? MenuBarModel.startFailedText : nil
+                    if showsRefusal, manager.config.compactMode { showCompactDropdown() }
                 } else {
                     reopenAfterFailure(mode: .start)
                 }
@@ -1737,10 +1874,39 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         sessionEndPending = true
         model.minimalBusy = true
         sessionRequest = Task { @MainActor in
-            await manager.end(reason: .user)
+            let wasActive = manager.isActive
+            let outcome = await manager.end(reason: .user)
+            playEndCue(wasActive: wasActive, outcome: outcome)
             sessionEndPending = false
             model.minimalBusy = compactModel.isBusy
         }
+    }
+
+    // MARK: Sounds
+
+    /// The start and end sounds (Settings, "Play a sound when you start or
+    /// end a session"). Nothing plays with the switch off, and so nothing
+    /// is generated or loaded: the app's closure is the only thing that
+    /// touches `SessionSounds`. Nothing plays while the displays sleep or
+    /// the lid is closed either. With the switch on, this reads the lid
+    /// from the registry. `status.lidClosed` changes when the lid observer
+    /// reports a close, 2 s after it, and an end stops the observer, so a
+    /// start or an end in those 2 s on an external display would find it
+    /// open. With no lid to read, as on a desktop, `status.lidClosed`
+    /// decides.
+    private func playCue(_ cue: SessionSoundCue) {
+        guard manager.config.sessionSounds, !manager.displaysAsleep else { return }
+        guard !(readLid() ?? status.lidClosed) else { return }
+        playSessionSound(cue)
+    }
+
+    /// The end sound plays for an end the user asked for that found the
+    /// session running and restored everything. An end that waited behind
+    /// the timer's, a floor's or a quit's finds the session gone; that end
+    /// was theirs, so nothing plays.
+    private func playEndCue(wasActive: Bool, outcome: EndOutcome) {
+        guard wasActive, !manager.isActive, outcome == .restored, manager.lastEndReason == .user else { return }
+        playCue(.deactivated)
     }
 
     /// The status item's hold-to-end gesture completed. Minimal can cancel
@@ -2190,8 +2356,33 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
     var buttonIsDown: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
     /// The system's major version. A test replaces it.
     var osMajorVersion = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+    /// The modifier keys held right now. The controller passes its own.
+    var heldModifiers: @MainActor () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags }
+    /// How long after a press the keys held still count as its keys.
+    /// A person rarely lets go of Option within 50 ms of the press.
+    static let pressKeysWindow: TimeInterval = 0.05
     private var pointerMonitor: Any?
     private var releaseWatch: Timer?
+    /// The drags and release a menu gesture still takes: those of the
+    /// button of a right click's or a Control-click's press on this view,
+    /// until that button's release or the next press. Empty with none
+    /// underway.
+    private var menuGestureTakes: [NSEvent.EventType] = []
+    /// The modifier keys of a left click on this view, for the eye's tap.
+    /// The tap runs on the release, when the keys held now can be up
+    /// already (`StatusItemController.eyeTapped`). `pressKeys` are a left
+    /// press's flags and the keys held as it is handled, until its release
+    /// reaches the window, which adds its own flags and moves them to
+    /// `releasedKeys`. On macOS 27 a status item's press and release reach
+    /// the app with no flags at all (a 27.0.1 VM logged 0 on both with
+    /// Option held), so there the keys held at the press are all a click
+    /// has. The tap reads those once, and
+    /// the next press drops them, so a tap gets no keys of another click.
+    /// A right press keeps `pressKeys`: the left click is still underway,
+    /// and its release can still come. A Control-click, a style change and
+    /// a move to another window drop both.
+    private var pressKeys: NSEvent.ModifierFlags?
+    private var releasedKeys: NSEvent.ModifierFlags?
 
     /// On macOS 27 a click on a status item reaches the app with its location
     /// at the middle of the item's window, wherever the pointer was (every
@@ -2202,38 +2393,178 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
     /// the one passed to `mouseDown`, so the event has to be replaced before
     /// dispatch: a local monitor may return a different event. Only an event
     /// at the window's middle is replaced; any other passes through as it came.
-    /// The monitor exists on macOS 27 and later only: earlier systems report a
-    /// click where it happened, even one at the middle.
+    /// Only macOS 27 and later get this: earlier systems report a click where
+    /// it happened, even one at the middle.
     ///
     /// The release has the same problem: the system sends the mouse-up at
     /// once, while the button is still down, so a press-and-hold never lasts.
     /// That release is held back, and sent when the button really comes up,
     /// with the pointer's movement in between sent as drags.
+    ///
+    /// The same monitor takes a right click and a Control-click on every
+    /// version (see `takesMenuGesture`), and keeps each click's keys for
+    /// the eye's tap (`notePress`, `noteRelease`).
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         stopWatchingRelease()
+        menuGestureTakes = []
+        forgetClick()
         if let monitor = pointerMonitor { NSEvent.removeMonitor(monitor) }
         pointerMonitor = nil
-        // Only macOS 27 relays the click: on macOS 26 every event is already
-        // where it happened, and the pointer may have moved since it was queued.
-        guard window != nil, osMajorVersion >= 27 else { return }
-        pointerMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+        guard window != nil else { return }
+        let events: NSEvent.EventTypeMask = [
+            .leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .rightMouseDragged, .rightMouseUp,
+        ]
+        pointerMonitor = NSEvent.addLocalMonitorForEvents(matching: events) { [weak self] event in
             // Local monitors always run on the main thread; `NSEvent` is not
             // Sendable, so it crosses `assumeIsolated` in a box.
             let incoming = EventBox(event)
             return MainActor.assumeIsolated {
-                // nil is a release held back, so it must not fall back to the original.
+                // nil is an event taken out of dispatch, so it must not fall back to the original.
                 guard let self else { return incoming }
-                return EventBox(self.route(incoming.event!))
+                let event = incoming.event!
+                self.notePress(event)
+                if self.takesMenuGesture(event) { return EventBox(nil) }
+                // Only macOS 27 relays the click: on macOS 26 every event is already
+                // where it happened, and the pointer may have moved since it was queued.
+                let handed = self.osMajorVersion >= 27 ? self.route(event) : event
+                if let handed { self.noteRelease(handed) }
+                return EventBox(handed)
             }.event
         }
+    }
+
+    /// A right click or a Control-click opens the menu, and none of it may
+    /// reach SwiftUI. SwiftUI takes a press from the window before
+    /// `mouseDown` runs, so with only `mouseDown` sending a Control-click
+    /// to the menu, the eye's tap still fired on the release. On macOS 27
+    /// the tap also fired for a right press and release sent with
+    /// `NSApp.sendEvent` (MenuClickEventTests, on hosted CI and in a 27.0.1
+    /// VM), so the right button is taken the same way. The press opens the
+    /// menu here, before dispatch, with the event as it came, and its
+    /// button's drags and release go nowhere. Taken out of dispatch, the
+    /// press never reaches `mouseDown` or `rightMouseDown`, which open the
+    /// menu only for a press that skipped this monitor. The menu's own
+    /// tracking usually takes the release; then the next press ends the
+    /// gesture, so it never takes a later click. A right click leaves the
+    /// left button alone: on macOS 27 a left release held back for the
+    /// hold (`watchRelease`) still goes out when that button comes up,
+    /// with the menu open. A press Minimal's eye is tracking ends here
+    /// (`cancelMinimalPress`). Popover style takes nothing here: its
+    /// clicks, the right click too, go to the status bar button. Ported
+    /// from b180afad (#63), which took the whole menu gesture the same way.
+    private func takesMenuGesture(_ event: NSEvent) -> Bool {
+        let isPress = event.type == .leftMouseDown || event.type == .rightMouseDown
+        if isPress {
+            menuGestureTakes = []
+        } else if menuGestureTakes.contains(event.type) {
+            if event.type == .leftMouseUp || event.type == .rightMouseUp { menuGestureTakes = [] }
+            return true
+        }
+        guard isPress, event.type == .rightMouseDown || event.modifierFlags.contains(.control),
+              isOnThisView(event) else { return false }
+        if event.type == .leftMouseDown {
+            stopWatchingRelease()
+            menuGestureTakes = [.leftMouseDragged, .leftMouseUp]
+            // The Control-click is the menu's, and no tap answers it.
+            pressKeys = nil
+        } else {
+            menuGestureTakes = [.rightMouseDragged, .rightMouseUp]
+        }
+        cancelMinimalPress()
+        onRightMouseDown?(event)
+        return true
+    }
+
+    /// Ends the press Minimal's eye is tracking (`MinimalIconMouseView`),
+    /// so neither its hold nor its release acts once the menu has the
+    /// click. The view ended it itself when a right press reached its
+    /// `rightMouseDown`, which this monitor now takes first. The release
+    /// macOS 27 holds back still goes out when the button comes up, and
+    /// finds no press to act on.
+    private func cancelMinimalPress() {
+        var views = subviews
+        while let view = views.popLast() {
+            if let press = view as? MinimalIconMouseView { press.stopTracking() }
+            views.append(contentsOf: view.subviews)
+        }
+    }
+
+    /// Whether a press lands on this view, which takes it.
+    private func isOnThisView(_ event: NSEvent) -> Bool {
+        guard !passesClicksThrough, let window, event.window === window else { return false }
+        return bounds.contains(convert(event.locationInWindow, from: nil))
+    }
+
+    /// A press drops the keys of the click released before it. A left
+    /// press on this view keeps its own and the keys held as it is handled
+    /// (`pressKeys`); one anywhere else keeps none. On macOS 27 the press
+    /// comes in as the button goes down, its release with it: the release
+    /// waits for the button to come up (`route`), and Option can be up by
+    /// then. A press whose keys are lost (`keysAreLost`) counts as an
+    /// Option-click: it opens the controls and starts nothing.
+    private func notePress(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            releasedKeys = nil
+            guard isOnThisView(event) else {
+                pressKeys = nil
+                return
+            }
+            var keys = event.modifierFlags.union(heldModifiers())
+            if keysAreLost(event) {
+                keys.insert(.option)
+                Log.info("status item: a click handled late counts as an Option-click")
+            }
+            pressKeys = keys
+        case .rightMouseDown:
+            releasedKeys = nil
+        default:
+            break
+        }
+    }
+
+    /// A left release on its way to the window ends its press's click.
+    /// On this view it keeps the keys for the tap (`releasedKeys`); off
+    /// it, dragged away, no tap can come, and it keeps none. A release
+    /// macOS 27 holds back (`route`) counts when it is sent again, with
+    /// the button really up.
+    private func noteRelease(_ event: NSEvent) {
+        guard event.type == .leftMouseUp, let keys = pressKeys else { return }
+        pressKeys = nil
+        releasedKeys = isOnThisView(event) ? keys.union(event.modifierFlags) : nil
+    }
+
+    /// Whether the keys of `press` are lost. On macOS 27 a press carries
+    /// no keys, so the keys held as it is handled are all it has. Handled
+    /// late, after a stall, they are the keys of a later moment, and
+    /// Option and the button can be up by then. Earlier systems put the
+    /// keys in the event.
+    func keysAreLost(_ press: NSEvent) -> Bool {
+        osMajorVersion >= 27
+            && ProcessInfo.processInfo.systemUptime - press.timestamp > Self.pressKeysWindow
+    }
+
+    /// The keys of the click released last, read once by the eye's tap.
+    /// None once another press has come: the tap answers no other click.
+    func takeClickModifiers() -> NSEvent.ModifierFlags {
+        defer { releasedKeys = nil }
+        return releasedKeys ?? []
+    }
+
+    func forgetClick() {
+        pressKeys = nil
+        releasedKeys = nil
     }
 
     /// What the monitor hands on for `event`: nil holds a release back.
     /// Popover style needs neither change: its click goes to the button,
     /// which acts on the mouse-down wherever it lands, and has no hold.
+    /// Only the left button is moved: a right press on this view went to
+    /// the menu, and any other right event passes as it came.
     private func route(_ event: NSEvent) -> NSEvent? {
-        guard !passesClicksThrough, let window, event.window === window else { return event }
+        guard !passesClicksThrough, let window, event.window === window,
+              [.leftMouseDown, .leftMouseDragged, .leftMouseUp].contains(event.type) else { return event }
         switch event.type {
         case .leftMouseDown:
             stopWatchingRelease()
@@ -2309,6 +2640,7 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        releasedKeys = nil
         onRightMouseDown?(event)
     }
 }

@@ -104,6 +104,8 @@ recovery; newly written journals use `frozenProcesses`.
   the session ends at instead (Settings, section 10), and no timer runs.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
+  With "Start a session with one click" on, a click with no session starts
+  the default preset instead (sections 10 and 11).
 - "Show the countdown in the menu bar" (`showMenuBarCountdown`, default on,
   also for a config.json without the key). Off: the status item is the eye
   alone, open while a session runs and closed otherwise, with no countdown
@@ -1061,7 +1063,7 @@ Backstop, independent of the app:
   has replaced it.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. The entries that record `startedAtMicros` go to
-  the installed app binary in one call (`Insomnia --resume-frozen
+  the app binary in one call (`Insomnia --resume-frozen
   <seconds>`, with one line `<pid> <startedAt> <startedAtMicros>
   <bootSession>` per entry on standard input, which has no size limit,
   answered before AppKit starts),
@@ -1070,7 +1072,12 @@ Backstop, independent of the app:
   input order, `<pid> <word>`, and exits 0 when every word is `resumed` or
   `gone`, 1 otherwise. A missing or malformed `<seconds>` (1 to 300), any
   further argument, empty input or a malformed line is a usage error (exit
-  64) that checks nothing. The script runs the binary only when the bundle's
+  64) that checks nothing. When the script runs from
+  `<name>.app/Contents/Resources`, the binary is the one in that bundle,
+  which the LaunchAgent, install.sh and uninstall.sh each verify before
+  they run the script. That holds after the user moves the bundle out of
+  ~/Applications. A checkout's copy uses the installed app in
+  ~/Applications. The script runs the binary only when the bundle's
   `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
   the script speaks, because an older build would start the menu bar app
   instead; otherwise it keeps those entries. It runs it with the same
@@ -1152,6 +1159,21 @@ older build is tightened when the app reads it:
 - menu bar style (`menuBarMode`): Pills, Compact, Minimal or Popover
   (section 11). The countdown switch applies to Pills and Popover; Compact
   and Minimal never show a countdown in the bar.
+- start a session with one click (`oneClickStart`), default off, also for
+  a config.json without the key. The row sits right under the Menu bar
+  picker, with one line on what a click does with the switch on and off in
+  the chosen style. With Minimal chosen the row is greyed out and its line
+  says the switch does nothing there (section 11, One-click start).
+- play a sound when you start or end a session (`sessionSounds`), default
+  off, also for a config.json without the key. Off, Insomnia generates,
+  loads and plays nothing. On, a start or an end asked for in the menu bar
+  plays a short tone, made in memory with no sound file. Nothing plays for
+  an end the user did not ask for (the timer, the backstop, Quit, a battery
+  or thermal floor, crash recovery at launch), for an end request that
+  found the session already ended another way, for `--session` commands,
+  while every display sleeps or while the lid is closed. The lid is read
+  when the tone would play, so a start or an end in the 2 s after a close,
+  before the lid observer reports it, plays nothing either.
 - freeze list (bundle ids), freeze every other app on/off (default off),
   Docker rule on/off, mute on lid close on/off (default on). Under the mute
   toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
@@ -1258,6 +1280,50 @@ position. Switching modes changes the content and click behavior without hiding,
 removing, or reinserting the item. This keeps the same identity for macOS and
 menu-bar managers such as Thaw; a separately inserted Compact item is no longer
 needed.
+
+**One-click start.** A switch under the Menu bar picker, "Start a session
+with one click" (`oneClickStart`), off by default. Off, every style works
+as this section describes. On, in Pills, Compact and Popover, a plain left
+click on the eye starts the default preset when no session runs, no start
+is pending and no end is restoring. The start takes the same path as a
+typed one and asks for the default preset. Every other click does what it
+does with the switch off:
+
+- Option-click opens the pills, the panel or the popover, so any length is
+  still one click away. In Popover a right-click or a Control-click opens
+  the popover too. On macOS 27 a click carries no keys, so the keys held
+  as the app handles it count; a click the app handles more than 50 ms
+  late, after a stall, counts as an Option-click, since Option can be up
+  by then.
+- A click during a session opens the extension (Pills), the panel
+  (Compact) or the popover. A click never ends a session.
+- A click while a start is pending or an end is restoring asks for nothing
+  more.
+- A default preset that no session can hold (not finite, not above zero,
+  or too large for an Int, as a hand-edited config.json can say) is never
+  asked for. The click opens the controls as with the switch off.
+
+A refused start shows its reason without another click, the way each
+style shows a refused typed start: the pills reopen with the error and
+the default length in the fields, Compact opens its panel with the error
+and the default length in its entry, and Popover opens the popover with
+the reason under the time buttons. Its fields are empty: a time left in
+them from an earlier opening does not come back, though a popover opened
+during the start keeps what was typed in it. In Pills and Compact, Return
+retries the same length, to the second, also after a time was typed there
+earlier; in Pills another click on the eye does too. Typing there goes to
+the default field from Settings, not to the field focused when the pills
+or the panel last closed. In Popover, Start
+and Return stay off until a time is typed, and a chip retries. A one-click
+start that goes through with a warning (an agent app's App Nap setting
+that could not be written, say) has spent its length: Compact shows the
+running session with the warning, and a click on its countdown opens
+empty fields. Minimal ignores
+the switch, because a click there already adds the default length, and
+Settings greys the row out. In Pills, Compact and Minimal a Control-click
+opens the right-click menu and never reaches the eye's click. The status
+view's event monitor takes the press, its drags and its release before
+SwiftUI sees them.
 
 **Compact mode.** Only the eye remains in the menu bar in every session state.
 Clicking it opens an arrowless native NSPanel with
