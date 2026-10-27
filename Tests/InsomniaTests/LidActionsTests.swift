@@ -1721,6 +1721,37 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs ?? [], [])
     }
 
+    /// A monitor's speakers over HDMI can mute but have no volume (issue
+    /// #103): lid close mutes them without a saved volume, and lid open
+    /// unmutes them.
+    func testAnOutputWithoutVolumeIsStillMutedAndRestored() async throws {
+        let (m, actions) = await make()
+        h.audio.connect("LG-HDMI", name: "LG UltraGear", volume: nil)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(h.audio.device("LG-HDMI")?.muted, true)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs.map(\.withoutSaveID),
+                       [SavedAudioOutput(deviceUID: "LG-HDMI", name: "LG UltraGear", volume: nil, muted: false, saveID: nil)])
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.audio.device("LG-HDMI")?.muted, false)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+        XCTAssertNil(m.lastError)
+    }
+
+    /// An output with neither control is skipped, with nothing journaled.
+    func testAnOutputWithoutVolumeOrMuteIsSkipped() async throws {
+        let (m, actions) = await make()
+        h.audio.connect("LG-HDMI", name: "LG UltraGear", volume: nil, muted: nil)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        XCTAssertEqual(h.audio.mutes, 0)
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs ?? [], [])
+        XCTAssertNil(m.lastError)
+        XCTAssertEqual(h.procs.suspended.count, 2, "the other lid actions still run")
+    }
+
     func testMuteOffLeavesAudioAlone() async throws {
         let (m, actions) = await make(mute: false)
         await m.start(duration: 3600)

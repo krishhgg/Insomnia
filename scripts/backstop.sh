@@ -767,7 +767,7 @@ journal_shape_problems() { # file
         else
           [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
           t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
-          [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          [[ -z "$t" || "$t" == "(any)" || "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
           [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
           t="$(type_of "$f" "savedAudioOutputs.$i.name")"
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"

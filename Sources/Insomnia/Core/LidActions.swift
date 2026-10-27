@@ -334,6 +334,10 @@ final class LidActions {
     private func muteSavingCurrent(_ manager: SessionManager) {
         do {
             let current = try audio.read()
+            guard let wasMuted = current.muted else {
+                Log.info("output \(current.name ?? current.deviceUID) has no mute control; not muted")
+                return
+            }
             try manager.journal { s in
                 // One entry per device. A device that already has one keeps
                 // it: a previous close muted it and was never undone, so
@@ -345,7 +349,7 @@ final class LidActions {
                         deviceUID: current.deviceUID,
                         name: current.name,
                         volume: current.volume,
-                        muted: current.muted,
+                        muted: wasMuted,
                         saveID: UUID().uuidString
                     ))
                 }
@@ -353,7 +357,7 @@ final class LidActions {
             // The device just read and journaled, even if the default output
             // has changed since.
             try audio.mute(deviceUID: current.deviceUID)
-            Log.info("muted \(current.deviceUID) (was volume \(current.volume), muted \(current.muted))")
+            Log.info("muted \(current.deviceUID) (was volume \(volumeText(current.volume)), muted \(wasMuted))")
         } catch {
             Log.error("mute on lid close failed: \(error.localizedDescription)")
         }

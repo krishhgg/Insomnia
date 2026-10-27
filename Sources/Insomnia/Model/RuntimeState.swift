@@ -87,7 +87,8 @@ struct AppNapOverride: Codable, Equatable, Hashable, Sendable {
 /// (spec section 4). Restored on that device only, never on another
 /// output; kept while the device is not connected. `name` is for the
 /// warning that names a device still waiting, and left out of the JSON
-/// when it could not be read. `saveID` is drawn afresh by each lid close
+/// when it could not be read. `volume` is left out for a device without a
+/// settable volume, which lid close still mutes. `saveID` is drawn afresh by each lid close
 /// that writes an entry, so a later save for the same device, with the
 /// same values or not, is never taken for this one, whichever copy of the
 /// app wrote it. nil, and left out of the JSON, in an entry written
@@ -96,11 +97,11 @@ struct AppNapOverride: Codable, Equatable, Hashable, Sendable {
 struct SavedAudioOutput: Codable, Equatable, Hashable, Sendable {
     let deviceUID: String
     let name: String?
-    let volume: Float
+    let volume: Float?
     let muted: Bool
     let saveID: String?
 
-    init(deviceUID: String, name: String?, volume: Float, muted: Bool, saveID: String?) {
+    init(deviceUID: String, name: String?, volume: Float?, muted: Bool, saveID: String?) {
         self.deviceUID = deviceUID
         self.name = name
         self.volume = volume

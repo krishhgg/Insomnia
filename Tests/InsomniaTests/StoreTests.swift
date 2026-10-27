@@ -58,12 +58,13 @@ final class StoreTests: XCTestCase {
 
     /// Output device entries are flat objects that backstop.sh and
     /// uninstall.sh check with plutil: a string UID, an optional string
-    /// name, a number, a bool and an optional string save ID.
+    /// name, an optional number, a bool and an optional string save ID.
     func testSavedAudioOutputsAreWrittenFlatForTheScripts() throws {
         var st = RuntimeState()
         st.savedAudioOutputs = [
             SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.25, muted: false, saveID: "8C1F0E2A-55B1-4F0D-9D7B-3E1A2B4C5D6E"),
             SavedAudioOutput(deviceUID: "70-8C-F2:output", name: nil, volume: 1, muted: true, saveID: nil),
+            SavedAudioOutput(deviceUID: "LG-HDMI", name: "LG UltraGear", volume: nil, muted: false, saveID: nil),
         ]
         try store.saveState(st)
         XCTAssertEqual(try store.loadState()?.savedAudioOutputs, st.savedAudioOutputs)
@@ -74,10 +75,11 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(outputs.first?["volume"] as? Double, 0.25)
         XCTAssertEqual(outputs.first?["muted"] as? Bool, false)
         XCTAssertEqual(outputs.first?["saveID"] as? String, "8C1F0E2A-55B1-4F0D-9D7B-3E1A2B4C5D6E")
-        XCTAssertNil(outputs.last?["name"])
-        XCTAssertNil(outputs.last?["saveID"])
+        XCTAssertNil(outputs[1]["name"])
+        XCTAssertNil(outputs[1]["saveID"])
+        XCTAssertNil(outputs.last?["volume"], "a device without a volume control has none saved")
         XCTAssertTrue(st.isDirty)
-        XCTAssertFalse(st.isDirty(leavingOutAudioOf: ["usb-headset", "70-8C-F2:output"]))
+        XCTAssertFalse(st.isDirty(leavingOutAudioOf: ["usb-headset", "70-8C-F2:output", "LG-HDMI"]))
     }
 
     /// A journal from before output device entries has no key, and a null
@@ -100,6 +102,13 @@ final class StoreTests: XCTestCase {
         ] {
             let st = try Store.makeDecoder().decode(RuntimeState.self, from: Data(earlier.utf8))
             XCTAssertEqual(st.savedAudioOutputs, [SavedAudioOutput(deviceUID: "usb-headset", name: "USB Headset", volume: 0.3, muted: false, saveID: nil)], earlier)
+        }
+        for noVolume in [
+            #"{"savedAudioOutputs":[{"deviceUID":"LG-HDMI","muted":false}]}"#,
+            #"{"savedAudioOutputs":[{"deviceUID":"LG-HDMI","volume":null,"muted":false}]}"#,
+        ] {
+            let st = try Store.makeDecoder().decode(RuntimeState.self, from: Data(noVolume.utf8))
+            XCTAssertEqual(st.savedAudioOutputs, [SavedAudioOutput(deviceUID: "LG-HDMI", name: nil, volume: nil, muted: false, saveID: nil)], noVolume)
         }
         for json in RecoveryScriptTests.corruptOutputJournals {
             XCTAssertThrowsError(try Store.makeDecoder().decode(RuntimeState.self, from: Data(json.utf8)), json)
