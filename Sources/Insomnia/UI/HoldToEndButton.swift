@@ -1,12 +1,12 @@
 import SwiftUI
 
-/// Press-and-hold "end session" control that sits to the right of the
-/// countdown in the status item.
+/// "End session" control that sits to the right of the countdown in the
+/// status item.
 ///
-/// A ring draws around the glyph for `Motion.holdDuration` while the mouse
-/// is down; only a completed ring ends the session. Releasing early, or
-/// dragging away, springs the ring back with no action, so a stray click
-/// while reaching for the menu bar clock cannot kill a session.
+/// A click ends the session: releasing the mouse over the button fires the
+/// action, and holding for `Motion.holdDuration` fires it sooner, with the
+/// ring drawing meanwhile. Dragging away before release springs the ring
+/// back with no action.
 struct HoldToEndButton: View {
     let reduceMotion: Bool
     let action: () -> Void
@@ -54,12 +54,15 @@ struct HoldToEndButton: View {
                 }
                 .onEnded { _ in
                     pressed = false
-                    if holding { release() }
+                    if holding {
+                        release()
+                        action()
+                    }
                 }
         )
-        .help("Hold to end the session")
+        .help("End the session")
         .accessibilityLabel("End session")
-        .accessibilityHint("Press and hold")
+        .accessibilityHint("Press to end the session now")
         .accessibilityAction { action() }
     }
 
@@ -78,7 +81,7 @@ struct HoldToEndButton: View {
         }
     }
 
-    /// Released or dragged away before the ring closed: no action.
+    /// Stop drawing the ring and spring it back; the caller decides on action.
     private func release() {
         holdTask?.cancel()
         holdTask = nil

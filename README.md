@@ -36,7 +36,7 @@
 > [Validation status](docs/release-validation.md) · [Apple's ventilation guidance](https://support.apple.com/en-us/102336)
 
 <p align="center">
-  <img src="docs/assets/session-flow.svg" alt="Illustrated menu-bar controls: enter Days, Hours, and Minutes, watch the countdown, and hold the end control to finish early. Click the eye or countdown to add time. Closing the lid is optional, and incomplete recovery needs attention." width="880">
+  <img src="docs/assets/session-flow.svg" alt="Illustrated menu-bar controls: enter Days, Hours, and Minutes, watch the countdown, and click the end control to finish early. Click the eye or countdown to add time. Closing the lid is optional, and incomplete recovery needs attention." width="880">
 </p>
 
 ## Install
@@ -103,7 +103,7 @@ file and explains how upgrades replace them.
 1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
    and press Enter.
 2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
+3. **End early.** Click the end control next to the countdown.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.
