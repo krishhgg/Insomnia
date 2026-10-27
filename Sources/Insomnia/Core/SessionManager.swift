@@ -764,6 +764,26 @@ final class SessionManager {
     private func loadJournal() throws {
         state = try store.loadState() ?? .clean
         if claimsLowPowerInThisBoot(state) { lowPowerWasOurs = true }
+        dropUnclearedLine(ifSettledIn: state)
+    }
+
+    /// Re-read the journal while a failed clear's line is up, and drop the
+    /// line once its entry is gone from disk, as when the backstop cleared
+    /// it after this process could not (issue #124). The menu calls this
+    /// before it opens. The read takes no lock; a journal that does not
+    /// read keeps the line. When the line goes, the journal just read
+    /// becomes `state`, so the menu's other lines (such as sleep held with
+    /// no session) go with it. Only a lock holder writes the journal, and
+    /// `state` is always what this process last read or wrote, so outside
+    /// a transaction this only brings it up to date, and inside one the
+    /// two are the same.
+    func recheckUnclearedEntry() {
+        guard uncleared != nil else { return }
+        guard let s = try? store.loadState() ?? .clean else { return }
+        dropUnclearedLine(ifSettledIn: s)
+        guard uncleared == nil else { return }
+        state = s
+        if claimsLowPowerInThisBoot(s) { lowPowerWasOurs = true }
     }
 
     /// `s` journals Insomnia's Low Power Mode, by a claim not read from
@@ -2984,19 +3004,21 @@ final class SessionManager {
         try store.saveState(s)
         state = s
         if claimsLowPowerInThisBoot(s) { lowPowerWasOurs = true }
-        // The entry a failed clear left is gone once its clear changes no
-        // undo entry of what was written, or nothing is left to undo,
-        // whichever write did it. The display write owed after Low Power
-        // Mode is left out: a retry made once the mode is off owes none,
-        // where the failed clear did.
-        if let (message, clear) = uncleared {
-            var cleared = s
-            clear(&cleared)
-            if cleared.undoEntries == s.undoEntries || !s.isDirty {
-                if lastError == message { lastError = nil }
-                uncleared = nil
-            }
-        }
+        dropUnclearedLine(ifSettledIn: s)
+    }
+
+    /// The entry a failed clear left is gone once its clear changes no
+    /// undo entry of `s`, or nothing is left to undo, whoever wrote it. The
+    /// display write owed after Low Power Mode is left out: a retry made
+    /// once the mode is off owes none, where the failed clear did. A newer
+    /// error in the menu stays.
+    private func dropUnclearedLine(ifSettledIn s: RuntimeState) {
+        guard let (message, clear) = uncleared else { return }
+        var cleared = s
+        clear(&cleared)
+        guard cleared.undoEntries == s.undoEntries || !s.isDirty else { return }
+        if lastError == message { lastError = nil }
+        uncleared = nil
     }
 
     /// Logs `message` and shows it in the status menu until the next
