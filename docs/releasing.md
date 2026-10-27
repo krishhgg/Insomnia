@@ -240,6 +240,7 @@ below cover what only a real Mac shows.
 - A left-running `disablesleep 0` that exits 0: the end finishes without running it again
 - After that command exits: Low Power Mode ownership matches the mode, and a lid open made meanwhile is undone
 - `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared
+- A journal clear the backstop finishes: `chflags uchg` state.json, choose End (the menu shows "sleep restored but the journal entry could not be cleared"), `chflags nouchg`, wait for the next backstop run to log "journal cleared"; the next menu opening has no error line
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600

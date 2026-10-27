@@ -50,6 +50,39 @@ final class UndoClearFailureTests: XCTestCase {
         XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
     }
 
+    /// The backstop clears the entry the app could not (issue #124): the
+    /// next menu opening reads the journal and the line goes. Before that,
+    /// with the entry still on disk, it stays.
+    func testLineGoesOnceTheBackstopClearsTheEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        m.recheckUnclearedEntry()
+        try assertShown(m, "sleep restored")
+
+        try h.store.saveState(.clean)
+        m.recheckUnclearedEntry()
+        XCTAssertNil(m.lastError)
+    }
+
+    /// A newer error in the menu is not the cleared entry's line, so it
+    /// stays when the backstop clears the entry.
+    func testANewerErrorStaysWhenTheBackstopClearsTheEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+        m.fail("something newer")
+
+        try h.store.saveState(.clean)
+        m.recheckUnclearedEntry()
+        XCTAssertEqual(m.lastError, "something newer")
+    }
+
     /// The end's `lowpowermode 0` exits 0 and the clear fails.
     func testEndWhoseLowPowerClearFailsSaysSo() async throws {
         let m = h.makeManager()
