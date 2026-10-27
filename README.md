@@ -138,6 +138,11 @@ to undo them. The timer keeps counting down while the lid is closed.
   with Slack, WhatsApp and Discord. "Freeze every other app" is off by
   default. Even when on, it skips meeting, recording and dictation apps: Zoom,
   Teams, Webex, FaceTime, Wispr Flow, Granola, Otter, OBS and Loom.
+- **The screen can lock.** Off by default. Turn on "Lock the screen" in
+  Settings and opening the lid asks for your login password. Apps keep
+  running, but agents that work through the screen, such as computer use, wait
+  until you sign in. It uses a private macOS call, so the menu shows a line if
+  it fails.
 - **Audio is muted.** Lid open unmutes each output Insomnia muted, even if you
   switched to another one.
 - **Low Power Mode turns on.** It turns off when the lid opens, unless a

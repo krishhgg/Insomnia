@@ -144,7 +144,7 @@ final class AppServices {
 
         (notifier as? Notifier)?.requestAuthorizationIfNeeded()
 
-        lidActions = LidActions(manager: manager, freezer: freezer, docker: docker, audio: audio, display: display, keyboard: keyboard, sampler: sampler)
+        lidActions = LidActions(manager: manager, freezer: freezer, docker: docker, audio: audio, display: display, keyboard: keyboard, screenLock: LoginFrameworkScreenLocker(), sampler: sampler)
         floors = FloorRuleDriver(manager: manager, notifier: notifier)
         // The panel under Insomnia's own Low Power Mode reads the mode's
         // rescaled value: sample once more just before the mode goes on

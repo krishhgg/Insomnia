@@ -5,6 +5,7 @@ import XCTest
 final class LidActionsTests: XCTestCase {
     var h: Harness!
     var freezer: FakeFreezer!
+    let locker = FakeScreenLocker()
 
     let processes: [ProcessEntry] = [
         ProcessEntry(pid: 1, ppid: 0, startedAt: 1),
@@ -44,7 +45,7 @@ final class LidActionsTests: XCTestCase {
         m.config.freezeList = ["com.tinyspeck.slackmacgap"]
         if let dockerRule { m.config.dockerRule = dockerRule }
         let docker = DockerRule(freezer: freezer, probe: dockerIdle)
-        let actions = LidActions(manager: m, freezer: freezer, docker: docker, audio: h.audio, display: h.display, keyboard: h.keyboard, sampler: sampler)
+        let actions = LidActions(manager: m, freezer: freezer, docker: docker, audio: h.audio, display: h.display, keyboard: h.keyboard, screenLock: locker, sampler: sampler)
         return (m, actions)
     }
 
@@ -850,6 +851,90 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.display.sets, [])
         XCTAssertEqual(h.keyboard.sets, [])
         XCTAssertEqual(h.display.wakes, 0)
+    }
+
+    // MARK: Lock the screen
+
+    func testLockRunsBeforeDarkeningMuteAndFreezes() async throws {
+        let (m, actions) = await make(dockerRule: false, mute: true)
+        m.config.lockScreenOnLidClose = true
+        m.config.darkenDisplayOnLidClose = true
+        await m.start(duration: 3600)
+        let order = Locked<[String]>([])
+        locker.onLock = { order.value.append("lock") }
+        h.display.onSet = { _ in order.value.append("display") }
+        h.audio.onMute = { order.value.append("mute") }
+        h.procs.onSuspend = { _ in order.value.append("freeze") }
+
+        await actions.onClose()
+
+        XCTAssertEqual(order.value, ["lock", "display", "mute", "freeze"])
+        XCTAssertEqual(h.display.sets, [0])
+        XCTAssertEqual(h.audio.mutes, 1)
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+    }
+
+    func testCloseLocksTheScreenOnceWhenOn() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 1)
+        XCTAssertNil(m.lastError)
+        XCTAssertTrue(logText().contains("screen locked on lid close"), logText())
+
+        await actions.onOpen()
+        XCTAssertEqual(locker.calls, 1, "opening the lid does nothing for the lock")
+    }
+
+    func testCloseDoesNotLockWhenOff() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = false
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 0)
+    }
+
+    func testCloseWithNoSessionDoesNotLock() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 0)
+    }
+
+    func testACloseTheLidOpenOvertookDoesNotLock() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+        await m.start(duration: 3600)
+        let close = actions.lidEventArrived()
+        actions.lidEventArrived()
+
+        await actions.onClose(event: close)
+
+        XCTAssertEqual(locker.calls, 0)
+    }
+
+    func testAFailedLockIsShownAndTheRestOfTheCloseStillRuns() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+        locker.throwOnLock = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 1)
+        let line = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(line.contains("could not lock the screen"), line)
+        XCTAssertTrue(line.contains("SACLockScreenImmediate returned 1"), line)
+        XCTAssertTrue(logText().contains("could not lock the screen"), logText())
+        XCTAssertEqual(h.display.sets, [0], "darkening still ran")
+        XCTAssertEqual(h.procs.suspended.count, 2, "freezing still ran")
     }
 
     /// Open: wake the panel first (a slept display lights before its
