@@ -248,6 +248,8 @@ below cover what only a real Mac shows.
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings battery menus keep the end floor below the Low Power Mode floor by moving the other menu
 - "Show the countdown in the menu bar" off: a start leaves only the eye, open, with no countdown or end control and the item no wider than idle; the right-click menu leads with the time left and End session ends the session and closes the eye; clicking the eye still opens the extend pills; turning the setting on or off mid-session changes the bar at once
+- During a session on battery, a Low Power Mode floor raised above the charge in Settings switches the mode on within seconds and lowering it switches it off, and the thermal rules toggle applies at once
+- Heat hold when serious heat happens during a supervised session on a ventilated desk (never heat the Mac to test it): Low Power Mode comes on once, stays on at fair and goes off at nominal with "Thermal state is back to nominal."; the menu shows "Thermal: serious" and "Low Power Mode set by Insomnia" meanwhile; with "Keep Low Power Mode on until the Mac fully cools" off it goes off at fair instead, and turning the setting off while the mode is held at fair releases it at once
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
 
 ### Menu bar

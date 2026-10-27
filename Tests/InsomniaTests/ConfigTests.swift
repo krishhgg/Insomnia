@@ -34,6 +34,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(c.freezeAllApps, "freeze-all is opt in")
         XCTAssertTrue(c.lowPowerOnLidClose)
         XCTAssertTrue(c.thermalRules)
+        XCTAssertTrue(c.thermalHoldUntilNominal, "the heat hold is on by default")
         XCTAssertFalse(c.disableAppNapForAgents, "writing other apps' preferences is opt-in")
         XCTAssertEqual(c.hotspotSSID, "")
         XCTAssertEqual(c.tmuxTargets, [])
@@ -152,6 +153,17 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(end.filter { $0 > 30 && $0 < 45 }, [35, 37, 40])
         XCTAssertEqual(end.last, Config.maxEndFloor)
         XCTAssertEqual(Config.floorChoices(through: 100, keeping: 40).last, 100)
+    }
+
+    /// The heat hold is on for a config.json written before the key
+    /// existed; an explicit false is honoured and survives a save.
+    func testThermalHoldUntilNominalDecodesAndDefaultsOn() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"thermalRules": true}"#.utf8))
+        XCTAssertTrue(legacy.thermalHoldUntilNominal)
+        let off = try Store.makeDecoder().decode(Config.self, from: Data(#"{"thermalHoldUntilNominal": false}"#.utf8))
+        XCTAssertFalse(off.thermalHoldUntilNominal)
+        let data = try Store.makeEncoder().encode(off)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), off)
     }
 
     // MARK: Battery floors

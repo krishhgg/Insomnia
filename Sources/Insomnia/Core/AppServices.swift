@@ -153,6 +153,9 @@ final class AppServices {
         // A power command left running refuses lid and floor transactions
         // until it exits; the manager calls back then.
         manager.resyncAfterCommand = { [weak self] replayLid in self?.resyncAfterCommand(replayLid: replayLid) }
+        // A floor input changed in Settings applies now, not at the next
+        // battery, thermal or lid event.
+        manager.floorInputsChanged = { [weak self] in self?.reevaluateFloors() }
         sampler.follow(manager)
 
         lid.onChange = { [weak self] closed in self?.lidChanged(closed) }
@@ -242,15 +245,19 @@ final class AppServices {
         }
     }
 
-    /// The part of the refresh that reads straight out of the system: battery
-    /// and lid. Split out so a caller that cannot await — the right-click
-    /// menu, which blocks the main actor once it is up — still opens on these.
-    /// Watts are not read here: the menu calls `instantWatts()` itself.
-    /// During a session the lid is the observer's, so a lid closed at a desk
-    /// reads as the session takes it.
+    /// The part of the refresh that reads straight out of the system: battery,
+    /// thermal state and lid. Split out so a caller that cannot await — the
+    /// right-click menu, which blocks the main actor once it is up — still
+    /// opens on these. Watts are not read here: the menu calls
+    /// `instantWatts()` itself. During a session the lid is the observer's,
+    /// so a lid closed at a desk reads as the session takes it.
     func refreshInstant() {
         power.refreshBattery()
         syncPower()
+        // Read here, not through the monitor: its copy moves only with the
+        // notification, so the floors see every change, and it is not
+        // kept current outside a session.
+        status.thermalState = ProcessInfo.processInfo.thermalState
         if running {
             status.lidClosed = lid.isClosed
         } else if let now = LidObserver.readClamshellState() {
@@ -332,10 +339,11 @@ final class AppServices {
         network?.passwordChanged(change, configuredSSID: configuredSSID)
     }
 
-    /// Re-run the floors with the current inputs. Settings that change a
-    /// floor input (the lid option) call this so the change applies now,
-    /// not at the next battery, thermal or lid event. Queued on the floor
-    /// chain like a power event; a no-op outside a session.
+    /// Re-run the floors with the current inputs. A change to a floor input
+    /// (the lid option, either battery floor, the thermal rules) calls this
+    /// through `SessionManager.floorInputsChanged`, so it applies now, not
+    /// at the next battery, thermal or lid event. Queued on the floor chain
+    /// like a power event; a no-op outside a session.
     func reevaluateFloors() {
         powerChanged()
     }

@@ -9,6 +9,8 @@ protocol StatusSource: AnyObject, Observable {
     var lidClosed: Bool { get }
     var batteryPercent: Int? { get }
     var isCharging: Bool { get }
+    /// The thermal state, read again when the menu opens.
+    var thermalState: ProcessInfo.ThermalState { get }
     var wifiSSID: String? { get }
     /// Length of the most recent network outage, nil if none this session.
     var lastGap: TimeInterval? { get }
@@ -41,6 +43,7 @@ final class PlaceholderStatus: StatusSource {
     var lidClosed: Bool = false
     var batteryPercent: Int? = nil
     var isCharging: Bool = false
+    var thermalState: ProcessInfo.ThermalState = .nominal
     var wifiSSID: String? = nil
     var lastGap: TimeInterval? = nil
     var frozenCount: Int = 0
@@ -60,8 +63,9 @@ final class PlaceholderStatus: StatusSource {
 /// Pure formatting for the menu's status block, kept out of the views so
 /// it can be tested.
 enum StatusLines {
-    /// "Lid: closed · 4.1 W · Wi-Fi: iPhone". Unknown parts are omitted.
-    static func machine(lidClosed: Bool, watts: Double?, wifiSSID: String?, batteryPercent: Int?, isCharging: Bool) -> String {
+    /// "Lid: closed · 4.1 W · Thermal: serious · Wi-Fi: iPhone". Unknown
+    /// parts are omitted, and so is a nominal thermal state.
+    static func machine(lidClosed: Bool, watts: Double?, wifiSSID: String?, batteryPercent: Int?, isCharging: Bool, thermal: ProcessInfo.ThermalState = .nominal) -> String {
         var parts: [String] = ["Lid: \(lidClosed ? "closed" : "open")"]
         if let w = watts {
             parts.append(String(format: "%.1f W", w))
@@ -69,15 +73,24 @@ enum StatusLines {
         if let p = batteryPercent {
             parts.append(isCharging ? "\(p)% charging" : "\(p)%")
         }
+        if thermal != .nominal {
+            parts.append("Thermal: \(PowerMonitor.name(thermal))")
+        }
         if let ssid = wifiSSID, !ssid.isEmpty {
             parts.append("Wi-Fi: \(ssid)")
         }
         return parts.joined(separator: " \u{00B7} ")
     }
 
-    /// "3 apps frozen · Docker paused", or nil when nothing is held.
-    static func actions(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?) -> String? {
+    /// "Low Power Mode set by Insomnia · 3 apps frozen · Docker paused",
+    /// or nil when nothing is held. `lowPower` is the journal's
+    /// `lowPowerSetByUs`: the mode Insomnia switched on and switches off
+    /// again.
+    static func actions(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?, lowPower: Bool = false) -> String? {
         var parts: [String] = []
+        if lowPower {
+            parts.append("Low Power Mode set by Insomnia")
+        }
         if frozenCount > 0 {
             parts.append(frozenCount == 1 ? "1 app frozen" : "\(frozenCount) apps frozen")
         }

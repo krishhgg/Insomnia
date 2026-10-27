@@ -755,12 +755,14 @@ final class StatusItemController: NSObject {
                     locationAuthorized: (status as? LiveStatusSource)?.locationPermission.isAuthorized ?? true
                 ),
                 batteryPercent: status.batteryPercent,
-                isCharging: status.isCharging
+                isCharging: status.isCharging,
+                thermal: status.thermalState
             ),
             actions: StatusLines.actions(
                 frozenCount: status.frozenCount,
                 dockerPaused: status.dockerPaused,
-                lastGap: status.lastGap
+                lastGap: status.lastGap,
+                lowPower: manager.effectiveState.lowPowerSetByUs
             ),
             throttledBrowsers: status.throttledBrowsers,
             relaunchProblems: status.relaunchProblems,

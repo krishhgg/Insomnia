@@ -684,7 +684,7 @@ IOKit sends no event for a read that keeps failing.
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
 | battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify, sleep a closed lid | — |
 | battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify, sleep a closed lid | — |
-| thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
+| thermal state `serious`, or `fair` with no `nominal` since a `serious` (the second only with `thermalHoldUntilNominal`, on by default) | `lowpowermode 1` | thermal back to `nominal` (back to `fair` with the hold off), or session end |
 | thermal state `critical` | end session, notify, sleep a closed lid | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
 
@@ -710,6 +710,31 @@ the session without it. Settings enforces the order in 5% steps by moving the
 other floor when the two would cross (`endFloor` at most 95). A `config.json`
 that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
 + 5 (capped at 100), logged, and written back.
+
+The thermal cause holds from a `serious` reading until a `nominal` one. A Mac
+back at `fair` is still cooling down, and switching the mode off there brings
+back the load that made it serious, so the mode would go on and off as the
+Mac heats up and cools down. `FloorRuleDriver` keeps that history for the
+session, in memory: after a relaunch a Mac at `fair` counts as cooled down.
+The notifications say what the mode waits for ("Low Power Mode stays on until
+it is back to nominal") and why it went off ("Thermal state is back to
+nominal.", or "Thermal rules are off." when Settings turned them off). While
+the mode is on for heat the display sample is held, as for any Low Power Mode
+Insomnia switched on (section 4), so the hold can keep it longer than before.
+Nothing but `nominal` and the session end bounds the hold: a Mac that stays at
+`fair`, under a long build say, keeps the mode, and the display sample held,
+until the session ends. That is deliberate. A Mac at `fair` after `serious` is
+still carrying the heat, and a release on a timer would bring the cycling back
+at a slower pace. The menu shows the mode and the thermal state meanwhile, and
+turning the thermal rules off in Settings releases it at once.
+
+Settings can turn the hold off ("Keep Low Power Mode on until the Mac fully
+cools", `thermalHoldUntilNominal`, on by default and for a config.json without
+the key). Off, the thermal cause ends at `fair` as it did before the hold: full
+speed comes back sooner, and the mode can go on and off again as the Mac heats
+up. Turning it off while the mode is held at `fair` releases the mode at once
+("Thermal state is back to fair."), and the enable notification says "Low
+Power Mode is on until it cools down." instead of naming `nominal`.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
@@ -1229,7 +1254,11 @@ older build is tightened when the app reads it:
   An Apple app, Insomnia or Docker Desktop on the freeze list alone shows as
   Keep running too, since the planner never freezes it from the list, and
   its row's Remove button clears the entry.
-- `lowPowerFloor`, `endFloor`, thermal rules on/off
+- `lowPowerFloor`, `endFloor`, thermal rules on/off, the heat hold
+  (`thermalHoldUntilNominal`, default on). A change to any of
+  them, or to the lid option, during a session runs the floors at once:
+  `SessionManager.config` calls `floorInputsChanged` when `Config.floorInputs`
+  changes, and `AppServices` runs `reevaluateFloors` for it.
 - hotspot SSID, picked from the networks this Mac has joined or typed
   (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets, `tmuxNudgePressesEnter` (default off)
@@ -1546,7 +1575,9 @@ validation record.
 11. **Floors.** Set `lowPowerFloor` above current charge → Low Power Mode on.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to
-    `serious`, `critical`, and recovery. Do not intentionally overheat the Mac.
+    `serious`, `critical`, and recovery: Low Power Mode stays on at `fair`
+    after `serious` and goes off at `nominal`. Do not intentionally overheat
+    the Mac.
 13. **Darken.** Brightness 70%, keyboard backlight on, close lid → both go to
     0 (check `state.json` has `savedDisplayBrightness` and
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat

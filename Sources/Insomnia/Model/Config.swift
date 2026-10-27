@@ -67,6 +67,11 @@ struct Config: Codable, Equatable, Sendable {
     /// `setLowPowerFloor` and `normalizeFloors`.
     var endFloor: Int = 10
     var thermalRules: Bool = true
+    /// Keep Low Power Mode switched on for heat until the thermal state is
+    /// back to nominal (`FloorRules.lowPowerCause`). Off: it goes off once
+    /// the state drops below serious, and may come back on as the Mac heats
+    /// up again. On by default, and for a config.json without the key.
+    var thermalHoldUntilNominal: Bool = true
 
     // Network failover
     var hotspotSSID: String = ""
@@ -181,6 +186,7 @@ struct Config: Codable, Equatable, Sendable {
         lowPowerFloor = try c.decodeIfPresent(Int.self, forKey: .lowPowerFloor) ?? d.lowPowerFloor
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
+        thermalHoldUntilNominal = try c.decodeIfPresent(Bool.self, forKey: .thermalHoldUntilNominal) ?? d.thermalHoldUntilNominal
         hotspotSSID = try c.decodeIfPresent(String.self, forKey: .hotspotSSID) ?? d.hotspotSSID
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
@@ -270,6 +276,27 @@ extension Config {
     /// A non-zero end floor sits below the Low Power Mode floor, so the mode
     /// gets its chance before the end.
     var floorsAreOrdered: Bool { endFloor == 0 || endFloor < lowPowerFloor }
+
+    /// The settings the floor rules read (`FloorRules.evaluate`). A change
+    /// to any of them during a session runs the floors at once
+    /// (`SessionManager.floorInputsChanged`).
+    struct FloorInputs: Equatable {
+        var lowPowerFloor: Int
+        var endFloor: Int
+        var thermalRules: Bool
+        var thermalHoldUntilNominal: Bool
+        var lowPowerOnLidClose: Bool
+    }
+
+    var floorInputs: FloorInputs {
+        FloorInputs(
+            lowPowerFloor: lowPowerFloor,
+            endFloor: endFloor,
+            thermalRules: thermalRules,
+            thermalHoldUntilNominal: thermalHoldUntilNominal,
+            lowPowerOnLidClose: lowPowerOnLidClose
+        )
+    }
 
     /// Sets the end floor (0...`maxEndFloor`) and raises the Low Power Mode
     /// floor one step above it when it would otherwise not be above it.
