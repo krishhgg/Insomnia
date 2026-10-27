@@ -1855,11 +1855,11 @@ final class SessionManager {
             let wasWaiting = audioDevicesNotConnected.remove(entry.deviceUID) != nil
             do {
                 let now = try audio.read(deviceUID: entry.deviceUID)
-                if now.muted {
+                if now.muted != false {
                     try audio.apply(volume: entry.volume, muted: entry.muted, deviceUID: entry.deviceUID)
-                    Log.info("audio restored on \(device) (volume \(entry.volume), muted \(entry.muted))")
+                    Log.info("audio restored on \(device) (volume \(volumeText(entry.volume)), muted \(entry.muted))")
                 } else {
-                    Log.info("audio: \(device) was unmuted after the lid close; left at volume \(now.volume), the saved volume \(entry.volume) is dropped")
+                    Log.info("audio: \(device) was unmuted after the lid close; left at volume \(volumeText(now.volume)), the saved volume \(volumeText(entry.volume)) is dropped")
                 }
             } catch is AudioDeviceMissingError {
                 audioDevicesNotConnected.insert(entry.deviceUID)
@@ -1889,10 +1889,9 @@ final class SessionManager {
                     volume = volume ?? current.volume
                     muted = muted ?? current.muted
                 }
-                let v = volume ?? 1
                 let m = muted ?? false
-                try audio.apply(volume: v, muted: m, deviceUID: nil)
-                Log.info("audio restored on the default output (volume \(v), muted \(m))")
+                try audio.apply(volume: volume, muted: m, deviceUID: nil)
+                Log.info("audio restored on the default output (volume \(volumeText(volume)), muted \(m))")
                 let cleared = clearUndone("audio restored") { s in
                     s.savedOutputVolume = nil
                     s.savedMuted = nil
@@ -2046,7 +2045,7 @@ final class SessionManager {
             do {
                 try self.journal { $0.savedAudioOutputs.removeAll { $0.deviceUID == deviceUID } }
                 self.audioDevicesNotConnected.remove(deviceUID)
-                Log.info("audio: stopped waiting for \(entry.label) as asked; its saved volume \(entry.volume) and mute \(entry.muted) are dropped, and it stays muted")
+                Log.info("audio: stopped waiting for \(entry.label) as asked; its saved volume \(volumeText(entry.volume)) and mute \(entry.muted) are dropped, and it stays muted")
             } catch {
                 self.fail("could not drop the saved volume of \(entry.label): \(error.localizedDescription)")
             }
