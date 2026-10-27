@@ -656,7 +656,15 @@ provided by the standalone backstop. Performance effects depend on workload.
 
 - `NWPathMonitor` on the Wi-Fi interface. Event-driven.
 - Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
-  scan, then join with `associate(to:password:)`. The password is read from
+  scan, then join with `associate(to:password:)`. A scan that finds nothing
+  is tried again with the SSID's apostrophes swapped, straight (U+0027) for
+  typographic (U+2019) and back (`HotspotSSID.scanCandidates`): iOS names a
+  Personal Hotspot `Name’s iPhone` with U+2019, a Mac keyboard types U+0027,
+  and a directed scan matches the exact bytes. Measured on macOS 27.2: a
+  fresh directed scan takes about 2 s, and one made within about 10 s of it
+  answers from the scan cache in about 20 ms, so the other spelling costs a
+  join almost nothing. It is looked for among the networks the first scan
+  heard, which holds for an iPhone hotspot, since it broadcasts its name. The password is read from
   the login Keychain (generic-password service `insomnia-hotspot`, account =
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
