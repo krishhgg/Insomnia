@@ -11,6 +11,8 @@ struct Config: Codable, Equatable, Sendable {
     /// The pill that is focused when the pills open, for a start and for an
     /// extend.
     var defaultFocusField: DurationInput.Field = .hours
+    /// What the menu bar countdown reads during a session.
+    var countdownStyle: CountdownStyle = .remaining
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
 
@@ -74,6 +76,12 @@ struct Config: Codable, Equatable, Sendable {
     var tmuxNudgePressesEnter: Bool = false
 
     // App
+    /// Show the live countdown and the hold-to-end ring next to the eye
+    /// while a session runs. Off: the eye alone says whether a session is
+    /// running (open) or not (closed), and the time left moves to the
+    /// right-click menu, beside End session. On by default, and for a config.json
+    /// without the key.
+    var showMenuBarCountdown: Bool = true
     var launchAtLogin: Bool = false
     /// The install (code directory hash, bundle path and the executable's
     /// file identity: `LoginItem.install`) whose login item macOS last
@@ -149,6 +157,8 @@ struct Config: Codable, Equatable, Sendable {
         // A value this build does not know falls back to hours; it must not
         // cost the user the rest of the config.
         defaultFocusField = (try? c.decodeIfPresent(DurationInput.Field.self, forKey: .defaultFocusField)) ?? d.defaultFocusField
+        // Same for a style this build does not know: back to the time left.
+        countdownStyle = (try? c.decodeIfPresent(CountdownStyle.self, forKey: .countdownStyle)) ?? d.countdownStyle
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
@@ -169,9 +179,18 @@ struct Config: Codable, Equatable, Sendable {
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
+        showMenuBarCountdown = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarCountdown) ?? d.showMenuBarCountdown
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }
+}
+
+/// How the menu bar countdown reads during a session.
+enum CountdownStyle: String, Codable, CaseIterable, Sendable {
+    case remaining
+    /// The clock time the session ends at. It changes only when the session
+    /// does, so nothing redraws the status item in between.
+    case endTime
 }
 
 // MARK: Lid-close update

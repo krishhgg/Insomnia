@@ -1,17 +1,21 @@
 import AppKit
 
 /// The right-click menu on the status item: a read-only status block, then
-/// Settings and Quit, which live here and nowhere else.
+/// End session while a session runs, Settings and Quit. With the menu bar
+/// countdown turned off, the time left heads the status block.
 ///
 /// The item list is pure so the ordering and the omission rules can be
-/// tested without a menu bar; `menu(_:target:settings:quit:)` is the only
-/// part that touches AppKit.
+/// tested without a menu bar; the menu builder is the only part that
+/// touches AppKit.
 enum StatusMenu {
     struct Item: Equatable {
         enum Kind: Equatable {
             case info
             case warning
             case separator
+            /// End the running session. Offered whenever a session runs; with
+            /// the menu bar countdown off it stands in for the hold-to-end ring.
+            case endSession
             case settings
             case quit
             /// Relaunch this browser with the occlusion flags. Carries the
@@ -29,10 +33,17 @@ enum StatusMenu {
         let kind: Kind
     }
 
+    static let endSessionTitle = "End session"
     static let settingsTitle = "Settings\u{2026}"
     static let quitTitle = "Quit Insomnia"
 
-    /// Disabled status lines, a separator, then Settings… and Quit. Empty
+    /// The time-left line, from the session's minute-granularity text
+    /// ("2h 14m").
+    static func remainingLine(_ remaining: String) -> String {
+        "Time left: \(remaining)"
+    }
+
+    /// Disabled status lines, a separator, then session and app actions. Empty
     /// lines are dropped, and the separator only appears when something
     /// precedes it, so the menu never opens with a stray rule at the top.
     /// `hotspotWarning` is the line about a hotspot password the failover
@@ -46,6 +57,9 @@ enum StatusMenu {
     /// `outputsWaiting` are output devices still muted from a lid close
     /// because they were not connected to get their volume back; each gets
     /// a line and an item to stop waiting for it.
+    /// `remaining` is the time left, given while a session runs and the bar
+    /// does not show it: the countdown is turned off, or it shows the end
+    /// time. It heads the menu.
     static func items(
         sessionActive: Bool,
         sleepHeld: Bool,
@@ -58,9 +72,13 @@ enum StatusMenu {
         commandRunning: String? = nil,
         foreignSleep: String? = nil,
         outputsWaiting: [SavedAudioOutput] = [],
-        lidSimulationBuild: Bool = false
+        lidSimulationBuild: Bool = false,
+        remaining: String? = nil
     ) -> [Item] {
         var out: [Item] = []
+        if sessionActive, let remaining = present(remaining) {
+            out.append(Item(title: remainingLine(remaining), kind: .info))
+        }
         if let held = SleepHeldLine.line(sessionActive: sessionActive, sleepHeld: sleepHeld) {
             out.append(Item(title: held.text, kind: held.isWarning ? .warning : .info))
         }
@@ -109,6 +127,9 @@ enum StatusMenu {
         if !out.isEmpty {
             out.append(Item(title: "", kind: .separator))
         }
+        if sessionActive {
+            out.append(Item(title: endSessionTitle, kind: .endSession))
+        }
         out.append(Item(title: settingsTitle, kind: .settings))
         out.append(Item(title: quitTitle, kind: .quit))
         return out
@@ -121,11 +142,12 @@ enum StatusMenu {
 
     /// Build the AppKit menu. Status lines are disabled small text; warnings
     /// are orange. `autoenablesItems` is off so the disabled lines stay
-    /// disabled and the two actions stay live without validation.
+    /// disabled and the actions stay live without validation.
     @MainActor
     static func menu(
         _ items: [Item],
         target: AnyObject?,
+        endSession: Selector,
         settings: Selector,
         quit: Selector,
         relaunchBrowser: Selector,
@@ -149,6 +171,8 @@ enum StatusMenu {
                 }
                 entry.attributedTitle = NSAttributedString(string: item.title, attributes: attributes)
                 menu.addItem(entry)
+            case .endSession:
+                menu.addItem(action(title: item.title, selector: endSession, key: "", target: target))
             case .settings:
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))
             case .quit:
