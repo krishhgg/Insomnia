@@ -13,6 +13,16 @@ starts right away. **The timer keeps counting down while the lid is
 closed**; only its on-screen redraw pauses, also for a session started with
 the lid already closed.
 
+A MacBook used closed on an external display is in use at a desk, so
+Insomnia does not act on that lid: the countdown keeps running and nothing
+is paused, muted or darkened. Unplug the display and the lid actions run
+then, apart from the darkening, which macOS already does under that lid;
+plug it in again and they are undone. A lid that closed in a bag stays
+closed for Insomnia when you plug in a display, until you open it. If macOS
+cannot list the displays when the lid closes, Insomnia does not act on the
+lid yet: it checks the list again every 2 seconds and decides once it can tell
+whether a display is connected.
+
 ## Display and keyboard backlight
 
 The display step exists because the sleep guard stops macOS from doing it:
@@ -45,6 +55,27 @@ panel under the closing lid by then, and Low Power Mode rescales it), and if
 Insomnia's own Low Power Mode was on while the lid was closed the value is
 written once more when the mode ends. If Insomnia is not running when you open
 the lid, press the brightness-up key.
+
+## Lock the screen
+
+"Lock the screen" in Settings, under When the lid closes, locks the screen when
+the lid closes during a session, so opening the lid asks for your login
+password. It is off by default, and a config.json from an earlier build keeps
+it off. The Mac stays awake and apps keep running, but agents that work
+through the screen, such as computer use, wait until you sign in: while the
+screen is locked, screenshots come back black and posted clicks and keypresses
+reach no app. Browser automation over the Chrome DevTools Protocol keeps
+working. Off, the Mac stays signed in with the lid closed. A lid closed on an
+external display counts as open (see above), so it does not lock; unplugging
+the display runs the lid actions, the lock with them, and plugging it in again
+does not unlock.
+
+The lock calls `SACLockScreenImmediate` in Apple's private login framework,
+the call behind Ctrl+Cmd+Q. A private API can change or disappear with a macOS
+update. If the call cannot be loaded or returns an error, Insomnia logs it and
+shows a line in the menu, and the rest of the lid close still runs. The lock is
+not journaled and has no undo: opening the lid does not unlock anything, you
+sign in.
 
 ## Defaults
 
@@ -100,7 +131,10 @@ The defaults are worth knowing:
   read. One failed read is tolerated, and the level is re-read every 30 s
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
-  session. These rules require the app to be running.
+  session. When one of these rules, or the timer, ends a session with the
+  lid closed, Insomnia also puts the Mac to sleep, unless macOS keeps it
+  awake closed (an external display in clamshell mode). These rules require
+  the app to be running.
   Setting the end floor to Never turns the battery end off. Otherwise the
   end floor stays below the Low Power Mode floor. The Settings menus move the
   other floor when the two would cross, and a hand-edited `config.json` with

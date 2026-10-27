@@ -238,6 +238,8 @@ below cover what only a real Mac shows.
 - App Nap opt-in: previous `NSAppSleepDisabled` put back at session end, by the backstop after a force-quit, and by uninstall
 - App Nap on macOS 27, where `defaults read` of a missing key prints "Could not find key 'NSAppSleepDisabled' in domain '<id>'." or "Domain '<id>' not found.": an `appNapOverrides` entry whose key is already gone (deleted by hand after a force-quit) is cleared by the agent with "the key is already absent" and the run exits 0, and uninstall counts agent apps without the key as checked, not unreadable; with a sandboxed agent app on the list (one with `~/Library/Containers/<id>`), its container's preferences have no `NSAppSleepDisabled` left after the agent clears its entry
 - Battery/thermal event behavior on supported hardware
+- A timer or floor-rule end with the lid closed puts the Mac to sleep (trigger it with a short timer and with the battery end floor, never by heating the Mac; with an external display in clamshell mode it stays awake; closed at a desk with the display then unplugged, it sleeps about 2 s after the end; a display unplugged and plugged back in within 1 s as the timer ends keeps it awake)
+- The same end with its `disablesleep 0` left running, as in the next item: open the lid for more than 2 s and close it again before the command exits. The log shows "lid opened, so the sleep owed for the closed lid is no longer requested", and no "sleep requested" line follows once the command exits
 - A `sudo pmset` that ignores SIGTERM: left running, lock held, journal intact, quit refused until it exits
 - The same command with the app force-quit: the backstop does not take the lock until the command exits; the relaunch names the pid from `unfinished-command.json`, and at its next retry after the command exits (retries start 30 s after each refusal) resumes the session with its battery floors
 - A left-running `disablesleep 0` that exits 0: the end finishes without running it again
@@ -270,6 +272,7 @@ below cover what only a real Mac shows.
 ### Lid close
 
 - Lid-close/open and safe recovery of explicitly selected test processes
+- Lock the screen on: a real lid close during a session locks the login session (the open asks for the password), the Mac stays awake (no Sleep in `pmset -g log` between close and open) and insomnia.log says "screen locked on lid close"; with the setting off nothing locks
 - Freeze-all scope with agents running (Cursor/T3 Code/Claude untouched)
 - Freeze-all off on a fresh config.json (list only) and on with a terminal, a non-Chrome browser and a JetBrains IDE open (all untouched)
 - Real lid close with freeze-all on during a Zoom or Teams call on AirPods, with Wispr Flow or Granola taking notes: none of their processes stopped (`ps -o stat` shows no `T`), the call and the notes continue, other Dock apps frozen, sound muted
@@ -279,6 +282,7 @@ below cover what only a real Mac shows.
 - Backstop and uninstall over saved audio of an output device renamed to `Headset \u0041` (a Bluetooth headset renamed in Bluetooth settings, the lid closed on it with muting on, then the app quit with `kill -9` and the session left to expire): the backstop log has no "malformed" and shows "pmset -a disablesleep 0 ok", state.json keeps the headset's entry, and the next launch with the headset connected restores its volume and mute
 - Lid close with a freeze-list app stopped beforehand by `kill -STOP` (left stopped on lid open, not in the journal)
 - Lid close during a session after `chflags uchg` on state.json (mode 0444 is not enough: the app writes a new file and renames it over state.json, and rename needs write access only to the folder): no process stopped, every app logged as left running; `chflags nouchg` before lid open
+- Closed-display mode: with an external display, start a session with the lid closed (the countdown changes every second, no "low power mode on (lid closed)"), then open and close the lid (no lid actions, the countdown keeps running); let the display sleep and wake (no lid actions); unplug the display with the lid closed (the lid actions run without the display and keyboard darkening, "lid closed" in insomnia.log, the Mac stays awake), plug it in again (every lid action undone, the countdown runs); then close the lid with no display attached and plug one in (nothing undone, the lid still counts as closed), open the lid (every lid action undone)
 - Simulated lid close/open via scripts/simulate-lid.sh on a build installed with `INSOMNIA_LID_SIMULATION=1 ./scripts/install.sh` (the launch log, status menu and Settings show "Lid simulation build")
 - A normal install (no `INSOMNIA_LID_SIMULATION`) ignores scripts/simulate-lid.sh during a session: no log line, no lid actions, trigger file left in place; no "Lid simulation build" marker anywhere
 - Docker Desktop idle/busy behavior with another Docker context selected

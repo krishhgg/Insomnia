@@ -131,6 +131,8 @@ file and explains how upgrades replace them.
    `Info.plist` first.
 
 You don't have to close the lid, and opening it doesn't end the session.
+When the timer or a battery or heat rule ends a session with the lid closed,
+Insomnia puts the Mac to sleep.
 
 On battery power, Insomnia turns on Low Power Mode below 40% and ends the
 session below 10%. Those are the defaults. You can change both in Settings,
@@ -159,6 +161,13 @@ to undo them. The timer keeps counting down while the lid is closed.
   keep running or to freeze, and "All other apps" keeps running by default.
   Set to freeze, it still skips meeting, recording and dictation apps: Zoom,
   Teams, Webex, FaceTime, Wispr Flow, Granola, Otter, OBS and Loom.
+- **The screen can lock.** Off by default. With "Lock the screen" on in
+  Settings, closing the lid locks the screen and opening it asks for your
+  login password. Apps, command-line agents and browser automation keep
+  running, but agents that work through the screen, such as computer use, wait
+  until you sign in. Off, the Mac stays signed in with the lid closed. A lid
+  closed on an external display locks only once the display is unplugged. It
+  uses a private macOS call, so the menu shows a line if it fails.
 - **Audio is muted.** Lid open unmutes each output Insomnia muted, even if you
   switched to another one.
 - **Low Power Mode turns on.** It turns off when the lid opens, unless a

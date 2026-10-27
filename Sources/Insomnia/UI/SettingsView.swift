@@ -58,6 +58,10 @@ struct SettingsView: View {
                     Button("Dismiss") { manager.dismissLidCloseNotice() }
                 }
             }
+            Toggle(isOn: manager.binding(\.lockScreenOnLidClose)) {
+                Text("Lock the screen")
+                Text("On: closing the lid during a session locks the screen, and opening it asks for your login password. Command-line agents and browser automation keep running; agents that work through the screen, such as computer use, wait until you sign in. Off: the Mac stays signed in with the lid closed. A lid closed on an external display does not lock until the display is unplugged.")
+            }
             Toggle(
                 "Turn off the display and keyboard backlight",
                 isOn: manager.binding(\.darkenDisplayOnLidClose))

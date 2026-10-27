@@ -268,6 +268,18 @@ with `scripts/install.sh`. Comet 154.0.8037.179, Google Chrome 154.0.8037.98.
   freeze list (FreezerTests covers the protected list), and page timers in
   Comet with the lid closed.
 
+## October 11, 2026 screen lock on lid close (MacBook Air, Apple M4)
+
+Machine: MacBook Air, Apple M4, macOS 27.0.1. Build: the lock-screen branch
+at `2fb7508`, with "Lock the screen" on.
+
+- insomnia.log has "lid closed" and "screen locked on lid close" in the same
+  second; `CGSSessionScreenIsLocked` read Yes about one second later.
+- The lid stayed closed for 2 min 44 s. A 2 s heartbeat had no gap over 3 s,
+  `pmset -g log` shows no Sleep or DarkWake in that window, and the network
+  answered throughout. Opening the lid asked for the password.
+- Not exercised: the same check with the setting off on this build.
+
 ## October 12, 2026 Settings window (MacBook Pro, Apple M2 Max)
 
 Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0 (26A428).

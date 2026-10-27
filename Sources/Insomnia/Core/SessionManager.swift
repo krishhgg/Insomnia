@@ -19,6 +19,15 @@ enum EndReason: String, Sendable {
     /// may still have been applied, so the start is undone from the journal
     /// like an end rather than rolled back from memory.
     case startFailed
+
+    /// The timer and floor-rule ends. With the lid closed they also ask
+    /// macOS to sleep (`SessionManager.sleepClosedLidIfOwed`).
+    var sleepsAClosedLid: Bool {
+        switch self {
+        case .timer, .thermalCritical, .batteryFloor, .batteryUnreadable: true
+        case .user, .quit, .backstop, .recoveryUnavailable, .startFailed: false
+        }
+    }
 }
 
 /// What `end` achieved. Callers that are about to quit need to know whether
@@ -375,6 +384,25 @@ final class SessionManager {
     private let appNap: any AppNapPreferencing
     private let notifier: any Notifying
     private let clamshell: @Sendable () -> Bool?
+    private let closedLidSleep: any ClosedLidSleeping
+    /// Runs only while a closed lid's sleep is owed, so that an open in
+    /// that time drops it (`oweClosedLidSleep`).
+    private let closedLidWatcher: any LidWatching
+    /// The lid is closed at a desk (`LidReading.closedAtDesk`). A closed
+    /// lid whose display list cannot be read is not, so a session that
+    /// becomes active under it takes it as closed, as in a bag: the
+    /// countdown redraw stops and the lid is a Low Power Mode cause, but
+    /// nothing is muted, frozen, darkened or locked, since only a lid close
+    /// event runs those.
+    private let lidAtDesk: @Sendable () -> Bool
+    /// A display other than the built-in panel is online; nil when the
+    /// display list cannot be read (`LidObserver.readExternalDisplay`).
+    private let externalDisplay: @Sendable () -> Bool?
+    /// How long the displays must stay without an external one before a
+    /// closed lid's owed sleep is asked: the lid observer's debounce.
+    private let closedLidSleepConfirmDelay: TimeInterval
+    /// Where `LidObserver.displaysChanged` is posted.
+    private let displayNotifications: NotificationCenter
     private let clock: @Sendable () -> Date
     /// What the process table says a pid is now. Read only, to tell whether
     /// a recorded command is still running (`recordedLockHolder`).
@@ -446,6 +474,23 @@ final class SessionManager {
     /// across sessions: it is the displays' state, not the session's. The
     /// status item watches it to stop its own tick for a pending start.
     private(set) var displaysAsleep = false
+    /// Set by a timer or floor-rule end of a session, and by the launch
+    /// reconcile of a session whose timer ran out. Cleared once the sleep
+    /// is asked, the lid opens or is closed at a desk when it is asked, a start
+    /// begins, or macOS has refused it or the display list could not be read
+    /// `closedLidSleepRefusalLimit` times in all (`dropClosedLidSleep`). Only this process asks, so a quit waits
+    /// while it is set.
+    @ObservationIgnored private(set) var closedLidSleepOwed = false
+    @ObservationIgnored private var closedLidSleepRetry: Timer?
+    /// Counts the asks scheduled. The ask a fired timer queues for the main
+    /// actor runs only if no later ask has replaced it since.
+    @ObservationIgnored private var closedLidSleepAsks = 0
+    /// Watches the displays while no external display is being confirmed
+    /// before the owed sleep is asked.
+    @ObservationIgnored private var closedLidSleepDisplayWatch: NSObjectProtocol?
+    /// How many times macOS has refused the sleep owed now, or the display
+    /// list could not be read when it was to be asked.
+    @ObservationIgnored private var closedLidSleepRefusals = 0
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -454,8 +499,13 @@ final class SessionManager {
     /// reads then: the lid observer reports changes only, so a session that
     /// starts under a closed lid gets no close call to pause it, and one
     /// that starts after an end with the lid shut must not inherit that
-    /// session's pause. Every end clears it.
+    /// session's pause. A lid closed at a desk (`LidReading.closedAtDesk`)
+    /// reads open then, and one whose display list cannot be read closed.
+    /// Every end clears it.
     @ObservationIgnored private var countdownPaused = false
+    /// Whether the session takes the lid as closed: set when it becomes
+    /// active and by each lid event since. The lid observer starts from it.
+    var lidTakenAsClosed: Bool { countdownPaused }
 
     /// Counts end requests. Start, extend and Low Power changes capture it
     /// when requested and compare after each await, so an end that arrived
@@ -468,6 +518,8 @@ final class SessionManager {
     @ObservationIgnored private(set) var pendingEnd: EndReason?
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
+    /// Lifecycle operations queued or running.
+    @ObservationIgnored private var lifecycleOperations = 0
     /// Detail of the last unreadable-journal notification, so a journal
     /// that stays broken is announced once, not on every transaction.
     @ObservationIgnored private var announcedCorruption: String?
@@ -546,10 +598,16 @@ final class SessionManager {
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
+        closedLidSleep: any ClosedLidSleeping = NoopClosedLidSleep(),
+        closedLidWatcher: any LidWatching = NoopLidWatcher(),
+        lidAtDesk: @escaping @Sendable () -> Bool = { LidObserver.readLid() == .closedAtDesk },
+        externalDisplay: @escaping @Sendable () -> Bool? = { LidObserver.readExternalDisplay() },
         clock: @escaping @Sendable () -> Date = { Date() },
         processLookup: @escaping @Sendable (Int32) -> ProcessLookup = { SignalProcessControl.processTableState(pid: $0) },
         recoveryLockTimeout: TimeInterval = 10,
         recoveryRetryDelay: TimeInterval = 30,
+        closedLidSleepConfirmDelay: TimeInterval = LidObserver.debounce,
+        displayNotifications: NotificationCenter = .default,
         reassertDelay: Duration = .seconds(2),
         keptRecheckDelay: Duration = .seconds(3),
         keptRecheckAttempts: Int = 20,
@@ -567,11 +625,17 @@ final class SessionManager {
         self.appNap = appNap
         self.notifier = notifier
         self.clamshell = clamshell
+        self.closedLidSleep = closedLidSleep
+        self.closedLidWatcher = closedLidWatcher
+        self.lidAtDesk = lidAtDesk
+        self.externalDisplay = externalDisplay
         self.clock = clock
         self.processLookup = processLookup
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
         self.recoveryLockTimeout = recoveryLockTimeout
         self.recoveryRetryDelay = recoveryRetryDelay
+        self.closedLidSleepConfirmDelay = closedLidSleepConfirmDelay
+        self.displayNotifications = displayNotifications
         self.reassertDelay = reassertDelay
         self.keptRecheckDelay = keptRecheckDelay
         self.keptRecheckAttempts = keptRecheckAttempts
@@ -647,7 +711,9 @@ final class SessionManager {
             display: display,
             keyboard: keyboard,
             appNap: CFAppNapPreferences(),
-            notifier: notifier
+            notifier: notifier,
+            closedLidSleep: IOKitClosedLidSleep(),
+            closedLidWatcher: LidObserver()
         )
         let services = AppServices(
             paths: paths,
@@ -702,6 +768,8 @@ final class SessionManager {
     }
 
     private func exclusive<T: Sendable>(_ what: String, owes deferred: Deferred? = nil, _ op: @escaping @MainActor @Sendable () async -> T) async -> Result<T, TransactionRefusal> {
+        lifecycleOperations += 1
+        defer { lifecycleOperations -= 1 }
         let previous = lifecycleTail
         let task = Task<Result<T, TransactionRefusal>, Never> { @MainActor in
             await previous?.value
@@ -1216,6 +1284,8 @@ final class SessionManager {
             fail(Self.endPendingRefusal)
             return false
         }
+        // The person wants the Mac awake now.
+        dropClosedLidSleep()
         let now = clock()
         let new = SessionMath.newSession(now: now, duration: duration, maxDuration: config.maxDuration)
         // What was on disk before this attempt, read under the lock. A
@@ -1283,7 +1353,9 @@ final class SessionManager {
 
         session = new
         lastError = nil
-        countdownPaused = clamshell() == true
+        // A lid closed at a desk counts as open: the countdown is on the
+        // external display, and nothing has been done for a close.
+        countdownPaused = clamshell() == true && !lidAtDesk()
         foreignSleepWarning = nil
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
@@ -1351,6 +1423,11 @@ final class SessionManager {
     func end(reason: EndReason) async -> EndOutcome {
         endTicket += 1
         if reason == .quit { quitRequested = true }
+        // Only an end that finds the session owes the sleep. A retry of an
+        // end that has already run (session.json kept in place, a restore
+        // left to this process) finds none, so the sleep that end owed is
+        // asked once, not again on every retry.
+        if reason.sleepsAClosedLid, session != nil { oweClosedLidSleep() }
         retryTimer?.invalidate()
         retryTimer = nil
         let outcome: EndOutcome
@@ -1386,7 +1463,179 @@ final class SessionManager {
             // are refused and quit is deferred until then.
             break
         }
+        switch outcome {
+        case .restored, .incomplete, .sessionRetained: sleepClosedLidIfOwed()
+        // Nothing was undone yet. The end that runs later asks.
+        case .locked, .journalUnreadable, .privilegedCommandRunning: break
+        }
+        // The app stays to ask, so starts are no longer refused for the quit.
+        if reason == .quit, closedLidSleepOwed { quitRequested = false }
         return outcome
+    }
+
+    /// Whether a quit may go ahead after its end returned `outcome`
+    /// (`AppDelegate.applicationShouldTerminate`): the end lets it go
+    /// (`EndOutcome.letsQuitGo`) and no closed lid's sleep is owed, since
+    /// only this process asks for it.
+    func letsQuitGo(after outcome: EndOutcome) -> Bool {
+        outcome.letsQuitGo && !closedLidSleepOwed
+    }
+
+    /// How many refusals end the owed sleep. Asked every 30 s, 10 is at most
+    /// about 5 minutes, while the recovery agent tries to restore sleep
+    /// every 60 s after a failed `disablesleep 0`. A quit or an end's retry
+    /// asks too, and its refusal counts the same, so the bound can come
+    /// sooner. A display list that cannot be read counts as a refusal. An
+    /// ask postponed for a lifecycle operation, a live `sudo pmset` or the
+    /// display check's confirmation is not a refusal. Still refused by then, sleep is not
+    /// coming back (the sudoers rule is gone, say), and owing it would hold
+    /// every quit, a restart's included.
+    static let closedLidSleepRefusalLimit = 10
+
+    private func oweClosedLidSleep() {
+        guard !closedLidSleepOwed else { return }
+        closedLidSleepOwed = true
+        closedLidSleepRefusals = 0
+        // The session's lid observer stops with the end, and an ask is
+        // repeated only every `recoveryRetryDelay`. Unwatched, a lid opened
+        // and closed again between two asks, or while the end waits for a
+        // command left running, would go unseen, and the next ask would
+        // put the Mac to sleep. The watcher starts from the lid as it is
+        // now; a lid already open is left to the ask's own check. A lid
+        // closed at a desk starts as closed: macOS keeps such a Mac awake,
+        // so the ask declines it, and the watcher still sees it open.
+        closedLidWatcher.onChange = { [weak self] closed in
+            if !closed { self?.lidOpenedWhileClosedLidSleepOwed() }
+        }
+        closedLidWatcher.start(closed: true)
+    }
+
+    /// Stops owing the sleep: asked, given up, or no longer wanted. No ask
+    /// stays scheduled and the lid is no longer watched.
+    private func dropClosedLidSleep() {
+        closedLidSleepOwed = false
+        closedLidSleepRetry?.invalidate()
+        closedLidSleepRetry = nil
+        stopWatchingDisplaysForClosedLidSleep()
+        closedLidWatcher.stop()
+        closedLidWatcher.onChange = nil
+    }
+
+    /// The person is at the Mac, so the owed sleep is dropped and stays
+    /// dropped if the lid closes again (spec section 6). macOS asks for
+    /// that close's sleep itself; sleep still disabled by a failed restore
+    /// refuses it, as after any end that owes nothing.
+    private func lidOpenedWhileClosedLidSleepOwed() {
+        guard closedLidSleepOwed else { return }
+        Log.info("lid opened, so the sleep owed for the closed lid is no longer requested")
+        dropClosedLidSleep()
+    }
+
+    /// macOS asks for a closed lid's sleep once, at the close, and the sleep
+    /// guard refuses it. Turning the guard off does not make macOS ask
+    /// again, so a timer or floor-rule end asks here (spec section 6).
+    /// macOS refuses while sleep is still disabled, as after a failed
+    /// `disablesleep 0` that the recovery agent retries, so a refusal asks
+    /// again later, up to `closedLidSleepRefusalLimit` refusals.
+    private func sleepClosedLidIfOwed(retrying: Bool = false, confirming: Bool = false) {
+        closedLidSleepRetry?.invalidate()
+        closedLidSleepRetry = nil
+        stopWatchingDisplaysForClosedLidSleep()
+        guard closedLidSleepOwed, session == nil else { return }
+        // Never in the middle of a start, an end or a `sudo pmset` left
+        // running. Its record is cleared only once the lock it holds is
+        // released and the end it held up has begun (`holdLock`), so a
+        // retry that fires just after the command exits waits for that end.
+        guard lifecycleOperations == 0, unfinishedCommand == nil else {
+            return askForClosedLidSleepLater(retrying: retrying)
+        }
+        guard clamshell() == true else {
+            Log.info("session end: the lid is open, so no sleep is requested")
+            dropClosedLidSleep()
+            return
+        }
+        // A lid closed at a desk keeps the Mac awake on its external
+        // display, as macOS does. `AppleClamshellCausesSleep` is not read:
+        // it stays false after that display is unplugged with the lid
+        // still closed (spec section 3), and that Mac has to sleep. A
+        // display list that cannot be read is not taken as no display, and
+        // no display has to stay so for the lid observer's debounce with no
+        // display change in between, read again before the ask, so that a
+        // display that drops out for a moment, once or again and again,
+        // does not put a Mac in use at a desk to sleep.
+        switch externalDisplay() {
+        case true?:
+            Log.info("session end: the lid is closed at a desk, so no sleep is requested")
+            dropClosedLidSleep()
+            return
+        case nil:
+            closedLidSleepRefusals += 1
+            if closedLidSleepRefusals >= Self.closedLidSleepRefusalLimit {
+                dropClosedLidSleep()
+                Log.error("session end with the lid closed: no sleep requested after \(closedLidSleepRefusals) refusals or unreadable display lists, so Insomnia stops asking and a quit no longer waits for it")
+                return
+            }
+            Log.error("session end with the lid closed: the display list could not be read (\(closedLidSleepRefusals) of \(Self.closedLidSleepRefusalLimit)), so whether the lid is closed at a desk is unknown; asking again in \(Int(recoveryRetryDelay)) s")
+            return askForClosedLidSleepLater(retrying: true)
+        case false?:
+            if !confirming, closedLidSleepConfirmDelay > 0 {
+                watchDisplaysForClosedLidSleep()
+                return askForClosedLidSleepLater(after: closedLidSleepConfirmDelay, retrying: retrying, confirming: true)
+            }
+        }
+        do {
+            try closedLidSleep.requestSleep()
+            dropClosedLidSleep()
+            Log.info("session end with the lid closed: sleep requested")
+        } catch {
+            closedLidSleepRefusals += 1
+            if closedLidSleepRefusals >= Self.closedLidSleepRefusalLimit {
+                dropClosedLidSleep()
+                Log.error("session end with the lid closed: sleep request refused \(closedLidSleepRefusals) times, so Insomnia stops asking and a quit no longer waits for it: \(error.localizedDescription)")
+                return
+            }
+            if !retrying {
+                Log.error("session end with the lid closed: sleep request refused (\(closedLidSleepRefusals) of \(Self.closedLidSleepRefusalLimit)), asking again every \(Int(recoveryRetryDelay)) s: \(error.localizedDescription)")
+            }
+            askForClosedLidSleepLater(retrying: true)
+        }
+    }
+
+    /// A display change while no external display is being confirmed
+    /// starts the check over: a display back drops the sleep, and none
+    /// starts a new wait.
+    private func watchDisplaysForClosedLidSleep() {
+        closedLidSleepDisplayWatch = displayNotifications.addObserver(forName: LidObserver.displaysChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.closedLidSleepDisplayWatch != nil else { return }
+                Log.info("session end with the lid closed: the displays changed before sleep was asked, so the display check starts over")
+                self.sleepClosedLidIfOwed()
+            }
+        }
+    }
+
+    private func stopWatchingDisplaysForClosedLidSleep() {
+        if let closedLidSleepDisplayWatch {
+            displayNotifications.removeObserver(closedLidSleepDisplayWatch)
+        }
+        closedLidSleepDisplayWatch = nil
+    }
+
+    /// Asks again after `recoveryRetryDelay`, or after `delay` for the
+    /// display check's confirmation.
+    private func askForClosedLidSleepLater(after delay: TimeInterval? = nil, retrying: Bool, confirming: Bool = false) {
+        closedLidSleepAsks += 1
+        let ask = closedLidSleepAsks
+        let timer = Timer(timeInterval: delay ?? recoveryRetryDelay, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                // A display change that came in after the timer fired, and
+                // before this ran, started the check over with a new ask.
+                guard let self, self.closedLidSleepAsks == ask else { return }
+                self.sleepClosedLidIfOwed(retrying: retrying, confirming: confirming)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        closedLidSleepRetry = timer
     }
 
     private func performEnd(reason: EndReason) async -> EndOutcome {
@@ -2553,6 +2802,8 @@ final class SessionManager {
             // No session: the journal held no claim, or an end restores it.
             if session == nil { earlierCommandCheckOwed = false }
             await settleEarlierCommand()
+            // An expired session's end owes the sleep; the lock is free now.
+            sleepClosedLidIfOwed()
         case .success(false):
             break
         case .failure:
@@ -2696,7 +2947,9 @@ final class SessionManager {
             } else if state.hasLidActions {
                 Log.info("reconcile: lid \(lidClosed == nil ? "unknown" : "closed"), keeping lid-close actions")
             }
-            countdownPaused = lidClosed == true
+            // A lid closed at a desk counts as open, unless the lid-close
+            // actions kept above show the lid closed for this session.
+            countdownPaused = lidClosed == true && (!lidAtDesk() || state.hasLidActions)
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
             services?.start(for: self)
@@ -2714,6 +2967,11 @@ final class SessionManager {
         let owesEnd = keptSessionFile != nil ? state.isDirty : state.isDirty(leavingOutAudioOf: savedOutputs)
         if onDisk != nil {
             Log.info("reconcile: session expired, restoring")
+            // The timer ran out while the app was not running. Its end owes
+            // the sleep as in `end`, asked once the lock is free
+            // (`reconcile(ticket:isRetry:)`, or the end its command's exit
+            // runs again).
+            oweClosedLidSleep()
             if case .privilegedCommandRunning = await performEnd(reason: .timer) { return }
         } else if owesEnd {
             Log.info(keptSessionFile != nil

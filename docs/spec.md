@@ -153,9 +153,46 @@ recovery; newly written journals use `frozenProcesses`.
 
 - IOKit interest notification on `IOPMrootDomain` for `AppleClamshellState`.
   Insomnia sleeps in its run loop; the kernel wakes it on change. Zero cost
-  between events.
+  between events, with one exception: a closed lid whose display list
+  cannot be read (below).
 - 2-second debounce to ignore flapping.
 - Lid close and open each run a fixed, reversible action list (below).
+- A closed lid with an external display connected (closed-display mode:
+  an online display that is neither built in nor of vendor
+  `kDisplayVendorIDUnknown`) keeps the state delivered before it. Closed
+  at a desk, the lid stays open: no lid actions, the countdown keeps
+  running and the lid is no Low Power Mode cause. Unplugging the last
+  external display then delivers the close, and plugging one in again the
+  open, unless a saved display or keyboard brightness waits for the lid to
+  open. Closed in a bag, the lid stays closed when a display is plugged
+  in, until it opens, so the built-in panel and keyboard are only lit
+  again once they are uncovered.
+- A closed lid whose display list cannot be read (`CGGetOnlineDisplayList`
+  fails) may be at a desk or in a bag, so it is neither a close nor an
+  open: the lid keeps the state delivered before it, and the observer
+  drops a change waiting out the debounce. The observer then reads the lid
+  again every 2 s, with no event needed, until the list reads or the lid
+  opens, and the rules above take that reading: with no display, the close
+  comes one debounce later. A read that finds no lid at all changes
+  nothing either, and the reads go on. This read is the only thing the
+  observer runs between events, and it stops with the observer. An
+  unreadable read does not replace the reading before it, so a lid closed
+  at a desk whose display then goes away is still a display loss. A
+  session that starts under such a lid, or that the app finds still
+  running at launch, takes it as closed, as it takes a lid in a bag: the
+  countdown redraw stops and the lid is a Low Power Mode cause, but
+  Insomnia mutes, freezes, darkens and locks nothing for it.
+- A close darkens the display and keyboard backlight only while the
+  built-in display is online. Under a lid closed at a desk, and after its
+  external display is unplugged, it is offline and macOS keeps both dark,
+  so the close leaves them alone, a close replayed after a power command
+  included.
+  `NSApplication.didChangeScreenParametersNotification` reads the lid
+  again when displays come and go. A display asleep stays online. With the
+  lid closed and nothing plugged in, macOS keeps a stand-in display online
+  (vendor `unkn`, model `virt`), which does not count. The kernel's
+  `AppleClamshellCausesSleep` is no substitute: on Apple Silicon it is set
+  at lid changes only, and stays No after the display is unplugged.
 - Lid events do nothing when no session is active.
 - Each lid event is numbered as it arrives, before its actions queue behind
   earlier ones. An open makes every earlier close stale. A close still
@@ -171,6 +208,7 @@ Quit, or reconcile.
 
 | action | on close | on open |
 |---|---|---|
+| Screen lock (optional, default off) | lock the login session first, before any other action, with `SACLockScreenImmediate` (a private login.framework call); not journaled; a failure shows in the menu and the other actions still run | nothing: the login password unlocks it |
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
@@ -391,7 +429,8 @@ retry, unless a newer failure has taken its place.
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
 reports changes only, so no close event arrives for it. The next lid open
-restarts the redraw.
+restarts the redraw. A lid closed at a desk reads open then, unless
+reconcile keeps lid-close actions from a close in that session.
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from
@@ -643,10 +682,10 @@ IOKit sends no event for a read that keeps failing.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
-| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify, sleep a closed lid | — |
+| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify, sleep a closed lid | — |
 | thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
-| thermal state `critical` | end session, notify | — |
+| thermal state `critical` | end session, notify, sleep a closed lid | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
 
 `PowerMonitor` tells a machine with no internal battery (desktop: no floor
@@ -677,6 +716,48 @@ causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
 Battery and thermal rules run only while the app is alive; they are not
 provided by the standalone backstop. Performance effects depend on workload.
+
+"Sleep a closed lid": macOS asks for a closed lid's sleep once, at the close,
+and the sleep guard refuses it. `disablesleep 0` only clears the kernel's flag
+(`kPowerEventUserDisabledSleep` in xnu's `IOPMrootDomain.cpp`) and does not
+look at the lid again. So these ends and the timer end owe a sleep, as does
+a launch reconcile that finds session.json expired (section 8: the app
+relaunched before the recovery agent's next run removed it), and Insomnia
+calls `IOPMSleepSystem` (no root needed) if
+`AppleClamshellState` is true and the lid is not closed at a desk (section 3:
+no external display online). It does not read `AppleClamshellCausesSleep`,
+which stays false after the display at a desk is unplugged with the lid
+still closed, when the Mac has to sleep. No external display has to hold
+for the 2 s debounce with no display change in between: a change starts the
+wait over (a display back drops the sleep), the display list is read again
+at its end, and the request goes ahead only if it still shows none, so a
+display that drops out for a moment, even again and again, does not put a
+Mac at a desk to sleep. A display list that cannot be
+read (`CGGetOnlineDisplayList` fails) is not taken as no display: the request
+waits 30 s and reads it again, and each such failure counts as a refusal
+below. It asks
+after an end, and only with no session, no lifecycle operation queued or
+running, and no `sudo pmset` left running. An end owes the sleep only when it
+finds the session, so the retry of an end that has run (session.json kept in
+place, a restore left to the app) owes nothing new, and the sleep is asked
+once. macOS refuses while sleep is still disabled, as after a failed
+`disablesleep 0` that the recovery agent retries, so a refused or postponed
+request is asked again every 30 s. The owed sleep is dropped once it is asked,
+when the lid is open or closed at a desk at the request, when a start begins,
+or after 10 refusals and unreadable display lists in all: sleep is then not
+coming back, as when the sudoers rule is gone. From the end that owes the sleep until it is
+dropped, the app also watches the lid as in section 3, apart from the
+session's own observer, which stops with the end. An open that holds for
+the 2 s debounce drops the sleep, between two requests or while the end
+waits for a `sudo pmset` left running; a lid already open at the end is
+left to the request's own check. Closing the lid again does not bring
+it back: macOS asks for that close's sleep itself, and sleep still disabled
+by a failed restore refuses it, as after an end that owes nothing. Asked
+every 30 s, that is at most about 5 minutes, while the agent tries to
+restore sleep every 60 s; a quit or an end's retry asks too and its refusal
+counts, while a postponed request does not. Only the app asks, so a quit
+waits while a sleep is owed, at most until those refusals end it. Other
+ends owe nothing.
 
 ### 7. Network failover
 
@@ -811,6 +892,11 @@ Reconcile runs at every Insomnia launch:
 1. Session file missing or expired → restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, saved audio, and
    recorded App Nap values.
+   A session file that decodes and has expired also owes a closed lid's
+   sleep (section 6). It is asked once the lock is free: after the
+   reconcile, or by the end that runs again when a `sudo pmset` left running
+   exits. A missing file owes none, and neither does one that does not
+   decode or cannot be read, whose end time is unknown.
    Unverified entries and failed restoration remain unresolved, not successful.
    A session file that does not decode counts as expired: it is renamed under
    the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
@@ -1298,7 +1384,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 
 | input | mechanism | cost between events |
 |---|---|---|
-| lid | IOKit interest notification | none |
+| lid | IOKit interest notification | none, except one read every 2 s while the lid is closed and the display list cannot be read |
 | battery % | IOPS run loop source | none |
 | battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
