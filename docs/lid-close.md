@@ -105,6 +105,11 @@ The defaults are worth knowing:
   other floor when the two would cross, and a hand-edited `config.json` with
   the floors out of order is corrected at launch, and logged, by raising the
   Low Power Mode floor.
+- **Heat:** Low Power Mode turned on for a serious thermal state stays on
+  until the state is back to nominal, or until the session ends if it stays
+  at fair. Switched off at fair, it would bring back the load that made the
+  Mac serious, and go on and off as the Mac heats up again. During a
+  session, a floor or the thermal rules changed in Settings apply at once.
 
 ## Upgrading from an earlier build
 

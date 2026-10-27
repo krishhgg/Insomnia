@@ -199,9 +199,9 @@ struct SettingsView: View {
             Text(Self.microphoneNote)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            // A floor input: the manager applies a change at once
+            // (`SessionManager.floorInputsChanged`).
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
-                // A floor input: apply it now if the lid is already closed.
-                .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
         } header: {
             Text("Lid-close actions")
         } footer: {
@@ -252,6 +252,9 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
+            Text("Low Power Mode turned on for heat stays on until the thermal state is back to nominal.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
