@@ -95,7 +95,9 @@ enum TransactionRefusal: Error, Sendable {
 final class SessionManager {
     private(set) var session: Session?
     private(set) var state: RuntimeState
-    var config: Config
+    var config: Config {
+        didSet { services?.hotspotUsage.configure(config: config, sessionActive: isActive) }
+    }
     /// Minute-granularity remaining time for the popover ("2h 14m").
     private(set) var remainingText: String = ""
     /// Live `H:MM:SS` countdown for the status item, updated at 1 Hz.
@@ -653,6 +655,7 @@ final class SessionManager {
             keyboard: keyboard
         )
         m.services = services
+        services.hotspotUsage.configure(config: m.config, sessionActive: false)
         services.logStartupSnapshot()
         return m
     }

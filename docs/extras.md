@@ -86,6 +86,27 @@ app will keep working while the lid is closed.
 
 ## Configuration and privacy
 
+### Hotspot data budget
+
+Enable **Track hotspot usage during sessions** in Settings and enter a
+budget in decimal GB (0 disables warnings). The compact menu shows the
+tracked total against that budget and opens its settings when clicked.
+Warnings at 80% and 100% leave your connection running. They also stay in
+the menu if macOS notifications are disabled.
+
+Usage combines this Mac's upload and download on the configured hotspot
+only while a session runs. It includes local Wi-Fi traffic and excludes
+traffic from the phone and other devices. Unknown Wi-Fi names, failed
+counter reads and network transitions pause accounting without charging
+the skipped interval. This estimate may be incomplete; use your carrier's
+meter for billing. Saved totals have no automatic monthly reset. Confirm
+**Reset tracked usage** when your allowance renews.
+
+History is saved separately in `hotspot-usage.json`, with SHA-256 network
+keys (not encrypted names). Normal uninstall keeps it; `--purge` removes it.
+
+### Local files
+
 Configuration lives in `~/Library/Application Support/Insomnia/config.json`.
 Use Settings for the app's controls; [Config.swift](../Sources/Insomnia/Model/Config.swift)
 defines the full configuration and defaults. Local logs can contain SSIDs,

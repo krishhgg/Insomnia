@@ -22,6 +22,7 @@ protocol StatusSource: AnyObject, Observable {
     /// Why a hotspot join was skipped this session, if one was, and for
     /// which SSID.
     var hotspotPasswordReport: HotspotPasswordReport? { get }
+    var hotspotUsage: HotspotUsageStatus? { get }
 
     /// Called when the menu opens; observers refresh anything not pushed.
     func refreshOnDemand()
@@ -32,6 +33,10 @@ protocol StatusSource: AnyObject, Observable {
     func instantWatts() -> Double?
     /// Relaunch the browser the user confirmed, as the menu item named it.
     func relaunchUnthrottled(_ browser: ThrottledBrowser)
+}
+
+extension StatusSource {
+    var hotspotUsage: HotspotUsageStatus? { nil }
 }
 
 /// Stand-in until the system layer is plugged in. Reports nothing.
@@ -48,6 +53,7 @@ final class PlaceholderStatus: StatusSource {
     var throttledBrowsers: [ThrottledBrowser] = []
     var relaunchProblems: [String] = []
     var hotspotPasswordReport: HotspotPasswordReport? = nil
+    var hotspotUsage: HotspotUsageStatus? = nil
 
     init() {}
 

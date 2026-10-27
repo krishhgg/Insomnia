@@ -40,6 +40,38 @@ signature that ad-hoc signing writes; that comparison does not prove which
 commit the build came from. The `v0.1.0` tag adds `install.sh --app`, its
 tests and its documentation on top of `b05652c`, with app sources unchanged.
 
+## PR #73 development check — October 11, 2026
+
+This is a scoped development check, not a release validation. The source
+tree matches PR #73's `f18d9dc`; a private scratch build lowered the
+deployment target to macOS 15 and split the existing `DurationInput`
+arithmetic for the local compiler. The Mac was an Apple M1 Max running
+macOS 15.6.1 (24G90), with Swift 6.2.4.
+
+With Location and Notifications access approved, the production Wi-Fi
+sampler, observer, polling driver, persistence, settings/menu and notification
+sender ran against the current Wi-Fi, configured as the test target. Active
+session state was supplied without changing power or network settings.
+Private history recorded 47,115,264 bytes: 36,326,400 received and 10,788,864
+sent. The harness downloaded four 1 MB payloads; background and local
+interface traffic were included. A download while paused did not change
+the ledger. A network interruption was marked unmeasured, so this total is
+not a complete meter of the whole interval.
+
+The 10 MB budget coalesced a jump across both thresholds into one reached
+warning. A 40 MB budget posted separate warnings at 32,448,512 and
+41,748,480 bytes; macOS reported both delivered, and each ledger was saved
+before posting. A fresh driver retained totals and warning history, and
+continued polling did not repeat the warnings. All 19 live verification
+checks passed; the test ended paused with thermal pressure 0 (nominal).
+The separate targeted suite passed 173 tests, and 100 real observer
+start/stop cycles completed without the earlier background-release crash.
+
+Actual phone-hotspot attribution, a full process restart of the live harness,
+the complete keep-awake runtime on supported macOS, notification banner
+placement, and a releasable build's device checks remain unverified.
+The pending checks are in [Releasing](releasing.md#hotspot).
+
 ## September 14, 2026 baseline
 
 The pre-fix audit found lifecycle races, incomplete recovery reporting,
