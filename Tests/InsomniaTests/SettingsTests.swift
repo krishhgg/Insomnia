@@ -138,6 +138,78 @@ final class SettingsTests: XCTestCase {
         XCTAssertLessThanOrEqual(short.height, 120)
     }
 
+    /// The menu bar style is a General setting, on #147's one page, not a
+    /// section of its own above the lid: its picker is the first menu in
+    /// General, after the battery floors and before the default length.
+    func testTheMenuBarStylePickerOpensTheGeneralGroup() throws {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        let titles = try popUpTitles(manager)
+        let style = try XCTUnwrap(titles.firstIndex(of: "Pills"), "\(titles)")
+        let endFloor = try XCTUnwrap(titles.firstIndex(of: "\(manager.config.endFloor)%"), "\(titles)")
+        XCTAssertGreaterThan(style, endFloor, "\(titles)")
+        XCTAssertEqual(titles[style + 1], SettingsView.lengthLabel(manager.config.defaultPreset), "\(titles)")
+    }
+
+    /// Every Minimal click adds the default length, so Minimal types it in
+    /// a field in place of the preset menu, under the same name.
+    func testMinimalTypesTheDefaultLengthInPlaceOfThePresetMenu() throws {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.menuBarMode = .minimal
+        let titles = try popUpTitles(manager)
+        let style = try XCTUnwrap(titles.firstIndex(of: "Minimal"), "\(titles)")
+        XCTAssertFalse(titles.contains(SettingsView.lengthLabel(manager.config.defaultPreset)), "\(titles)")
+        XCTAssertEqual(titles[style + 1], manager.config.defaultFocusField.placeholder, "\(titles)")
+    }
+
+    /// Each style has a name and one line on what it does, short enough
+    /// to sit on one line under the picker's label.
+    func testEachMenuBarStyleHasANameAndOneLineOnWhatItDoes() {
+        XCTAssertEqual(Config.MenuBarMode.allCases.map(SettingsView.styleName), ["Pills", "Compact", "Minimal"])
+        let lines = Config.MenuBarMode.allCases.map(SettingsView.styleDescription)
+        XCTAssertEqual(Set(lines).count, lines.count)
+        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        for line in lines {
+            XCTAssertFalse(line.isEmpty)
+            XCTAssertFalse(line.contains("\n"), line)
+            XCTAssertLessThan((line as NSString).size(withAttributes: [.font: font]).width, 300, line)
+        }
+    }
+
+    /// The titles of the Settings window's menus, top to bottom. On macOS 27
+    /// SwiftUI draws a form's pickers itself, with no NSPopUpButton and no
+    /// Accessibility element to read in the test process, so the tests that
+    /// need the titles skip there. They still run on macOS 26.
+    private func popUpTitles(_ manager: SessionManager) throws -> [String] {
+        let loginItem = LoginItem(
+            service: FakeLoginItemService(status: .notRegistered), install: "test",
+            activity: NotificationCenter())
+        let window = SettingsWindow {
+            SettingsView(
+                manager: manager, secrets: InMemoryHotspotSecretStore(),
+                locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+                loginItem: loginItem, releases: ReleaseChecker())
+        }.make()
+        // Tall enough for every row, so none is left out of the layout.
+        window.setContentSize(NSSize(width: 490, height: 3000))
+        window.layoutIfNeeded()
+        var popUps: [NSPopUpButton] = []
+        func collect(_ view: NSView) {
+            if let popUp = view as? NSPopUpButton { popUps.append(popUp) }
+            view.subviews.forEach(collect)
+        }
+        collect(try XCTUnwrap(window.contentView))
+        if popUps.isEmpty, ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
+            throw XCTSkip("SwiftUI on macOS 27 draws the form's pickers without NSPopUpButton")
+        }
+        return popUps
+            .sorted { $0.convert($0.bounds, to: nil).maxY > $1.convert($1.bounds, to: nil).maxY }
+            .map(\.title)
+    }
+
     /// Session lengths read as words. The test passes an English locale, so
     /// it also passes on a Mac set to another language.
     func testSessionLengthsReadAsWords() {

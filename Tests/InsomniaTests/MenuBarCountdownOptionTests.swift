@@ -97,6 +97,28 @@ final class MenuBarCountdownOptionTests: XCTestCase {
         ], "the countdown is in the bar; End session stays in the menu")
     }
 
+    /// Compact and Minimal have no countdown in the bar, whatever the
+    /// countdown setting says, so their menu carries the time left.
+    @MainActor
+    func testTheMenuCarriesTheTimeLeftInTheStylesWithNoCountdownInTheBar() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.showMenuBarCountdown = true
+        await manager.start(duration: 3600)
+        func timeLeft() -> [String] {
+            StatusItemController.menuItems(manager: manager, status: PlaceholderStatus())
+                .map(\.title).filter { $0.hasPrefix("Time left") }
+        }
+        XCTAssertEqual(timeLeft(), [], "Pills: the countdown is in the bar")
+        for style in [Config.MenuBarMode.compact, .minimal] {
+            manager.config.menuBarMode = style
+            XCTAssertEqual(timeLeft(), ["Time left: 1h"], "\(style)")
+        }
+        await manager.end(reason: .user)
+        XCTAssertEqual(timeLeft(), [], "no session")
+    }
+
     /// With the countdown off, VoiceOver reads the time left on the eye, or
     /// the end time when the bar is set to it: nothing ticks then, so a time
     /// left would go stale.
@@ -112,6 +134,19 @@ final class MenuBarCountdownOptionTests: XCTestCase {
             StatusRootView.eyeAccessibilityValue(showsCountdown: false, running: true, style: .endTime, remaining: "2h 14m", endTime: ""),
             "Time left: 2h 14m"
         )
+    }
+
+    /// With the countdown on, VoiceOver names it for what it shows, in Pills
+    /// and in the Compact panel, and Minimal's tooltip and VoiceOver value
+    /// say the same: a clock time is when the session ends, not a time left.
+    @MainActor
+    func testTheCountdownIsNamedForTheEndTimeWhenTheBarIsSetToIt() {
+        XCTAssertEqual(SessionRunningControls.countdownLabel(isStarting: false, style: .remaining), "Time remaining")
+        XCTAssertEqual(SessionRunningControls.countdownLabel(isStarting: false, style: .endTime), "Ends at")
+        XCTAssertEqual(SessionRunningControls.countdownLabel(isStarting: true, style: .endTime), "Starting session")
+        XCTAssertEqual(MinimalStatusIcon.runningStatus("2:14:05", style: .remaining), "Keeping awake, 2:14:05 remaining")
+        XCTAssertEqual(MinimalStatusIcon.runningStatus("6:30 PM", style: .endTime), "Keeping awake, ends at 6:30 PM")
+        XCTAssertEqual(MinimalStatusIcon.runningStatus("", style: .endTime), "Keeping awake")
     }
 
     // MARK: Status item

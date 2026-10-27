@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SwiftUI
 
 /// UI state for the status item. The controller mutates it; the views only
 /// read it. Content state (`visiblePills`, `focusVisible`, `focused`,
@@ -39,7 +40,8 @@ final class MenuBarModel {
         /// Enter was pressed on the start pills and the manager has not yet
         /// confirmed a session (the recovery agent can take seconds to
         /// answer, or refuse). Shows the projected countdown
-        /// (`pendingCountdown`) and nothing that acts on a session.
+        /// (`pendingCountdown`). Compact and Minimal may cancel the request;
+        /// Pills waits for confirmation before showing its end ring.
         case starting
         case running
 
@@ -48,8 +50,8 @@ final class MenuBarModel {
             return false
         }
 
-        /// The countdown and the hold-to-end ring belong to a confirmed
-        /// session only; a pending start must not draw them.
+        /// The default menu bar's running controls belong to a confirmed
+        /// session only; a pending start must not draw its end ring.
         var showsRunningControls: Bool { self == .running }
     }
 
@@ -61,6 +63,20 @@ final class MenuBarModel {
     static let startFailedText = "Couldn\u{2019}t start"
 
     var phase: Phase = .idle
+    /// Compensates for native status-item resizing so the Pills eye travels
+    /// smoothly instead of jumping when its controls unfold to the right.
+    var widthMotion: StatusItemWidthMotion?
+    /// Minimal mode keeps the status item interactive without opening an
+    /// editor. Block another click while its session request is settling.
+    var minimalBusy = false
+    /// Ending disables both additions and repeated cancellation, even while
+    /// the manager is draining a startup or restoring an already-cleared session.
+    var isEnding = false
+    /// The fraction of the confirmed session left, for Minimal's arc, or nil
+    /// in the other styles. The controller reads it from the session's start
+    /// and end on a session change, a style change or a wake, and on its own
+    /// slow timer, which stops while every display sleeps (`syncMinimalTick`).
+    var minimalProgress: Double?
     /// Concise start failure shown beside the pills; cleared on the next
     /// commit, open or collapse.
     var startError: String?
@@ -99,6 +115,54 @@ final class MenuBarModel {
     var mode: Mode? {
         if case let .entering(m) = phase { return m }
         return nil
+    }
+
+    /// Edit the duration pills in either presentation using the original
+    /// menu bar focus and rejection feedback. Submission and dismissal
+    /// belong to their controller.
+    @discardableResult
+    func applyInput(_ command: DurationInputCommand, reduceMotion: Bool) -> Bool {
+        switch command {
+        case let .focus(field):
+            focus(field, reduceMotion: reduceMotion)
+        case .next:
+            focus(focused.next, reduceMotion: reduceMotion)
+        case .previous:
+            focus(focused.previous, reduceMotion: reduceMotion)
+        case let .digit(digit):
+            let field = focused
+            withAnimation(Motion.base(reduceMotion: reduceMotion)) {
+                if input.append(digit: digit, to: field) {
+                    if !input.canAcceptDigit(in: field), field != .minutes {
+                        focused = field.next
+                        focusBounce += 1
+                    }
+                } else {
+                    rejectBounce += 1
+                }
+            }
+        case .backspace:
+            let field = focused
+            withAnimation(Motion.base(reduceMotion: reduceMotion)) {
+                if !input.backspace(field), field != .days {
+                    focused = field.previous
+                    focusBounce += 1
+                }
+            }
+        case .ignore:
+            break
+        case .submit, .cancel:
+            return false
+        }
+        return true
+    }
+
+    private func focus(_ field: DurationInput.Field, reduceMotion: Bool) {
+        withAnimation(Motion.snappy(reduceMotion: reduceMotion)) {
+            focused = field
+            focusVisible = true
+        }
+        focusBounce += 1
     }
 
     /// The session a start or an extension pressed at some moment will

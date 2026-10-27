@@ -10,9 +10,9 @@ import SwiftUI
 /// status item's length to it once (`StatusWidthWriter`), decoupled from
 /// this layout. Everything that animates inside (the pills staggering in and out,
 /// the focus ring, the countdown and the ring coming and going) is scale,
-/// offset and opacity, anchored at the leading edge so the bar reads as
-/// growing out of the mark; the bar narrows only once the content on its
-/// way out has gone.
+/// offset and opacity. The Pills reveal compensates for the native item's
+/// right-anchored resizing, so the eye glides while its controls unfold to
+/// the right; native space is released only after the return settles.
 struct StatusRootView: View {
     let model: MenuBarModel
     let manager: SessionManager
@@ -28,17 +28,9 @@ struct StatusRootView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotionEnv
 
-    /// Scale of a pill slot's content while hidden; the same shape as
-    /// `Motion.pillTransition`, driven by `visiblePills` instead of by
-    /// inserting and removing the pill (which would move the layout).
-    private static let hiddenPillScale: CGFloat = 0.55
-    /// Gap between the mark and the slots, and between the slots.
-    private static let slotSpacing: CGFloat = 7
-    /// Each slot's laid-out width, for the distance a collapsing pill
-    /// travels; a fixed slot's width never changes once measured.
-    @State private var pillWidths: [DurationInput.Field: CGFloat] = [:]
-
     private var reduceMotion: Bool { reduceMotionEnv || Motion.reduceMotion }
+    private var compact: Bool { manager.config.compactMode }
+    private var minimal: Bool { manager.config.menuBarMode == .minimal }
     /// Sleep is held right now (journal-backed), independent of the UI phase.
     private var isRunning: Bool { manager.isActive }
     /// Both, not either: the phase can lag the manager by a hop when a
@@ -73,32 +65,42 @@ struct StatusRootView: View {
     }
 
     var body: some View {
-        HStack(spacing: Self.slotSpacing) {
-            icon
+        HStack(spacing: DurationPillsView.spacing) {
+            if minimal {
+                MinimalStatusIcon(
+                    model: model, manager: manager, reduceMotion: reduceMotion,
+                    onTap: onTapIcon, onHold: onHoldEnd,
+                    isPressed: buttonIsDown, pointer: pointerLocation
+                )
+            } else {
+                icon
+            }
             // What comes and goes with the layout carries its own animation
             // on its transition (`Motion.countdownTransition` and friends):
             // the branch switches outside any animation, and an
             // `.animation(_:value:)` on this container did not reach it.
-            if model.slotsPresent {
-                pills
+            if !compact && !minimal && model.slotsPresent {
+                DurationPillsView(model: model, reduceMotion: reduceMotion, onTap: onTapPill)
                 if let error = model.startError {
                     startError(error)
                         .opacity(model.startErrorShown ? 1 : 0)
                         .animation(Motion.base(reduceMotion: reduceMotion), value: model.startErrorShown)
                 }
-            } else if showsCountdown {
-                countdown
-                if showsRunningControls {
-                    HoldToEndButton(reduceMotion: reduceMotion, action: onHoldEnd, isPressed: buttonIsDown, pointer: pointerLocation)
-                        .transition(Motion.ringTransition(reduceMotion: reduceMotion))
-                }
+            } else if !compact && !minimal && showsCountdown {
+                SessionRunningControls(
+                    text: countdownText, isStarting: model.phase == .starting,
+                    showEnd: showsRunningControls, reduceMotion: reduceMotion,
+                    style: manager.config.countdownStyle,
+                    isPressed: buttonIsDown, pointer: pointerLocation,
+                    onTapCountdown: onTapCountdown, onHoldEnd: onHoldEnd
+                )
             }
         }
         .padding(.leading, 6)
         // Never animated: `slotsPresent` can land in the same transaction as
         // a `withAnimation` (a refused start reopens the pills in one turn),
         // and an interpolated inset would report a width per frame.
-        .animation(nil) { $0.padding(.trailing, model.slotsPresent ? 8 : 6) }
+        .animation(nil) { $0.padding(.trailing, !compact && !minimal && model.slotsPresent ? 8 : 6) }
         .frame(height: NSStatusBar.system.thickness)
         .fixedSize()
         .contentShape(Rectangle())
@@ -107,6 +109,10 @@ struct StatusRootView: View {
         } action: { width in
             onWidthChange(width)
         }
+        .modifier(StatusItemRevealEffect(
+            reservedWidth: !compact && !minimal ? (model.widthMotion?.reservedWidth ?? 0) : 0,
+            displayedWidth: !compact && !minimal ? (model.widthMotion?.displayedWidth ?? 0) : 0
+        ))
         // The host is kept as wide as the widest content it has held, so the
         // content must sit at its leading edge rather than centred in it.
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -128,17 +134,23 @@ struct StatusRootView: View {
             }
             .onTapGesture(perform: onTapIcon)
             .accessibilityLabel("Insomnia")
+            .accessibilityAddTraits(.isButton)
             .accessibilityValue(eyeAccessibilityValue)
+            .help(compact ? "Open Insomnia" : "Insomnia")
     }
 
+    /// The time left when the bar shows no countdown beside the eye,
+    /// otherwise the eye's state.
     private var eyeAccessibilityValue: String {
-        Self.eyeAccessibilityValue(
-            showsCountdown: manager.config.showMenuBarCountdown,
+        let time = Self.eyeAccessibilityValue(
+            showsCountdown: !compact && manager.config.showMenuBarCountdown,
             running: isRunning,
             style: manager.config.countdownStyle,
             remaining: manager.remainingText,
             endTime: manager.countdownText
         )
+        if !time.isEmpty { return time }
+        return isRunning ? "Keeping awake" : (model.phase == .starting ? "Starting" : "Inactive")
     }
 
     /// What VoiceOver reads on the eye when the bar shows no countdown.
@@ -155,86 +167,6 @@ struct StatusRootView: View {
         guard !showsCountdown, running, !remaining.isEmpty else { return "" }
         if style == .endTime, !endTime.isEmpty { return "Ends at \(endTime)" }
         return StatusMenu.remainingLine(remaining)
-    }
-
-    /// All three slots are in the layout whenever they are present;
-    /// `visiblePills` only scales, moves and fades each slot's content, so
-    /// the stagger never moves the layout. A hidden pill has two shapes:
-    /// retracted in place (the open stagger's starting point, scaled down
-    /// from its leading edge), and while `pillsCollapsing` (a close)
-    /// folded towards the eye: shifted left by its own distance from the
-    /// first slot, so all three converge on the mark, and shrunk to
-    /// `Motion.collapseScale`. The farthest pill leaves first (the stagger
-    /// steps `visiblePills` down), so the pills still up always run
-    /// unbroken from the eye and each one slides under its neighbour
-    /// (`zIndex`) as the bar folds shut. Reduce Motion: opacity only.
-    private var pills: some View {
-        ForEach(Array(DurationInput.Field.allCases.enumerated()), id: \.element) { index, field in
-            let shown = index < model.visiblePills
-            let collapsing = !shown && model.pillsCollapsing && !reduceMotion
-            let fullSize = shown || reduceMotion
-            let scale: CGFloat = collapsing ? Motion.collapseScale : (fullSize ? 1 : Self.hiddenPillScale)
-            let travel: CGFloat = collapsing ? collapseTravel(index: index) : 0
-            PillView(
-                field: field,
-                text: model.input.text(for: field),
-                focused: model.focused == field,
-                valid: model.input.isValid(field),
-                glowVisible: model.focusVisible,
-                focusBounce: model.focusBounce,
-                rejectBounce: model.rejectBounce,
-                reduceMotion: reduceMotion,
-                onTap: { onTapPill(field) }
-            )
-            .onGeometryChange(for: CGFloat.self) { proxy in
-                proxy.size.width
-            } action: { width in
-                pillWidths[field] = width
-            }
-            .scaleEffect(scale, anchor: .leading)
-            .offset(x: -travel)
-            .opacity(shown ? 1 : 0)
-            .accessibilityHidden(!shown)
-            // A slot born already shown (the first pill when its stagger step
-            // lands in the same transaction as the slots, every pill when a
-            // refused start puts them straight back) has no hidden frame to
-            // spring from, so it springs in through the same shape as a
-            // transition. One born hidden must not: its stagger step would
-            // then compound with a transition still in flight. Removal is
-            // instant either way, so a leaving slot never holds the layout.
-            .transition(.asymmetric(insertion: shown ? Motion.pillTransition(reduceMotion: reduceMotion) : .identity, removal: .identity))
-            .zIndex(Double(10 - index))
-        }
-    }
-
-    /// How far the pill in slot `index` travels to put its leading edge on
-    /// the first slot's: the slots before it and the gaps between. Zero for
-    /// the first slot, which shrinks and fades where it is (its leading
-    /// edge already abuts the mark). A slot not yet measured contributes
-    /// nothing, so the pill still shrinks and fades in place.
-    private func collapseTravel(index: Int) -> CGFloat {
-        let before = DurationInput.Field.allCases.prefix(index).reduce(CGFloat(0)) { $0 + (pillWidths[$1] ?? 0) }
-        return before + Self.slotSpacing * CGFloat(index)
-    }
-
-    /// The live countdown while running, or the projected one while a start
-    /// is pending: the manager has to arm the recovery agent and disable
-    /// sleep first, and either can take seconds. The projection is what the
-    /// session will read once confirmed, so the live text replaces it
-    /// without a jump; the hold-to-end ring waits for the confirmation.
-    private var countdown: some View {
-        Text(countdownText)
-            .font(.system(size: 13, weight: .medium, design: .rounded))
-            .monospacedDigit()
-            // No content transition and no animation: a per-frame one is a
-            // per-frame status item re-render, about 23 ms each. See
-            // `Motion.countdownTick`.
-            .animation(Motion.countdownTick, value: countdownText)
-            .padding(.trailing, 1)
-            .transition(Motion.countdownTransition(reduceMotion: reduceMotion))
-            .contentShape(Rectangle())
-            .onTapGesture(perform: onTapCountdown)
-            .accessibilityLabel(model.phase == .starting ? "Starting session" : countdownText)
     }
 
     /// The manager refused the start: say so next to the pills the value is

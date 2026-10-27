@@ -1115,6 +1115,9 @@ older build is tightened when the app reads it:
 - show the countdown in the menu bar (`showMenuBarCountdown`) on/off,
   default on. Off leaves the eye alone in the bar, as the menu bar list
   above describes.
+- menu bar style (`menuBarMode`): Pills, Compact or Minimal (section 11).
+  The countdown switch applies to Pills; Compact and Minimal never show a
+  countdown in the bar.
 - freeze list (bundle ids), freeze every other app on/off (default off),
   Docker rule on/off, mute on lid close on/off (default on). Under the mute
   toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
@@ -1209,6 +1212,113 @@ directly in the menu bar). Insomnia copies that interaction and the feel.
 along the menu bar: three pill fields spring out to the right of the icon,
 one after another with a short stagger.
 
+**Menu bar styles.** Settings > General opens with a Menu bar picker of
+three styles: Pills (the default, the inline entry described here), Compact
+and Minimal. One line under the picker says what the chosen style does. A
+fourth style, Popover, is planned, and the setting is an enum with room for
+it. The config key is `menuBarMode`, stored as `pills`, `compact` or
+`minimal`. A config without the key reads as Pills, or as Compact when an
+older build's `compactMode` is on. A value this build does not know reads as
+Pills and leaves the rest of the config as it was. All three
+styles share one persistent NSStatusItem, status button, and autosaved menu-bar
+position. Switching modes changes the content and click behavior without hiding,
+removing, or reinserting the item. This keeps the same identity for macOS and
+menu-bar managers such as Thaw; a separately inserted Compact item is no longer
+needed.
+
+**Compact mode.** Only the eye remains in the menu bar in every session state.
+Clicking it opens an arrowless native NSPanel with
+the same Days / Hours / Minutes pills, or the running countdown and hold-to-end
+control. Return starts or extends a session; clicking the countdown opens
+the fields to add time. Settings and Quit remain in the right-click menu.
+The hold-to-end control appears as soon as a start is submitted, so a pending
+start can be cancelled while the recovery agent and sleep guard prepare.
+Adding time stays disabled while a request is pending, and cancellation stays
+disabled while the resulting restoration finishes. The panel reads the
+session manager's own end state, so it shows every end, whoever started it:
+a hold or the menu's End session in any style, the timer, a battery or
+thermal floor, `--session end`, a reconcile or a failed start. From the
+request until the end restores sleep, or hands what is left to an armed
+recovery agent after `disablesleep 0` failed, the panel shows Ending… with
+its countdown and ring disabled and takes no keys, then the pills. That
+includes the wait for a retry after a restore command outlived its timeout,
+or after an end left work that only Insomnia can finish. An end that changed
+nothing leaves the session active: a busy recovery lock (retried in 30 s),
+an unreadable state.json (waits for a person) or a command still holding the
+lock (retried when it exits). The panel then shows Ending… with its
+countdown disabled, because time added then would be ended by the retry or
+refused. Its ring stays enabled to ask for the end again. The Pills style
+keeps its original behavior of showing the end control after session
+confirmation.
+The timer and input fields never widen the menu bar in this mode.
+Clicking outside dismisses the dropdown and retains
+unfinished duration input. Switching modes takes effect immediately without
+ending an active session or cancelling a pending start. The dropdown reuses
+the Pills style's DurationPillsView and SessionRunningControls, including
+PillView, HoldToEndButton, and duration-key handling: click to select,
+type digits, use Tab or arrows to move, Delete to erase, and Return to submit.
+Selection uses the original inline focus ring and bounce; there is no text
+cursor or text selection.
+Out-of-range digits receive the same feedback as in the Pills style. An
+empty draft opens on the default field from Settings, as the Pills do, when
+the panel opens, when the countdown is clicked to add time, and after a
+start, an extension or an end goes through. A draft with digits keeps its
+own focus. The countdown changes its digits in one step, as in the bar.
+The panel uses AppKit's native popover material and window shadow with rounded
+corners. It has no title bar or popover arrow. Its left edge aligns with the
+persistent status button, with a 2-point gap below the menu bar. The app clamps
+the panel to the display when space is limited.
+Opening the panel activates Insomnia, as the Pills do, so typed digits reach
+the panel and not the app in front. Clicking the icon again, clicking outside,
+or pressing Escape dismisses it; switching modes also closes it. Escape, a
+second click on the icon and a mode change give focus back to the app the user
+was in. Switching apps or opening Settings leaves focus where it went. An
+outside click that brings no app forward gives it back. The right-click menu
+gives it back after it closes, if no window of Insomnia took it. During an extension, Escape first returns
+from the input pills to the running countdown, matching the shared controls.
+The window fits only the active row, shrinking for the timer and expanding for
+duration entry or a wrapped error. Its content-size animation uses the same
+0.32-second duration as the original inline folding animation. Reopening
+starts at the current content size, and Reduce Motion skips the spatial resize.
+The same status item keeps its position when switching modes. All presentations
+use the same status rows and action
+handlers, including browser-relaunch confirmation and audio-recovery actions.
+
+**Minimal mode.** Only the eye occupies the menu bar, with no dropdown or
+inline editor. An arc with rounded ends and an opening beneath the eye
+appears as soon as a start is submitted. The thick remaining-time arc starts
+full and empties as the remaining fraction decreases, revealing a thinner
+track for elapsed time; an extension updates the session's total span and
+adds to the ring. Confirmation replaces the initial full arc with live
+progress. The arc reads the session's start and end on its own timer, about
+every hundredth of the session and from 2 to 60 seconds apart, so it drains
+with either countdown style. A start, an extension or an end redraws it at
+once. The timer stops while every display sleeps; a wake redraws the arc and
+restarts it. Time running out redraws in one step, and only added time
+animates. The item keeps the same width in every state. The arc and eye share
+one 0.32-second transition when starting and ending; the last progress value
+stays visible as the arc fades out and the eye closes. Reduce Motion uses a
+crossfade without resizing the eye or arc.
+
+A short click starts a session or adds time using the default session length
+from Settings, which Settings shows as a text field (such as 1d 2h 30m) while
+Minimal is chosen. Holding the eye for 0.6 seconds ends
+a session or cancels a pending start; releasing after a completed hold never
+adds time. Dragging away cancels the gesture. When the hold completes, the
+button must still be down and the pointer within 12 points of where the press
+began, as for the end ring: on macOS 27 the release and the drags arrive from
+a poll and may not have been delivered yet. Only that check ends a session: a
+release the app handles 0.6 seconds or more after the press, before the check
+has run (the main thread was busy), may be a click held back, so it ends
+nothing and adds no time. The same rules apply to the end ring in the Compact
+panel. Additional clicks wait for
+pending session work to finish, and an end blocks repeated actions until its
+restoration finishes. Right-click and Control-click retain the
+status menu, Settings, and Quit. In Compact and Minimal the status menu
+carries the time left while a session runs, since the bar has no countdown. Accessibility offers the start/add action,
+an End session action, and the remaining time. Switching modes does not restart
+or end a session.
+
 ```
 ☕  ( Days ? ) ( Hours ? ) ( Minutes ? )
 ```
@@ -1232,7 +1342,11 @@ extension. Hold the end control to end the session. The right-click menu
 contains status lines (lid, watts, Wi-Fi, frozen apps, Docker), browser
 relaunch actions, End session while running, Settings, and Quit. End session
 uses the same journaled restoration as the hold control; it leaves the app
-open.
+open. Wi-Fi occupies its own status row below the lid, power and battery row.
+The right-click menu anchors to the same persistent status button in every mode
+using AppKit's native context-menu presentation. Read-only rows fit their text
+without reserving a keyboard-shortcut column, while action rows retain the
+native shortcut layout and menu padding.
 
 Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
 `Voltage`) on demand when status is requested. Never continuously polled.
@@ -1242,11 +1356,13 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
 - Everything animates with springs, except the fold that closes the pills
   (a fixed-duration ease, so the slots can leave the moment the last pill
   is gone), the pupil shrinking away as the lid drops (a 0.4 s ease-out,
-  no bounce) and the Reduce Motion crossfades.
+  no bounce), the Pills style's approximately 0.147-second width reveal,
+  Minimal mode's coordinated 0.32-second ease-in-out transition, and the
+  Reduce Motion crossfades.
   Baseline: `.spring(response: 0.35, dampingFraction: 0.72)`; pill focus
   bounce and chip taps use a snappier `.spring(response: 0.25,
   dampingFraction: 0.6)` with a slight scale overshoot (1.0 → 1.06 → 1.0).
-- The status item's width is never animated: `NSStatusItem.length` is
+- The status item's native width is never animated: `NSStatusItem.length` is
   written once per layout change (`StatusWidthWriter`), to the width the
   SwiftUI layout of a custom `NSStatusItem` view reports once per open and
   once per close, as every Apple item does. (Every length write makes
@@ -1255,8 +1371,14 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   menu bar smoothness design spec, revision 4.) Layout-changing state (the
   phase, the pill slots, the error label) is set outside any animation
   transaction, so the layout is computed once per state; the hosting view
-  is laid out at that width, anchored at the leading edge, and the item's
-  window reveals or clips it. Only scale, offset and opacity animate inside.
+  is laid out at that width, anchored at the leading edge. The Pills style's
+  `StatusItemWidthMotion` compensates for the native window's movement with
+  an in-window translation: growth reserves space immediately, then the eye
+  glides as controls unfold to its right; shrinking retains the reservation
+  until the eye's return settles and then releases space in one write. An
+  interrupted close retargets the visible movement and cancels its obsolete
+  release. Reduce Motion and changes to Compact or Minimal settle the
+  reservation immediately; those modes do not apply this translation.
 - Each pill is a fixed slot sized by its placeholder at the typed weight and
   padding, so typing a digit never changes the layout.
 - Pills appear with a staggered scale-and-fade (about 40 ms between pills)
@@ -1265,7 +1387,9 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   by the slots before it, shrinks to 0.6 from its leading edge and fades,
   on one 0.32 s ease curve, farthest pill first, 40 ms apart, sliding under
   its neighbour. The slots leave in one relayout 0.36 s after the last
-  pill's step, and the width is written then, never across a visible pill.
+  pill's step, and the width reveal retargets then, never across a visible
+  pill. A smaller native reservation is written after the eye's return
+  animation settles.
   On Enter the eye starts to open at once and the countdown scales in from
   the leading edge after the slots have left, showing what the session
   will read once the manager confirms it, in the current countdown style,
@@ -1283,7 +1407,10 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   focus to the previous app if Insomnia still owns it. Switching to another
   window closes the pills without taking focus back. The right-click menu
   also closes the pills before it starts handling keys.
-- Number changes in the countdown use `.contentTransition(.numericText())`.
+- The countdown changes its digits in one step, with no content transition
+  and no animation, in the bar and in the Compact panel. Each animated frame
+  re-renders the status item (`Motion.countdownTick`). Minimal's arc drains
+  the same way.
 - Focus ring is a soft glow that breathes in, not a hard outline.
 - Respect Reduce Motion: springs become short crossfades (0.15 s; the
   blink 0.3 s), the fold is opacity only in place (0.2 s), the stagger is
@@ -1305,6 +1432,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
 | countdown redraw | 1 Hz timer, stopped while lid closed or displays asleep; none with the end time | one wake per second while active and visible; none with the end time |
+| Minimal arc redraw | timer at a hundredth of the session, 2 to 60 s, only in Minimal with a session, stopped while displays asleep | one wake per 2 to 60 s |
 | displays asleep | `NSWorkspace` screensDidSleep / screensDidWake, and `CGDisplayIsAsleep` once at launch | none |
 | hotspot retry | only during an outage | none otherwise |
 | update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |

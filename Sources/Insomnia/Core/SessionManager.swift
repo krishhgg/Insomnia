@@ -157,6 +157,20 @@ final class SessionManager {
 
     var isActive: Bool { session != nil }
 
+    /// An end runs now or is owed (`pendingEnd`), whoever asked for it: the
+    /// user, the timer, a floor, `--session end`, a reconcile or a failed
+    /// start. True from the request until the end restores sleep or leaves
+    /// what is left to the recovery agent, through every retry. The Compact
+    /// panel shows Ending… while it lasts.
+    var isEnding: Bool { endsRunning > 0 || pendingEnd != nil }
+
+    /// The end owed changed nothing and nothing runs it now: the session is
+    /// still active, after a busy lock (retried in `recoveryRetryDelay`),
+    /// an unreadable state.json (waits for a person) or a command holding
+    /// the lock (retried when it exits). Asking for the end again tries it
+    /// at once.
+    var endIsWaiting: Bool { endsRunning == 0 && pendingEnd != nil && session != nil }
+
     /// Journal edits owed by a freeze that `LidActions` undid because the
     /// write confirming it failed (`clearUndoneFreeze`).
     struct UndoneFreeze: Equatable, Sendable {
@@ -465,7 +479,12 @@ final class SessionManager {
     @ObservationIgnored private(set) var quitRequested = false
     /// An end that could not complete (lock busy, or dirty with no agent to
     /// retry). Retried in process; new starts wait until it is resolved.
-    @ObservationIgnored private(set) var pendingEnd: EndReason?
+    /// Observed, for `isEnding`.
+    private(set) var pendingEnd: EndReason?
+    /// Ends running now: `end` from the request until it returns, and
+    /// `performEnd` for the callers that run it directly. Observed, for
+    /// `isEnding`.
+    private var endsRunning = 0
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
     /// Detail of the last unreadable-journal notification, so a journal
@@ -1349,6 +1368,8 @@ final class SessionManager {
     /// be read the end changes nothing and waits for a person.
     @discardableResult
     func end(reason: EndReason) async -> EndOutcome {
+        endsRunning += 1
+        defer { endsRunning -= 1 }
         endTicket += 1
         if reason == .quit { quitRequested = true }
         retryTimer?.invalidate()
@@ -1390,6 +1411,8 @@ final class SessionManager {
     }
 
     private func performEnd(reason: EndReason) async -> EndOutcome {
+        endsRunning += 1
+        defer { endsRunning -= 1 }
         let had = session != nil
         Log.info("session end (\(reason.rawValue))")
         stopTimers()

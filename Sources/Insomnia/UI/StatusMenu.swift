@@ -64,6 +64,7 @@ enum StatusMenu {
         sessionActive: Bool,
         sleepHeld: Bool,
         machine: String?,
+        network: String? = nil,
         actions: String?,
         throttledBrowsers: [ThrottledBrowser],
         relaunchProblems: [String] = [],
@@ -84,6 +85,9 @@ enum StatusMenu {
         }
         if let machine = present(machine) {
             out.append(Item(title: machine, kind: .info))
+        }
+        if let network = present(network) {
+            out.append(Item(title: network, kind: .info))
         }
         if let actions = present(actions) {
             out.append(Item(title: actions, kind: .info))
@@ -155,21 +159,19 @@ enum StatusMenu {
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
-        let lineFont = NSFont.menuFont(ofSize: NSFont.smallSystemFontSize)
         for item in items {
             switch item.kind {
             case .separator:
                 menu.addItem(.separator())
             case .info, .warning:
-                let entry = NSMenuItem(title: item.title, action: nil, keyEquivalent: "")
+                let entry = NSMenuItem(title: "", action: nil, keyEquivalent: "")
                 entry.isEnabled = false
-                // NSMenuItem has no font of its own; the attributed title is
-                // the only way to make one line smaller or orange.
-                var attributes: [NSAttributedString.Key: Any] = [.font: lineFont]
-                if item.kind == .warning {
-                    attributes[.foregroundColor] = NSColor.systemOrange
-                }
-                entry.attributedTitle = NSAttributedString(string: item.title, attributes: attributes)
+                // A title participates in the menu-wide shortcut column,
+                // even when this disabled line has no shortcut. A native
+                // label gives the status row its own fitting width; the
+                // actionable rows keep AppKit's normal title/shortcut layout.
+                entry.view = StatusMenuLabel(title: item.title, warning: item.kind == .warning)
+                entry.setAccessibilityLabel(item.title)
                 menu.addItem(entry)
             case .endSession:
                 menu.addItem(action(title: item.title, selector: endSession, key: "", target: target))
@@ -198,6 +200,29 @@ enum StatusMenu {
         item.isEnabled = true
         return item
     }
+}
+
+/// Read-only menu content, using a standard AppKit label. Only the content
+/// is a view: the containing NSMenu still owns chrome, tracking and actions.
+@MainActor
+final class StatusMenuLabel: NSView {
+    let label: NSTextField
+
+    init(title: String, warning: Bool) {
+        label = NSTextField(labelWithString: title)
+        label.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = warning ? .systemOrange : .disabledControlTextColor
+        label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byClipping
+        label.sizeToFit()
+        let size = label.frame.size
+        super.init(frame: NSRect(x: 0, y: 0, width: ceil(size.width) + 32, height: ceil(size.height) + 10))
+        label.frame.origin = NSPoint(x: 16, y: 5)
+        addSubview(label)
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { nil }
 }
 
 /// What the menu asks before "Relaunch <browser> unthrottled" quits

@@ -40,11 +40,14 @@ final class HoldToEndEventTests: XCTestCase {
     }
 
     @MainActor
-    private func makeRig(_ harness: Harness, osMajorVersion: Int = 27) async -> Rig {
+    private func makeRig(
+        _ harness: Harness, osMajorVersion: Int = 27, mode: Config.MenuBarMode = .pills
+    ) async -> Rig {
         _ = NSApplication.shared
         let hits = Hits()
         let hardware = Hardware()
         let manager = harness.makeManager()
+        manager.config.menuBarMode = mode
         let model = MenuBarModel()
         await manager.start(duration: 3600)
         model.phase = .running
@@ -190,17 +193,56 @@ final class HoldToEndEventTests: XCTestCase {
         XCTAssertEqual(rig.hits.summary, "icon=0 countdown=1 hold=0", "the click stayed in the middle")
     }
 
+    /// Minimal has no ring: the eye with its arc takes the hold. The same
+    /// macOS 27 click, down and up at once at the middle of the item, must
+    /// end a session only if the button is still down when the hold
+    /// completes. Here the release never arrives, as when the poll that sends
+    /// it stops early, so only the hold's own check can tell.
+    @MainActor
+    func testMinimalEndsOnARealHoldAndNotOnAClickWhoseReleaseIsLate() async {
+        let harness = Harness()
+        defer { harness.home.destroy() }
+        let rig = await makeRig(harness, mode: .minimal)
+        defer { rig.window.orderOut(nil) }
+        let eye = rig.size.width / 2
+
+        // A real hold: the button stays down past the deadline.
+        pressDown(over: eye, rig)
+        try? await Task.sleep(for: .seconds(0.9))
+        XCTAssertEqual(rig.hits.summary, "icon=0 countdown=0 hold=1", "a hold ends the session")
+        await letGo(rig)
+        XCTAssertEqual(rig.hits.summary, "icon=0 countdown=0 hold=1", "and its release adds no time")
+
+        // A click: the button comes straight back up, and no release is sent.
+        rig.hardware.pointerX = eye
+        rig.hardware.buttonDown = true
+        deliver(.leftMouseDown, rig, number: 3)
+        rig.hardware.buttonDown = false
+        try? await Task.sleep(for: .seconds(0.9))
+        XCTAssertEqual(rig.hits.hold, 1, "a click must not end the session")
+
+        // A click whose release does arrive adds time and ends nothing.
+        deliver(.leftMouseDown, rig, number: 4)
+        deliver(.leftMouseUp, rig, number: 5)
+        try? await Task.sleep(for: .seconds(0.2))
+        XCTAssertEqual(rig.hits.summary, "icon=1 countdown=0 hold=1")
+    }
+
     /// Press a bare hold-to-end button, let `midway` change the hardware 0.3 s
     /// in, and return how many times the ring ended the session. No release
     /// and no drag event is ever delivered: the ring's own timer is the only
     /// thing that can notice the change.
     @MainActor
     private func holdBareButton(
+        usesNativePointer: Bool = false,
         isPressed: @escaping () -> Bool, pointer: @escaping () -> CGPoint, midway: () -> Void
     ) async -> Int {
         _ = NSApplication.shared
         var holds = 0
-        let button = HoldToEndButton(reduceMotion: true, action: { holds += 1 }, isPressed: isPressed, pointer: pointer)
+        let button = HoldToEndButton(
+            reduceMotion: true, usesNativePointer: usesNativePointer,
+            action: { holds += 1 }, isPressed: isPressed, pointer: pointer
+        )
         let host = NSHostingView(rootView: button)
         let size = host.fittingSize
         host.frame = NSRect(origin: .zero, size: size)
@@ -232,6 +274,25 @@ final class HoldToEndEventTests: XCTestCase {
             var down = true
             let holds = await holdBareButton(isPressed: { down }, pointer: { .zero }, midway: { down = stillDown })
             XCTAssertEqual(holds, expectedHolds, "button still down at the deadline: \(stillDown)")
+        }
+    }
+
+    /// The ring in the Compact panel takes its press through the native
+    /// view Minimal uses, which keeps its own hold timer. That timer must
+    /// make the same last check as the SwiftUI ring.
+    @MainActor
+    func testTheNativeRingInTheCompactPanelChecksTheButtonAndThePointerToo() async {
+        for (stillDown, slide, expectedHolds) in [(true, CGFloat(0), 1), (false, 0, 0), (true, 20, 0)] {
+            var down = true
+            var pointerX: CGFloat = 100
+            let holds = await holdBareButton(
+                usesNativePointer: true, isPressed: { down }, pointer: { CGPoint(x: pointerX, y: 50) },
+                midway: {
+                    down = stillDown
+                    pointerX += slide
+                }
+            )
+            XCTAssertEqual(holds, expectedHolds, "button still down: \(stillDown), pointer moved \(slide) pt")
         }
     }
 
