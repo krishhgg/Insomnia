@@ -104,6 +104,9 @@ file and explains how upgrades replace them.
    and press Enter.
 2. **Add time.** Click the eye or the countdown during a session.
 3. **End early.** Press and hold the end control next to the countdown.
+   To show only the eye, turn off "Show the countdown in the menu bar" in
+   Settings. The eye opens while a session runs and closes when it ends,
+   and the right-click menu shows the time left and End Session.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.

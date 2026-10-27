@@ -111,6 +111,7 @@ final class StatusMenuWarningTests: XCTestCase {
         let menu = StatusMenu.menu(
             items,
             target: nil,
+            endSession: #selector(NSObject.description),
             settings: #selector(NSObject.description),
             quit: #selector(NSObject.description),
             relaunchBrowser: #selector(NSObject.description),
@@ -137,6 +138,7 @@ final class StatusMenuWarningTests: XCTestCase {
         let menu = StatusMenu.menu(
             items,
             target: nil,
+            endSession: #selector(NSObject.description),
             settings: #selector(NSObject.description),
             quit: #selector(NSObject.description),
             relaunchBrowser: #selector(NSObject.description),

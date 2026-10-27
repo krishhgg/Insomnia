@@ -74,6 +74,12 @@ struct Config: Codable, Equatable, Sendable {
     var tmuxNudgePressesEnter: Bool = false
 
     // App
+    /// Show the live countdown and the hold-to-end ring next to the eye
+    /// while a session runs. Off: the eye alone says whether a session is
+    /// running (open) or not (closed), and the time left and End Session
+    /// move to the right-click menu. On by default, and for a config.json
+    /// without the key.
+    var showMenuBarCountdown: Bool = true
     var launchAtLogin: Bool = false
     /// The install (code directory hash, bundle path and the executable's
     /// file identity: `LoginItem.install`) whose login item macOS last
@@ -169,6 +175,7 @@ struct Config: Codable, Equatable, Sendable {
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
+        showMenuBarCountdown = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarCountdown) ?? d.showMenuBarCountdown
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }
