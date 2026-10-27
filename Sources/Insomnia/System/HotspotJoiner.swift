@@ -2,7 +2,9 @@ import CoreWLAN
 import Foundation
 
 protocol HotspotJoining: Sendable {
-    /// Returns false when the SSID-filtered scan finds no matching network.
+    /// Returns false when no SSID-filtered scan finds a matching network:
+    /// one for the SSID as given, then one per other spelling of its
+    /// apostrophes (`HotspotSSID.scanCandidates`).
     func join(ssid: String, password: String, interfaceName: String) async throws -> Bool
 }
 
@@ -23,11 +25,15 @@ struct CoreWLANHotspotJoiner: HotspotJoining {
             throw HotspotJoinError.missingInterface(interfaceName)
         }
         // macOS may require Location Services permission for SSID visibility.
-        // Keep this scan SSID-filtered: association works with the returned
+        // Keep each scan SSID-filtered: association works with the returned
         // CWNetwork even when its `ssid` property is redacted.
-        let networks = try interface.scanForNetworks(withSSID: ssid.data(using: .utf8))
-        guard let network = networks.first else { return false }
-        try interface.associate(to: network, password: password)
+        guard let found = try HotspotSSID.firstFound(ssid, scan: { name in
+            try interface.scanForNetworks(withSSID: Data(name.utf8)).first
+        }) else { return false }
+        if found.name != ssid {
+            Log.info("hotspot \(ssid) found as \(found.name), its apostrophe swapped")
+        }
+        try interface.associate(to: found.network, password: password)
         return true
     }
 

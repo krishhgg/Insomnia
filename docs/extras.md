@@ -11,7 +11,9 @@ apostrophe still finds an iPhone's curly one. Then enter the password and
 click Save. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
 CoreWLAN to find and join that network without putting the password in process
-arguments.
+arguments. An iPhone names its hotspot with a typographic apostrophe
+(`Name’s iPhone`), and a Mac keyboard types a straight one; when the name as
+typed finds nothing, Insomnia looks for it with the other apostrophe too.
 
 The Keychain item's access list names only the build of Insomnia that saved
 it, and Insomnia reads it with Keychain prompts switched off, so a join during
@@ -58,10 +60,14 @@ tmux set-option -p -t <session:window.pane> @insomnia-nudge on
 ```
 
 Mark a dedicated, disposable agent pane, not one you type in, because pending
-text is opaque to Insomnia. Enter is off by default, so the word is typed and
-nothing submits it. Turn on "Press Enter after continue" in Settings, under
-If Wi-Fi drops, to submit it, knowing that Enter also submits anything
-already typed in that pane. The
+text is opaque to Insomnia. A marked pane whose agent has exited and left a
+shell prompt is skipped, because the keys would go to the shell. tmux also
+shows the shell while a shell runs the agent without `exec`, as in
+`tmux new 'agent; exec zsh'` or a launcher script, so such a pane is skipped
+too. Start the agent from an interactive shell or as the pane's command. Enter
+is off by default, so the word is typed and nothing submits it. Turn on "Press
+Enter after continue" in Settings, under If Wi-Fi drops, to submit it, knowing
+that Enter also submits anything already typed in that pane. The
 option must be on the pane itself (`-p`). One set on the session or window
 does not count. Pane options need tmux 3.0 or later. Ending a session cancels
 pending automation but cannot retract keystrokes already sent.

@@ -155,8 +155,10 @@ struct KeychainError: Error, LocalizedError, Sendable {
 }
 
 /// The configured hotspot SSID as the keychain account: what the failover
-/// joins and Settings saves under. One rule for both, so a check that the
-/// SSID is still the same after a keychain wait compares like with like.
+/// reads the password under and Settings saves under. One rule for both, so
+/// a check that the SSID is still the same after a keychain wait compares
+/// like with like. The failover's scan also tries the name with its
+/// apostrophes swapped (`scanCandidates`).
 enum HotspotSSID {
     static func normalized(_ configured: String) -> String {
         configured.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -181,6 +183,30 @@ enum HotspotSSID {
             .replacingOccurrences(of: "\u{2019}", with: "'")
             .replacingOccurrences(of: "\u{2018}", with: "'")
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+
+    /// The names the directed scan looks for, in order: `ssid` as
+    /// configured, then with every straight apostrophe (U+0027) made
+    /// typographic (U+2019), then the other way round. iOS names a Personal
+    /// Hotspot `Name’s iPhone` with U+2019, a Mac keyboard types U+0027,
+    /// and a directed scan matches the SSID's exact bytes (#87).
+    static func scanCandidates(_ ssid: String) -> [String] {
+        var names = [ssid]
+        for (straight, curly) in [("'", "\u{2019}"), ("\u{2019}", "'")] {
+            let swapped = ssid.replacingOccurrences(of: straight, with: curly)
+            if !names.contains(swapped) { names.append(swapped) }
+        }
+        return names
+    }
+
+    /// Scans for each of `scanCandidates(ssid)` in turn and returns the
+    /// first network found, with the name it was found under; nil when no
+    /// scan finds one. A scan that throws ends the search.
+    static func firstFound<Found>(_ ssid: String, scan: (String) throws -> Found?) rethrows -> (name: String, network: Found)? {
+        for name in scanCandidates(ssid) {
+            if let network = try scan(name) { return (name, network) }
+        }
+        return nil
     }
 }
 
