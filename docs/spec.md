@@ -475,15 +475,25 @@ level not yet decided. Each level the app writes from the journal, or
 finds set since in place of a kept value, becomes that device's sample,
 so a close soon after a restore that came late, from the re-read of a
 kept value or after the mode, journals the restored level and not a 0
-sampled before it. The keyboard journals the current
-read if trusted now, else its last sample; when nothing trustworthy is
-known for it, it is left to macOS entirely (no journal entry, no write),
-because restoring a suppressed 0 would leave the backlight off. On open the
+sampled before it. A keyboard already reading 0 is left to macOS entirely
+(no new journal entry or write), unless a positive restore is already owed
+from an earlier close. Ambient auto-off can read 0 with neither suppression
+nor dimming flagged, while manual off can set the suppression flag; neither
+is a reason to restore an older positive sample over it. For a positive
+current reading, the keyboard journals that reading if trusted now, else a
+positive last sample; without either, it is left alone. A saved zero from an
+older version is cleared without a keyboard write or reassertion, including
+when the private-call guard refuses; a failed clear stays owed for retry.
+This avoids committing automatic zero as a permanent off setting. It leaves
+macOS free to relight a keyboard that was already off, even while the lid is
+closed, and positive ambient-dimmed readings remain possible restore values.
+On open the
 restore is written, the entries cleared, and the same values written once
 more 2 s later, because powerd re-applies its own remembered brightness
 asynchronously after the wake and can override the first write; that second
-write is skipped if the lid closed again in the meantime (the close journals
-fresh values first) and superseded by any newer restore. A display restore
+write is canceled if another current lid close starts in the meantime, even
+when an already-zero keyboard creates no new journal entry, and superseded
+by any newer restore. A display restore
 written while Insomnia's own Low Power Mode was on is journaled as
 `displayRestoredUnderLowPower` and written once more, then re-asserted the
 same way, right after Insomnia switches the mode off (lid open, charger,
