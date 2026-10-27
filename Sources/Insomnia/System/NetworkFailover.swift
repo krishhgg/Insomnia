@@ -161,6 +161,27 @@ enum HotspotSSID {
     static func normalized(_ configured: String) -> String {
         configured.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// The names from `known` that Settings offers while `typed` is in the
+    /// hotspot field: each once, in order, matching what was typed with
+    /// case, accents and apostrophes ignored. An iPhone names its hotspot
+    /// with a curly apostrophe (U+2019) and a keyboard types a straight
+    /// one, and the join scan matches exact bytes, so `Avery's` offers
+    /// `Avery’s iPhone` and choosing it fills in the exact name.
+    static func suggestions(for typed: String, among known: [String]) -> [String] {
+        let key = matchKey(typed)
+        var seen = Set<String>()
+        return known.filter { name in
+            !normalized(name).isEmpty && seen.insert(name).inserted && (key.isEmpty || matchKey(name).contains(key))
+        }
+    }
+
+    private static func matchKey(_ name: String) -> String {
+        normalized(name)
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{2018}", with: "'")
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
 }
 
 /// Why the failover has no hotspot password to join with. Shown in the
