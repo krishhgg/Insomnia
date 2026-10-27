@@ -262,10 +262,13 @@ type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); 
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
-record_text_problems() { # file
+# With the optional `session` argument the walker checks session keys and
+# the identity fields inside ownerIdentity for duplicates instead of checking
+# display records, so mode and owner never rely on plutil's last-key-wins view.
+record_text_problems() { # file [session]
   local LC_ALL=C
   local text rest raw key c token depth str plain scalar number esc hex lost
-  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
+  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead seen="" scope="" label=state.json
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
   scalar='^[^],}[:space:]]+'
@@ -274,7 +277,12 @@ record_text_problems() { # file
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
   text="$(<"$1")"
-  [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  if [[ "${2:-}" == session ]]; then
+    label=session.json
+    lost="the top level of session.json cannot be followed here, so its mode and owner cannot be checked"
+  else
+    [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  fi
   if IFS= read -r -d '' c < "$1"; then
     echo "$lost"
     return 0
@@ -286,7 +294,17 @@ record_text_problems() { # file
   while :; do
     rest="${rest#"${rest%%[![:space:]]*}"}"
     # An empty object, or a comma before the end, which the app accepts.
-    [[ "${rest:0:1}" == "}" ]] && break
+    if [[ "${rest:0:1}" == "}" ]]; then
+      [[ -n "$scope" ]] || break
+      scope=""
+      rest="${rest:1}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      case "${rest:0:1}" in
+        ,) rest="${rest:1}"; continue ;;
+        '}') break ;;
+        *) echo "$lost"; return 0 ;;
+      esac
+    fi
     [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
     raw="${BASH_REMATCH[0]}"
     rest="${rest:${#raw}}"
@@ -308,15 +326,31 @@ record_text_problems() { # file
       else
         case "${raw:0:1}" in
           '"'|\\|/|b|f|n|r|t) key+="?"; raw="${raw:1}" ;;
-          *) echo "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
+          *) echo "a key in $label has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
         esac
       fi
     done
     key+="$raw"
+    if [[ "${2:-}" == session ]]; then
+      case "$scope:$key" in
+        :mode|:startedAt|:endsAt|:extensions|:ownerPID|:ownerIdentity|:ownerExecutable|ownerIdentity:startedAt|ownerIdentity:startedAtMicros|ownerIdentity:bootSession)
+          [[ -z "$scope" ]] || key="$scope.$key"
+          if [[ "$seen" == *"|$key|"* ]]; then
+            echo "$key is repeated in session.json; the app reads the first and plutil the last"
+            return 0
+          fi
+          seen+="|$key|" ;;
+      esac
+    fi
     rest="${rest#"${rest%%[![:space:]]*}"}"
     [[ "${rest:0:1}" == : ]] || { echo "$lost"; return 0; }
     rest="${rest:1}"
     rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "${2:-}" == session && -z "$scope" && "$key" == ownerIdentity && "${rest:0:1}" == '{' ]]; then
+      scope=ownerIdentity
+      rest="${rest:1}"
+      continue
+    fi
     token=""
     case "${rest:0:1}" in
       '"')
@@ -347,13 +381,17 @@ record_text_problems() { # file
         rest="${rest:${#token}}"
         ;;
     esac
-    case "$key" in
-      keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
-      keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
-      # The boot is a string, whose type plutil checks.
-      keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
-      *) token="" ;;
-    esac
+    if [[ "${2:-}" == session ]]; then
+      token="" # Unknown display keys in a session are not journal records.
+    else
+      case "$key" in
+        keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
+        keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
+        # The boot is a string, whose type plutil checks.
+        keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
+        *) token="" ;;
+      esac
+    fi
     if [[ -n "$token" && "$token" != null ]]; then
       if [[ "$token" =~ $number ]]; then
         digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
@@ -382,7 +420,7 @@ record_text_problems() { # file
     rest="${rest#"${rest%%[![:space:]]*}"}"
     case "${rest:0:1}" in
       ,) rest="${rest:1}" ;;
-      '}') break ;;
+      '}') [[ -n "$scope" ]] || break ;;
       *) echo "$lost"; return 0 ;;
     esac
   done
@@ -541,8 +579,26 @@ epoch_at() { # file keypath
   v="${v%.}"
   epoch_of "${v%$'\n'}"
 }
+session_integer_fits() { # file keypath bits
+  local value digits limit
+  [[ "$(type_of "$1" "$2")" == integer ]] || return 1
+  value="$(extract "$1" "$2" || true)"
+  [[ "$value" =~ ^-?[0-9]+$ ]] || return 1
+  digits="${value#-}"
+  if [[ "$3" == 32 ]]; then
+    limit=2147483647; [[ "$value" == -* ]] && limit=2147483648
+  else
+    limit=9223372036854775807; [[ "$value" == -* ]] && limit=9223372036854775808
+  fi
+  (( ${#digits} < ${#limit} )) && return 0
+  # Equal-width decimal strings sort numerically under LC_ALL=C. Arithmetic
+  # would overflow exactly the values this decoder guard needs to refuse.
+  # shellcheck disable=SC2071
+  [[ ${#digits} == "${#limit}" && ( "$digits" == "$limit" || "$digits" < "$limit" ) ]]
+}
+
 session_shape_problems() { # file
-  local f="$1" key t i
+  local f="$1" key t i mode
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
   if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
@@ -550,7 +606,30 @@ session_shape_problems() { # file
     echo "session.json is not a JSON object"
     return 0
   fi
+  # Reuse the text walker to reject duplicate critical keys (including
+  # escaped spellings), JSON5 keys and NUL-containing encodings before
+  # plutil's last-key-wins view can bless a mode the app would not read.
+  record_text_problems "$f" session
+  # Keep stored trailing newlines: "unlimited\n" is not the Swift enum case.
+  mode="$(extract "$f" mode || true; echo .)"
+  mode="${mode%.}"; mode="${mode%$'\n'}"
+  t="$(type_of "$f" mode)"
+  if [[ -z "$t" ]]; then
+    mode=timed # Legacy data must still have its original deadline.
+  elif [[ "$t" != string || ( "$mode" != timed && "$mode" != unlimited ) ]]; then
+    echo "mode is not timed or unlimited"
+  fi
+  if [[ "$mode" == unlimited ]]; then
+    t="$(type_of "$f" endsAt)"
+    [[ -z "$t" || "$t" == "(any)" ]] || echo "unlimited session has an endsAt"
+    t="$(type_of "$f" ownerPID)"
+    i="$(extract "$f" ownerPID || true)"
+    if [[ "$t" != integer || ! "$i" =~ ^[0-9]{1,10}$ ]] || (( 10#${i:-0} < 1 || 10#${i:-0} > 2147483647 )); then
+      echo "unlimited ownerPID is not a positive Int32"
+    fi
+  fi
   for key in startedAt endsAt; do
+    [[ "$key" == endsAt && "$mode" == unlimited ]] && continue
     t="$(type_of "$f" "$key")"
     if [[ -z "$t" ]]; then
       echo "$key is missing"
@@ -560,6 +639,26 @@ session_shape_problems() { # file
       echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
+  t="$(type_of "$f" ownerPID)"
+  if [[ -n "$t" && "$t" != "(any)" ]] && ! session_integer_fits "$f" ownerPID 32; then
+    echo "ownerPID is not an Int32"
+  fi
+  t="$(type_of "$f" ownerIdentity)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != dictionary ]]; then
+      echo "ownerIdentity is not an object"
+    else
+      session_integer_fits "$f" ownerIdentity.startedAt 64 || echo "ownerIdentity.startedAt is not an Int64"
+      session_integer_fits "$f" ownerIdentity.startedAtMicros 32 || echo "ownerIdentity.startedAtMicros is not an Int32"
+      [[ "$(type_of "$f" ownerIdentity.bootSession)" == string ]] || echo "ownerIdentity.bootSession is not a string"
+    fi
+  fi
+  t="$(type_of "$f" ownerExecutable)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != string || "$(extract "$f" ownerExecutable || true)" != /* ]]; then
+      echo "ownerExecutable is not an absolute executable path"
+    fi
+  fi
   t="$(type_of "$f" extensions)"
   if [[ -z "$t" ]]; then
     echo "extensions is missing"

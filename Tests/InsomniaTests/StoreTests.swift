@@ -27,6 +27,77 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(try store.loadSession(), s)
     }
 
+    func testUnlimitedOwnerUsesTheHelpersFlatWireSchema() throws {
+        let owner = SessionOwner(
+            pid: 4242,
+            identity: ProcessIdentity(startedAt: 1_800_000_000, startedAtMicros: 17, bootSession: "fixture-boot"),
+            executable: "/development build/Insomnia"
+        )
+        let session = Session(unlimitedStartedAt: Date(timeIntervalSince1970: 1_800_000_000), owner: owner, extensions: [600])
+        try store.saveSession(session)
+        XCTAssertEqual(try store.loadSession(), session)
+        XCTAssertEqual(try store.loadSession()?.owner, owner)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: home.paths.sessionFile)) as? [String: Any])
+        XCTAssertEqual(json["mode"] as? String, "unlimited")
+        XCTAssertNil(json["endsAt"])
+        XCTAssertNil(json["owner"], "the helper reads flat ownership keys, not a nested owner")
+        XCTAssertEqual(json["ownerPID"] as? Int32, owner.pid)
+        XCTAssertEqual(json["ownerExecutable"] as? String, owner.executable)
+        let identity = try XCTUnwrap(json["ownerIdentity"] as? [String: Any])
+        XCTAssertEqual(identity["startedAt"] as? Int64, owner.identity.startedAt)
+        XCTAssertEqual(identity["startedAtMicros"] as? Int32, owner.identity.startedAtMicros)
+        XCTAssertEqual(identity["bootSession"] as? String, owner.identity.bootSession)
+    }
+
+    func testLegacyOwnershipCombinationsSurvivePersistenceAndTimedExtension() throws {
+        let fields: [(String, Any)] = [
+            ("ownerPID", 4242),
+            ("ownerIdentity", ["startedAt": 1_800_000_000, "startedAtMicros": 17, "bootSession": "fixture-boot"]),
+            ("ownerExecutable", "/development build/Insomnia"),
+        ]
+        for unlimited in [false, true] {
+            for mask in 0..<8 where !unlimited || mask & 1 != 0 {
+                var fixture: [String: Any] = ["startedAt": "2027-01-15T08:00:00Z", "extensions": [600]]
+                if unlimited {
+                    fixture["mode"] = "unlimited"
+                } else {
+                    // No mode is the original timed wire format.
+                    fixture["endsAt"] = "2027-01-15T09:00:00Z"
+                }
+                for (index, field) in fields.enumerated() where mask & (1 << index) != 0 {
+                    fixture[field.0] = field.1
+                }
+                try JSONSerialization.data(withJSONObject: fixture).write(to: home.paths.sessionFile)
+                let decoded = try XCTUnwrap(store.loadSession())
+                XCTAssertEqual(decoded.isUnlimited, unlimited)
+                XCTAssertEqual(decoded.owner != nil, mask == 7)
+                let updated = SessionMath.extended(decoded, by: 600, now: decoded.startedAt, maxDuration: 86400)
+                XCTAssertEqual(updated.endsAt, decoded.endsAt?.addingTimeInterval(600))
+                try store.saveSession(updated)
+                XCTAssertEqual(try store.loadSession(), updated)
+                let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: home.paths.sessionFile)) as? [String: Any])
+                for (key, _) in fields {
+                    XCTAssertEqual(saved[key] as? NSObject, fixture[key] as? NSObject, "ownership evidence changed for mask \(mask)")
+                }
+            }
+        }
+    }
+
+    func testMalformedSessionOwnershipIsStillRejected() throws {
+        for fields in [
+            #""ownerPID":0"#,
+            #""ownerPID":-1"#,
+            #""ownerPID":4294971538"#,
+            #""ownerPID":"4242""#,
+            #""ownerPID":4242,"ownerIdentity":{"startedAt":1800000000}"#,
+            #""ownerPID":4242,"ownerExecutable":"relative/Insomnia""#,
+        ] {
+            let json = "{\"mode\":\"unlimited\",\"startedAt\":\"2027-01-15T08:00:00Z\",\"extensions\":[],\(fields)}"
+            try Data(json.utf8).write(to: home.paths.sessionFile)
+            XCTAssertThrowsError(try store.loadSession(), json)
+        }
+    }
+
     func testStateRoundTripPreservesOptionals() throws {
         var st = RuntimeState()
         st.sleepDisabledByUs = true

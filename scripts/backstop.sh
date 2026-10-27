@@ -28,7 +28,14 @@
 # the lock file's inode.
 #
 # Decision, driven only by what the journal says was changed:
-#   - session.json valid (endsAt in the future) and no --force: exit 0.
+#   - session.json timed with endsAt in the future, or explicitly unlimited
+#     with its owning Insomnia process verified alive, and no --force: exit 0.
+#     Unlimited verifies the recorded executable path (installed path for
+#     older records), this user's uid and
+#     running state; recorded identity also checks boot and start second.
+#     ps cannot compare ownerIdentity.startedAtMicros, so same-second reuse
+#     by the same executable is a remaining limitation. Missing/unverifiable
+#     owners end unlimited operation conservatively, never wait on a deadline.
 #   - state.json missing or clean: nothing is undone and nothing privileged
 #     runs; an expired session.json is removed. Exit 0. Entries in
 #     savedAudioOutputs alone count as clean (see below).
@@ -140,8 +147,8 @@
 #   - session.json present but not readable at all (permissions, I/O), or
 #     not a regular file (a FIFO or device is never opened: open(2) could
 #     block while this run holds the lock): its end time is unknown, and
-#     sleep is never held without a deadline that can be enforced, so it is
-#     treated as expired and the journal is undone as above. The file is
+#     sleep is never held without a deadline or verified unlimited owner, so
+#     it is treated as expired and the journal is undone as above. The file is
 #     never opened, read or removed: it may have been a valid session. Once
 #     the journal is clean it is renamed aside like a malformed one, so its
 #     bytes stay as evidence and no later run, of this script or the app,
@@ -153,7 +160,8 @@
 # still two operations, in the app binary as here; the binary does each
 # entry's lookup right before that entry's signal, never all lookups first.
 #
-# --force: treat the session as expired even if endsAt is in the future
+# --force: treat the session as expired even if timed endsAt is in the future
+# or an unlimited owner is still alive
 # (used by install.sh / uninstall.sh to end a stale session deliberately).
 #
 # Honours INSOMNIA_HOME with the same layout as the app (see Paths.swift).
@@ -564,10 +572,13 @@ stop_transaction() { # what
 # decoder's Unicode equivalence, so a file with neither "keptDisplay" nor a
 # backslash in it has none of them and is not read further. Any of these
 # makes the journal malformed, as for a wrong type, and nothing is undone.
-record_text_problems() { # file
+# With the optional `session` argument the walker checks session keys and
+# the identity fields inside ownerIdentity for duplicates instead of checking
+# display records, so mode and owner never rely on plutil's last-key-wins view.
+record_text_problems() { # file [session]
   local LC_ALL=C
   local text rest raw key c token depth str plain scalar number esc hex lost
-  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead
+  local n_low=0 n_lit=0 n_boot=0 digits sig exp e10 lead seen="" scope="" label=state.json
   str='^"([^"\\]|\\.)*"'
   plain='^[^]["{}]+'
   scalar='^[^],}[:space:]]+'
@@ -576,7 +587,12 @@ record_text_problems() { # file
   hex='^u[0-9A-Fa-f]{4}'
   lost="the top level of state.json cannot be followed here, so its records about a kept display entry cannot be checked"
   text="$(<"$1")"
-  [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  if [[ "${2:-}" == session ]]; then
+    label=session.json
+    lost="the top level of session.json cannot be followed here, so its mode and owner cannot be checked"
+  else
+    [[ "$text" == *keptDisplay* || "$text" == *\\* ]] || return 0
+  fi
   if IFS= read -r -d '' c < "$1"; then
     echo "$lost"
     return 0
@@ -588,7 +604,17 @@ record_text_problems() { # file
   while :; do
     rest="${rest#"${rest%%[![:space:]]*}"}"
     # An empty object, or a comma before the end, which the app accepts.
-    [[ "${rest:0:1}" == "}" ]] && break
+    if [[ "${rest:0:1}" == "}" ]]; then
+      [[ -n "$scope" ]] || break
+      scope=""
+      rest="${rest:1}"
+      rest="${rest#"${rest%%[![:space:]]*}"}"
+      case "${rest:0:1}" in
+        ,) rest="${rest:1}"; continue ;;
+        '}') break ;;
+        *) echo "$lost"; return 0 ;;
+      esac
+    fi
     [[ "$rest" =~ $str ]] || { echo "$lost"; return 0; }
     raw="${BASH_REMATCH[0]}"
     rest="${rest:${#raw}}"
@@ -610,15 +636,31 @@ record_text_problems() { # file
       else
         case "${raw:0:1}" in
           '"'|\\|/|b|f|n|r|t) key+="?"; raw="${raw:1}" ;;
-          *) echo "a key in state.json has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
+          *) echo "a key in $label has an escape JSON does not have, so its records about a kept display entry cannot be checked"; return 0 ;;
         esac
       fi
     done
     key+="$raw"
+    if [[ "${2:-}" == session ]]; then
+      case "$scope:$key" in
+        :mode|:startedAt|:endsAt|:extensions|:ownerPID|:ownerIdentity|:ownerExecutable|ownerIdentity:startedAt|ownerIdentity:startedAtMicros|ownerIdentity:bootSession)
+          [[ -z "$scope" ]] || key="$scope.$key"
+          if [[ "$seen" == *"|$key|"* ]]; then
+            echo "$key is repeated in session.json; the app reads the first and plutil the last"
+            return 0
+          fi
+          seen+="|$key|" ;;
+      esac
+    fi
     rest="${rest#"${rest%%[![:space:]]*}"}"
     [[ "${rest:0:1}" == : ]] || { echo "$lost"; return 0; }
     rest="${rest:1}"
     rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "${2:-}" == session && -z "$scope" && "$key" == ownerIdentity && "${rest:0:1}" == '{' ]]; then
+      scope=ownerIdentity
+      rest="${rest:1}"
+      continue
+    fi
     token=""
     case "${rest:0:1}" in
       '"')
@@ -649,13 +691,17 @@ record_text_problems() { # file
         rest="${rest:${#token}}"
         ;;
     esac
-    case "$key" in
-      keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
-      keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
-      # The boot is a string, whose type plutil checks.
-      keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
-      *) token="" ;;
-    esac
+    if [[ "${2:-}" == session ]]; then
+      token="" # Unknown display keys in a session are not journal records.
+    else
+      case "$key" in
+        keptDisplayUnderLowPower) n_low=$((n_low + 1)) ;;
+        keptDisplayReadLit) n_lit=$((n_lit + 1)) ;;
+        # The boot is a string, whose type plutil checks.
+        keptDisplayUnderLowPowerBoot) n_boot=$((n_boot + 1)); token="" ;;
+        *) token="" ;;
+      esac
+    fi
     if [[ -n "$token" && "$token" != null ]]; then
       if [[ "$token" =~ $number ]]; then
         digits="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
@@ -684,7 +730,7 @@ record_text_problems() { # file
     rest="${rest#"${rest%%[![:space:]]*}"}"
     case "${rest:0:1}" in
       ,) rest="${rest:1}" ;;
-      '}') break ;;
+      '}') [[ -n "$scope" ]] || break ;;
       *) echo "$lost"; return 0 ;;
     esac
   done
@@ -834,14 +880,33 @@ epoch_at() { # file keypath
   epoch_of "${v%$'\n'}"
 }
 
-# Prints one line per way session.json does not have the shape the app's
-# Session decoder needs (Session.swift): a JSON object whose startedAt and
-# endsAt are dates as Store.swift writes them and whose extensions is an
-# array of numbers. All three are required; extra keys are ignored, as in
-# Swift. The app refuses a file with any of these problems, so the shell
-# does not act on its endsAt either.
+# A present owner field must fit the Swift signed integer decoder too.
+# Compare decimal strings, not bash arithmetic, so overflow cannot turn an
+# oversized persisted pid into a small live pid.
+session_integer_fits() { # file keypath bits
+  local value digits limit
+  [[ "$(type_of "$1" "$2")" == integer ]] || return 1
+  value="$(extract "$1" "$2" || true)"
+  [[ "$value" =~ ^-?[0-9]+$ ]] || return 1
+  digits="${value#-}"
+  if [[ "$3" == 32 ]]; then
+    limit=2147483647; [[ "$value" == -* ]] && limit=2147483648
+  else
+    limit=9223372036854775807; [[ "$value" == -* ]] && limit=9223372036854775808
+  fi
+  (( ${#digits} < ${#limit} )) && return 0
+  # Equal-width decimal strings sort numerically under LC_ALL=C. Arithmetic
+  # would overflow exactly the values this decoder guard needs to refuse.
+  # shellcheck disable=SC2071
+  [[ ${#digits} == "${#limit}" && ( "$digits" == "$limit" || "$digits" < "$limit" ) ]]
+}
+
+# Session.swift requires startedAt and extensions in both modes. Missing
+# mode is legacy timed, which still requires endsAt. Unlimited must have no
+# deadline and a positive ownerPID; ownerIdentity is optional, but when
+# present must decode as ProcessIdentity. Unknown modes never hold sleep.
 session_shape_problems() { # file
-  local f="$1" key t i
+  local f="$1" key t i mode
   # plutil also reads XML and binary property lists, which the app's
   # JSONDecoder refuses, so the file itself must start with "{" too.
   if [[ "$(LC_ALL=C tr -d ' \t\r\n' < "$f" 2>/dev/null | head -c 1)" != "{" ]] \
@@ -849,7 +914,30 @@ session_shape_problems() { # file
     echo "session.json is not a JSON object"
     return 0
   fi
+  # Reuse the text walker to reject duplicate critical keys (including
+  # escaped spellings), JSON5 keys and NUL-containing encodings before
+  # plutil's last-key-wins view can bless a mode the app would not read.
+  record_text_problems "$f" session
+  # Keep stored trailing newlines: "unlimited\n" is not the Swift enum case.
+  mode="$(extract "$f" mode || true; echo .)"
+  mode="${mode%.}"; mode="${mode%$'\n'}"
+  t="$(type_of "$f" mode)"
+  if [[ -z "$t" ]]; then
+    mode=timed # Legacy data must still have its original deadline.
+  elif [[ "$t" != string || ( "$mode" != timed && "$mode" != unlimited ) ]]; then
+    echo "mode is not timed or unlimited"
+  fi
+  if [[ "$mode" == unlimited ]]; then
+    t="$(type_of "$f" endsAt)"
+    [[ -z "$t" || "$t" == "(any)" ]] || echo "unlimited session has an endsAt"
+    t="$(type_of "$f" ownerPID)"
+    i="$(extract "$f" ownerPID || true)"
+    if [[ "$t" != integer || ! "$i" =~ ^[0-9]{1,10}$ ]] || (( 10#${i:-0} < 1 || 10#${i:-0} > 2147483647 )); then
+      echo "unlimited ownerPID is not a positive Int32"
+    fi
+  fi
   for key in startedAt endsAt; do
+    [[ "$key" == endsAt && "$mode" == unlimited ]] && continue
     t="$(type_of "$f" "$key")"
     if [[ -z "$t" ]]; then
       echo "$key is missing"
@@ -859,6 +947,26 @@ session_shape_problems() { # file
       echo "$key is not a date in the form 2027-01-15T08:00:00Z or 2027-01-15T10:00:00+02:00"
     fi
   done
+  t="$(type_of "$f" ownerPID)"
+  if [[ -n "$t" && "$t" != "(any)" ]] && ! session_integer_fits "$f" ownerPID 32; then
+    echo "ownerPID is not an Int32"
+  fi
+  t="$(type_of "$f" ownerIdentity)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != dictionary ]]; then
+      echo "ownerIdentity is not an object"
+    else
+      session_integer_fits "$f" ownerIdentity.startedAt 64 || echo "ownerIdentity.startedAt is not an Int64"
+      session_integer_fits "$f" ownerIdentity.startedAtMicros 32 || echo "ownerIdentity.startedAtMicros is not an Int32"
+      [[ "$(type_of "$f" ownerIdentity.bootSession)" == string ]] || echo "ownerIdentity.bootSession is not a string"
+    fi
+  fi
+  t="$(type_of "$f" ownerExecutable)"
+  if [[ -n "$t" && "$t" != "(any)" ]]; then
+    if [[ "$t" != string || "$(extract "$f" ownerExecutable || true)" != /* ]]; then
+      echo "ownerExecutable is not an absolute executable path"
+    fi
+  fi
   t="$(type_of "$f" extensions)"
   if [[ -z "$t" ]]; then
     echo "extensions is missing"
@@ -872,6 +980,44 @@ session_shape_problems() { # file
       i=$((i + 1))
     done
   fi
+}
+
+# An unlimited session is held only by its owning app, never by a generic
+# live pid. Read identity in one ps snapshot; comm is the executable path,
+# not argv, so another command mentioning Insomnia does not count. A lookup
+# failure cannot establish a live owner: unlimited operation needs the app's
+# safety checks, so it is ended conservatively instead of held indefinitely.
+unlimited_owner_alive() { # session file
+  local pid out w mon day time year stat uid executable expected started micros boot observed
+  pid="$(extract "$1" ownerPID || true)"
+  out="$("$PS" -ww -o lstart=,stat=,uid=,comm= -p "$pid" 2>/dev/null)" || return 1
+  [[ "$out" != *$'\n'* ]] || return 1
+  read -r w mon day time year stat uid executable <<< "$out"
+  expected="$INSOMNIA_BIN"
+  if [[ "$(type_of "$1" ownerExecutable)" == string ]]; then
+    expected="$(extract "$1" ownerExecutable; echo .)"
+    expected="${expected%.}"; expected="${expected%$'\n'}"
+  fi
+  [[ "$uid" == "$(id -u)" && "$executable" == "$expected" ]] || return 1
+  [[ -n "$w" && -n "$mon" && -n "$day" && -n "$time" && -n "$year" && -n "$stat" ]] || return 1
+  [[ "$stat" != Z* && "$stat" != T* ]] || return 1
+  observed="$("$DATE" -j -u -f '%a %b %d %H:%M:%S %Y' "$w $mon $day $time $year" +%s 2>/dev/null)" || return 1
+  [[ "$observed" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$(type_of "$1" ownerIdentity)" == dictionary ]]; then
+    started="$(extract "$1" ownerIdentity.startedAt || true)"
+    micros="$(extract "$1" ownerIdentity.startedAtMicros || true)"
+    [[ "$micros" =~ ^[0-9]{1,6}$ ]] || return 1
+    boot="$(extract "$1" ownerIdentity.bootSession || true; echo .)"
+    boot="${boot%.}"; boot="${boot%$'\n'}"
+    [[ -n "$boot" && "$boot" == "$("$SYSCTL" -n kern.bootsessionuuid 2>/dev/null)" ]] || return 1
+    [[ "$observed" == "$started" ]] || return 1
+  else
+    # Only an owner without kernel identity needs the session-age fallback.
+    # A recovered timed session can predate its current, identified owner.
+    # Whole-second timestamps still leave a subsecond ambiguity.
+    (( observed <= $(epoch_at "$1" startedAt) )) || return 1
+  fi
+  return 0
 }
 
 # --- Read the session --------------------------------------------------------
@@ -895,7 +1041,9 @@ if [[ -e "$SESSION" ]]; then
       session_state=malformed
     else
       ends_at="$(extract "$SESSION" endsAt || true)"
-      if (( $(epoch_at "$SESSION" endsAt) > $("$DATE" -u +%s) )); then
+      if [[ "$(extract "$SESSION" mode || true)" == unlimited ]]; then
+        if unlimited_owner_alive "$SESSION"; then session_state=valid; else session_state=expired; fi
+      elif (( $(epoch_at "$SESSION" endsAt) > $("$DATE" -u +%s) )); then
         session_state=valid
       else
         session_state=expired
@@ -1014,6 +1162,12 @@ case "$session_state" in
   malformed)  session_note="session.json unreadable" ;;
   unreadable) session_note="session.json cannot be read ($unreadable_why), so its end time is unknown; treated as expired" ;;
 esac
+if [[ "$session_state" == valid || "$session_state" == expired ]] && [[ "$(extract "$SESSION" mode || true)" == unlimited ]]; then
+  case "$session_state" in
+    valid) session_note="forced end of unlimited session" ;;
+    expired) session_note="unlimited session owner is gone or cannot be verified" ;;
+  esac
+fi
 
 outputs_note="saved audio for $output_count output device(s), kept for the app, which restores each once it is connected"
 

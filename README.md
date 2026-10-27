@@ -5,14 +5,14 @@
 <h1 align="center">Insomnia</h1>
 
 <p align="center">
-  <strong>Keep your Mac awake. Give the session an end time.</strong>
+  <strong>Keep your Mac awake. Choose a timer or go unlimited.</strong>
 </p>
 
 <p align="center">
-  A macOS menu bar app for timed awake sessions. Insomnia is an eye icon that
-  lives in your MacBook menu bar. It has no Dock icon and no main window. Set
-  how long your Mac stays awake, choose what happens when the lid closes, and
-  see when something could not be undone.
+  A macOS menu bar app for timed or unlimited awake sessions. Insomnia is an
+  eye icon that lives in your MacBook menu bar. It has no Dock icon and no
+  main window. Choose how long your Mac stays awake, what happens when the
+  lid closes, and see when something could not be undone.
 </p>
 
 <p align="center">
@@ -101,9 +101,13 @@ file and explains how upgrades replace them.
 ## Using it
 
 1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
-   and press Enter.
-2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
+   and press Enter. Or click **∞** after Minutes to start immediately with
+   no time limit, ignoring any entered values.
+2. **Add time or go unlimited.** Click the eye or countdown during a timed
+   session. Enter more time, or click **∞** to remove the deadline.
+3. **End.** Press and hold the end control next to the countdown or **∞**.
+   Clicking a running **∞** does nothing; stop it and start a new session
+   to return to a timer.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.
@@ -129,7 +133,8 @@ watch, and read `~/Library/Logs/Insomnia/insomnia.log` afterward.
 </p>
 
 During a session, closing the lid does each of these, and opening it tries
-to undo them. The timer keeps counting down while the lid is closed.
+to undo them. Timed sessions keep counting down while the lid is closed;
+unlimited sessions keep running without a deadline.
 
 - **Display and keyboard light go off.** Insomnia saves their brightness
   first. With sleep turned off, macOS no longer does this by itself.
@@ -161,8 +166,13 @@ and how to test lid actions without closing the lid.
 
 Insomnia writes each change to a **recovery journal**, a file on disk, before
 it makes the change. Ending the session tries to undo what the journal lists.
-If the app crashes or quits, the recovery agent tries the same once the
-session's end time has passed.
+Normal Quit ends either kind of session. If the app crashes or is force-quit,
+the recovery agent tries cleanup after a timed session's deadline, or once
+it detects that an unlimited session's owning app is gone. It checks every
+minute, so this is not instantaneous. Relaunching does not resume an
+interrupted unlimited session; the app attempts cleanup instead. Unlimited
+mode still respects the configured battery and heat protections while the
+app runs.
 
 Some things need you:
 

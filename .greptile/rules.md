@@ -8,8 +8,9 @@ they are not flagged again.
 ## How recovery works
 
 The app writes two JSON files under `~/Library/Application Support/Insomnia`
-(or `INSOMNIA_HOME`): `session.json`, whose `endsAt` is the only thing that
-keeps sleep disabled, and `state.json` (`RuntimeState`), the journal of
+(or `INSOMNIA_HOME`): `session.json`, whose future `endsAt` authorizes a
+timed session and whose explicit unlimited mode requires a live matching
+owner identity, and `state.json` (`RuntimeState`), the journal of
 everything Insomnia changed and must undo. Every change is journaled before
 it is made and undone from the journal, never from memory. A session starts
 by writing both files, arming the launchd backstop, and only then running
@@ -19,7 +20,8 @@ The app undoes the journal itself at session end, Quit, lid open, and at
 every launch (reconcile). `scripts/backstop.sh`, installed by `install.sh`
 and run by a per-user LaunchAgent at load and every 60 s with macOS
 `/bin/bash 3.2`, undoes it when the app cannot: once `session.json` is
-missing or expired it runs `sudo -n pmset -a disablesleep 0` and
+missing, expired, or unlimited with its owning app gone it runs
+`sudo -n pmset -a disablesleep 0` and
 `-b lowpowermode 0` for the journaled flags and sends SIGCONT only to a
 journaled pid that still exists, is stopped, started in this boot session at
 the journaled second, and belongs to this user. Entries that record

@@ -78,6 +78,34 @@ final class UIStartupTests: XCTestCase {
     // MARK: Success
 
     @MainActor
+    func testUnlimitedStartsImmediatelyIgnoringInputsAndWaitsForConfirmation() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        let gate = AsyncGate()
+        rig.h.backstop.armGate = gate
+        rig.openAndTypeOneDay()
+
+        rig.controller.unlimitedTapped()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(rig.model.phase, .starting)
+        XCTAssertEqual(rig.model.pendingCountdown, "∞")
+        XCTAssertFalse(rig.model.phase.showsRunningControls)
+        XCTAssertFalse(rig.manager.isActive)
+        XCTAssertFalse(rig.controller.pendingTickArmed)
+        rig.controller.unlimitedTapped()
+        rig.controller.holdToEnd()
+
+        await gate.open()
+        let confirmed = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(rig.manager.session?.isUnlimited, true)
+        XCTAssertNil(rig.manager.session?.endsAt)
+        XCTAssertEqual(rig.manager.countdownText, "∞")
+        XCTAssertNil(rig.model.pendingCountdown)
+        XCTAssertTrue(rig.model.phase.showsRunningControls)
+    }
+
+    @MainActor
     func testEnterShowsStartingWithoutRunningControlsUntilTheManagerConfirms() async {
         let rig = Rig()
         defer { rig.h.home.destroy() }
@@ -117,6 +145,35 @@ final class UIStartupTests: XCTestCase {
         XCTAssertEqual(rig.h.backstop.arms, 1)
     }
 
+    @MainActor
+    func testUnlimitedWithEmptyInputsStartsWithoutADefaultPreset() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        rig.manager.config.defaultPreset = 0
+        rig.controller.expand(mode: .start)
+        rig.controller.unlimitedTapped()
+        let confirmed = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(rig.manager.session?.isUnlimited, true)
+    }
+
+    @MainActor
+    func testUnlimitedKeyboardActionStartsFromTheExistingKeyCatcher() async throws {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        rig.controller.expand(mode: .start)
+        let panel = try XCTUnwrap(NSApp.windows.compactMap { $0 as? KeyCatcherPanel }.first { $0.isVisible })
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: panel.windowNumber, context: nil,
+            characters: "u", charactersIgnoringModifiers: "u", isARepeat: false, keyCode: 32
+        ))
+        NSApp.sendEvent(event)
+        let confirmed = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(rig.manager.session?.isUnlimited, true)
+    }
+
     /// Bare Enter (default preset) goes through the same pending phase.
     @MainActor
     func testBareEnterAlsoWaitsInStartingBeforeRunning() async {
@@ -137,6 +194,40 @@ final class UIStartupTests: XCTestCase {
     }
 
     // MARK: Failure
+
+    @MainActor
+    func testRefusedUnlimitedStartRestoresInputsAndFailureReporting() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        let gate = AsyncGate()
+        rig.h.backstop.armGate = gate
+        rig.h.backstop.failArm = true
+        rig.openAndTypeOneDay()
+        rig.controller.unlimitedTapped()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(rig.model.phase, .starting)
+        XCTAssertEqual(rig.model.pendingCountdown, "∞")
+        await gate.open()
+        let refused = await waitUntil { rig.model.phase.isEntering }
+        XCTAssertTrue(refused)
+        XCTAssertFalse(rig.manager.isActive)
+        XCTAssertEqual(rig.model.phase, .entering(.start))
+        XCTAssertEqual(rig.model.input.total, 86400)
+        XCTAssertEqual(rig.model.startError, MenuBarModel.startFailedText)
+        XCTAssertNil(rig.model.pendingCountdown)
+        XCTAssertNotNil(rig.manager.lastError)
+        try? await Task.sleep(for: .milliseconds(600))
+        XCTAssertTrue(rig.model.slotsPresent, "the cancelled fold must not hide restored inputs")
+
+        rig.h.backstop.armGate = nil
+        rig.h.backstop.failArm = false
+        rig.controller.unlimitedTapped()
+        XCTAssertFalse(rig.model.startErrorShown)
+        let confirmed = await waitUntil { rig.model.phase == .running && !rig.model.slotsPresent }
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(rig.manager.session?.isUnlimited, true)
+        XCTAssertNil(rig.model.startError)
+    }
 
     @MainActor
     func testImmediateHelperFailureReopensThePillsWithTheValueAndAConciseError() async {
@@ -322,6 +413,91 @@ final class UIStartupTests: XCTestCase {
         XCTAssertTrue(ok)
         XCTAssertEqual(rig.manager.countdownText, "4:00:00")
         XCTAssertEqual(rig.model.phase, .running)
+    }
+
+    @MainActor
+    func testTimedSessionConvertsToUnlimitedAndRunningInfinityCannotOpenEntry() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        await rig.manager.start(duration: 3600)
+        let startedAt = rig.manager.session?.startedAt
+        let running = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(running)
+        rig.controller.customExtend()
+        XCTAssertTrue(rig.model.input.append(digit: 2, to: .hours))
+        rig.controller.unlimitedTapped()
+        XCTAssertEqual(rig.model.pendingCountdown, "∞")
+        XCTAssertEqual(rig.model.phase, .running)
+        let converted = await waitUntil { rig.manager.session?.isUnlimited == true && rig.model.pendingCountdown == nil }
+        XCTAssertTrue(converted)
+        let folded = await waitUntil { !rig.model.slotsPresent }
+        XCTAssertTrue(folded)
+        XCTAssertEqual(rig.manager.session?.startedAt, startedAt)
+        XCTAssertEqual(rig.manager.countdownText, "∞")
+
+        let session = rig.manager.session
+        rig.controller.customExtend()
+        rig.controller.iconTapped()
+        rig.controller.unlimitedTapped()
+        XCTAssertEqual(rig.model.phase, .running)
+        XCTAssertFalse(rig.model.slotsPresent)
+        XCTAssertEqual(rig.manager.session, session)
+
+        rig.controller.holdToEnd()
+        let ended = await waitUntil { !rig.manager.isActive && rig.model.phase == .idle }
+        XCTAssertTrue(ended)
+    }
+
+    @MainActor
+    func testRefusedUnlimitedConversionReturnsToTheOriginalTimedCountdown() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        await rig.manager.start(duration: 3600)
+        let running = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(running)
+        let original = rig.manager.session
+        let gate = AsyncGate()
+        rig.h.backstop.armGate = gate
+        rig.h.backstop.failArm = true
+        rig.controller.customExtend()
+        rig.controller.unlimitedTapped()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(rig.model.phase, .running)
+        XCTAssertTrue(rig.model.phase.showsRunningControls)
+        XCTAssertEqual(rig.model.pendingCountdown, "∞")
+        XCTAssertEqual(rig.manager.session, original)
+        rig.controller.customExtend()
+        XCTAssertEqual(rig.model.phase, .running, "clicking the pending infinity is also inert")
+        await gate.open()
+        let refused = await waitUntil { rig.model.pendingCountdown == nil && !rig.model.slotsPresent }
+        XCTAssertTrue(refused)
+        XCTAssertEqual(rig.manager.session, original)
+        XCTAssertEqual(rig.manager.countdownText, "1:00:00")
+        XCTAssertEqual(rig.model.phase, .running)
+        XCTAssertNil(rig.model.startError)
+        XCTAssertNotNil(rig.manager.lastError)
+    }
+
+    @MainActor
+    func testEndingWhileUnlimitedConversionIsPendingLeavesTheItemIdle() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        await rig.manager.start(duration: 3600)
+        let running = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(running)
+        let gate = AsyncGate()
+        rig.h.backstop.armGate = gate
+        rig.controller.customExtend()
+        rig.controller.unlimitedTapped()
+        await gate.waitUntilStarted()
+        rig.controller.holdToEnd()
+        await settleQueuedRequests()
+        await gate.open()
+        let ended = await waitUntil { !rig.manager.isActive && rig.model.phase == .idle && !rig.model.slotsPresent }
+        XCTAssertTrue(ended)
+        XCTAssertNil(rig.model.pendingCountdown)
+        XCTAssertNil(rig.model.startError)
+        XCTAssertEqual(rig.manager.countdownText, "")
     }
 
     // MARK: Running controls

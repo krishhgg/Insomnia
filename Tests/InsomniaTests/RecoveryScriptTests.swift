@@ -35,6 +35,13 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - backstop.sh
 
+    func testUnlimitedRecoveryFixtureSuite() throws {
+        let suite = ScriptFixture.productionScripts.deletingLastPathComponent()
+            .appendingPathComponent("Tests/Shell/backstop-unlimited.sh")
+        let r = try fx.run(suite)
+        XCTAssertEqual(r.status, 0, r.stdout + r.stderr)
+    }
+
     func testPrivilegedCommandFailureExitsNonzeroAndKeepsJournal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false,"extra":"keep"}"#)
@@ -121,6 +128,9 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.run(fx.backstop, ["--force"]).status, 75, "--force")
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
         XCTAssertEqual(try fx.run(fx.backstop).status, 75, "a session.json")
+        try #"{"mode":"unlimited","startedAt":"2026-01-01T00:00:00Z","extensions":[],"ownerPID":4242,"ownerExecutable":"/development build/Insomnia","ownerIdentity":{"startedAt":1767225600,"startedAtMicros":17,"bootSession":"\#(fx.bootUUID)"}}"#
+            .write(to: fx.session, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try fx.run(fx.backstop).status, 75, "an unlimited session.json")
         XCTAssertEqual(fx.calls(), [])
     }
 
@@ -874,7 +884,7 @@ final class RecoveryScriptTests: XCTestCase {
             let file = dir.appendingPathComponent("\(i).json")
             try data.write(to: file)
             files.append(file.path)
-            app.append((try? Store.makeDecoder().decode(Session.self, from: data)).map { String(Int($0.endsAt.timeIntervalSince1970)) } ?? "")
+            app.append((try? Store.makeDecoder().decode(Session.self, from: data)).flatMap { $0.endsAt }.map { String(Int($0.timeIntervalSince1970)) } ?? "")
         }
         XCTAssertEqual(app.filter { !$0.isEmpty }.count, 11, "the app reads the first eleven: \(Array(zip(cases, app)))")
         for script in [fx.backstop, fx.uninstall] {
@@ -1333,6 +1343,22 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     // MARK: - uninstall.sh
+
+    func testUninstallPreservesValidUnlimitedEvidenceWhenRestoreFails() throws {
+        try fx.installMachinery()
+        try #"{"mode":"unlimited","startedAt":"2026-01-01T00:00:00Z","extensions":[],"ownerPID":4242,"ownerExecutable":"/development build/Insomnia"}"#
+            .write(to: fx.session, atomically: true, encoding: .utf8)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("sudo", "fail")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.session), "failed undo must preserve session evidence")
+        XCTAssertTrue(fx.exists(fx.plist), "recovery must remain installed")
+        XCTAssertTrue(r.stderr.contains("session.json is still present"), r.stderr)
+        XCTAssertFalse(r.stderr.contains("is not a session"), r.stderr)
+    }
 
     func testUninstallAbortsWhenRestoreFailsAndKeepsEverything() throws {
         try fx.installMachinery()
@@ -2740,13 +2766,50 @@ final class RecoveryScriptTests: XCTestCase {
         }
     }
 
+    func testConflictingOwnerIdentityFieldsAreRefusedByBothScripts() throws {
+        let fields = ["startedAt", "startedAtMicros", "bootSession"]
+        let firstValues = ["1767225599", "-1", #""old-boot""#]
+        let lastValues = ["1767225600", "17", #""fixture-boot""#]
+        var inputs: [(label: String, bytes: Data)] = []
+        for (i, field) in fields.enumerated() {
+            for escaped in [false, true] {
+                let secondKey = escaped ? "\(backslash)u00\(String(field.utf8.first!, radix: 16))\(field.dropFirst())" : field
+                let json = "{\"ownerIdentity\":{\"\(field)\":\(firstValues[i]),\"\(secondKey)\":\(lastValues[i])}}"
+                inputs.append(("\(field)-\(escaped)", Data(json.utf8)))
+            }
+        }
+        inputs.append(("mode-after-owner", Data(#"{"mode":"timed","ownerIdentity":{"startedAt":1767225600,"startedAtMicros":17,"bootSession":"fixture-boot"},"mode":"unlimited"}"#.utf8)))
+        inputs.append(("escaped-owner", Data("{\"\(backslash)u006fwnerIdentity\":{\"startedAt\":1767225599,\"startedAt\":1767225600}}".utf8)))
+        let controls = [
+            #"{"startedAt":"2026-01-01T00:00:00Z","ownerIdentity":{"startedAt":1767225600,"startedAtMicros":17,"bootSession":"fixture-boot"},"mode":"unlimited"}"#,
+            #"{"extra":{"ownerIdentity":{"startedAt":1,"startedAt":2}},"ownerIdentity":{"startedAt":1767225600,"extra":{"startedAt":1,"startedAt":2},"startedAtMicros":17,"bootSession":"fixture-boot"}}"#,
+            #"{"ownerIdentity":null,"mode":"unlimited"}"#,
+        ]
+        for (i, json) in controls.enumerated() {
+            inputs.append(("control-\(i)", Data(json.utf8)))
+        }
+        for script in ["backstop.sh", "uninstall.sh"] {
+            let printed = try recordTextProblems(inputs, script: script, session: true)
+            for field in fields {
+                for escaped in [false, true] {
+                    XCTAssertEqual(printed["\(field)-\(escaped)"], "ownerIdentity.\(field) is repeated in session.json; the app reads the first and plutil the last\n", script)
+                }
+            }
+            XCTAssertEqual(printed["mode-after-owner"], "mode is repeated in session.json; the app reads the first and plutil the last\n", script)
+            XCTAssertEqual(printed["escaped-owner"], "ownerIdentity.startedAt is repeated in session.json; the app reads the first and plutil the last\n", script)
+            for i in controls.indices {
+                XCTAssertEqual(printed["control-\(i)"], "", script)
+            }
+        }
+    }
+
     /// record_text_problems as it is in each script, run on its own over
     /// exact bytes: what it prints, or nothing.
-    private func recordTextProblems(_ inputs: [(label: String, bytes: Data)], script: String = "backstop.sh") throws -> [String: String] {
+    private func recordTextProblems(_ inputs: [(label: String, bytes: Data)], script: String = "backstop.sh", session: Bool = false) throws -> [String: String] {
         let f = try ScriptFixture()
         defer { f.destroy() }
         let runner = f.root.appendingPathComponent("record-text-problems.sh")
-        try ("set -euo pipefail\n" + Self.recordTextProblemsSource(script) + "\nrecord_text_problems \"$1\"\n")
+        try ("set -euo pipefail\n" + Self.recordTextProblemsSource(script) + "\nrecord_text_problems \"$1\"" + (session ? " session" : "") + "\n")
             .write(to: runner, atomically: true, encoding: .utf8)
         var printed: [String: String] = [:]
         for (i, input) in inputs.enumerated() {
@@ -2763,7 +2826,7 @@ final class RecoveryScriptTests: XCTestCase {
     private static func recordTextProblemsSource(_ script: String) throws -> String {
         let text = try String(contentsOf: ScriptFixture.productionScripts.appendingPathComponent(script), encoding: .utf8)
         let lines = text.components(separatedBy: "\n")
-        let start = try XCTUnwrap(lines.firstIndex(of: "record_text_problems() { # file"), script)
+        let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("record_text_problems() {") }, script)
         let end = try XCTUnwrap(lines[start...].firstIndex(of: "}"), script)
         return lines[start...end].joined(separator: "\n")
     }

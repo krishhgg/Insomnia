@@ -13,6 +13,275 @@ final class ReconcileTests: XCTestCase {
         h.home.destroy()
     }
 
+    func testUnlimitedFailedStartRestoresOwnership() async throws {
+        let m = h.makeManager()
+        h.guardFake.throwOn = ["disablesleep 1"]
+        await m.startUnlimited()
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), .clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertNotNil(m.lastError)
+    }
+
+    func testUnlimitedEndsForQuitAndSafetyReasons() async throws {
+        let m = h.makeManager()
+        for reason: EndReason in [.batteryFloor, .batteryUnreadable, .thermalCritical, .quit] {
+            await m.startUnlimited()
+            XCTAssertTrue(m.isActive)
+            let outcome = await m.end(reason: reason)
+            XCTAssertEqual(outcome, .restored)
+            XCTAssertNil(try h.store.loadSession())
+            XCTAssertEqual(try h.store.loadState(), .clean)
+            XCTAssertFalse(h.guardFake.sleepDisabled)
+        }
+    }
+
+    func testMalformedModesAndMissingLegacyDeadlineAreCleanedUp() async throws {
+        let fixtures = [
+            #"{"startedAt":"2027-01-15T08:00:00Z","extensions":[]}"#,
+            #"{"mode":"future","startedAt":"2027-01-15T08:00:00Z","endsAt":"2027-01-15T09:00:00Z","extensions":[]}"#,
+            #"{"mode":"timed","startedAt":"2027-01-15T08:00:00Z","extensions":[]}"#,
+            #"{"mode":"unlimited","startedAt":"2027-01-15T08:00:00Z","extensions":[],"ownerPID":0}"#,
+        ]
+        for fixture in fixtures {
+            try Data(fixture.utf8).write(to: h.home.paths.sessionFile)
+            var state = RuntimeState.clean
+            state.sleepDisabledByUs = true
+            try h.store.saveState(state)
+            h.guardFake.sleepDisabled = true
+            let m = h.makeManager()
+            await m.reconcile()
+            XCTAssertFalse(m.isActive, fixture)
+            XCTAssertNil(try h.store.loadSession(), fixture)
+            XCTAssertEqual(try h.store.loadState(), .clean, fixture)
+            XCTAssertFalse(h.guardFake.sleepDisabled, fixture)
+        }
+    }
+
+    func testUnlimitedStartWaitsForConfirmationAndQuitWins() async throws {
+        let m = h.makeManager()
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
+        let starting = await runUntilSuspended { await m.startUnlimited() }
+        await gate.waitUntilStarted()
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(try h.store.loadSession()?.isUnlimited, true)
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        let ending = await runUntilSuspended { await m.end(reason: .quit) }
+        await gate.open()
+        await starting.value
+        let outcome = await ending.value
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), .clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+    }
+
+    func testQuitWinsWhileUnlimitedConversionWaitsForConfirmation() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let original = try XCTUnwrap(m.session)
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
+        let converting = await runUntilSuspended { await m.makeUnlimited() }
+        await gate.waitUntilStarted()
+        XCTAssertEqual(m.session, original)
+        XCTAssertEqual(try h.store.loadSession(), original)
+        let ending = await runUntilSuspended { await m.end(reason: .quit) }
+        await gate.open()
+        await converting.value
+        let outcome = await ending.value
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), .clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+    }
+
+    func testUnlimitedConversionWriteFailurePreservesTimedSession() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let original = try XCTUnwrap(m.session)
+        let file = h.home.paths.sessionFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await m.makeUnlimited()
+        XCTAssertEqual(m.session, original)
+        XCTAssertEqual(try h.store.loadSession(), original)
+        XCTAssertEqual(m.scheduledDeadline, original.endsAt)
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertNotNil(m.lastError)
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        _ = await m.end(reason: .user)
+    }
+
+    func testUnlimitedConversionFailurePreservesTimedDeadline() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let original = try XCTUnwrap(m.session)
+        h.backstop.failArm = true
+        await m.makeUnlimited()
+        XCTAssertEqual(m.session, original)
+        XCTAssertEqual(try h.store.loadSession(), original)
+        XCTAssertEqual(m.scheduledDeadline, original.endsAt)
+        XCTAssertTrue(h.guardFake.sleepDisabled)
+        XCTAssertNotNil(m.lastError)
+        h.backstop.failArm = false
+        _ = await m.end(reason: .user)
+    }
+
+    func testUnlimitedReconcileCannotDiscardAnUnremovableSession() async throws {
+        let m = h.makeManager()
+        await m.startUnlimited()
+        let file = h.home.paths.sessionFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+        XCTAssertFalse(relaunched.isActive)
+        XCTAssertEqual(try h.store.loadSession()?.isUnlimited, true)
+        XCTAssertNotNil(relaunched.pendingEnd)
+        XCTAssertNotNil(relaunched.lastError)
+        let quit = await relaunched.end(reason: .quit)
+        XCTAssertEqual(quit, .sessionRetained)
+        XCTAssertFalse(quit.letsQuitGo)
+        await relaunched.startUnlimited()
+        XCTAssertFalse(relaunched.isActive)
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file)
+        _ = await relaunched.end(reason: .user)
+        _ = await m.end(reason: .user)
+    }
+
+    func testUnlimitedReconcileKeepsFailedRestoreJournaled() async throws {
+        let m = h.makeManager()
+        await m.startUnlimited()
+        h.guardFake.throwOn = ["disablesleep 0"]
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+        XCTAssertFalse(relaunched.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true)
+        XCTAssertNotNil(relaunched.lastError)
+        h.guardFake.throwOn = []
+        _ = await relaunched.end(reason: .user)
+        _ = await m.end(reason: .user)
+    }
+
+    func testLegacyPartialUnlimitedOwnersAreCleanedUpWithoutResuming() async throws {
+        for fields in [
+            #""ownerPID":4242"#,
+            #""ownerPID":4242,"ownerIdentity":{"startedAt":1800000000,"startedAtMicros":17,"bootSession":"fixture-boot"}"#,
+            #""ownerPID":4242,"ownerExecutable":"/development build/Insomnia""#,
+        ] {
+            let json = "{\"mode\":\"unlimited\",\"startedAt\":\"2027-01-15T08:00:00Z\",\"extensions\":[],\(fields)}"
+            try Data(json.utf8).write(to: h.home.paths.sessionFile)
+            XCTAssertTrue(try XCTUnwrap(h.store.loadSession()).isUnlimited)
+            var state = RuntimeState.clean
+            state.sleepDisabledByUs = true
+            try h.store.saveState(state)
+            h.guardFake.sleepDisabled = true
+            // A failed restore must retain the obligation, even though this
+            // older session has no complete owner and must never be resumed.
+            h.guardFake.throwOn = ["disablesleep 0"]
+            let m = h.makeManager()
+            await m.reconcile()
+            XCTAssertFalse(m.isActive, json)
+            XCTAssertNil(try h.store.loadSession(), json)
+            XCTAssertEqual(try h.store.loadState()?.sleepDisabledByUs, true, json)
+            XCTAssertTrue(h.guardFake.sleepDisabled, json)
+            h.guardFake.throwOn = []
+            let outcome = await m.end(reason: .user)
+            XCTAssertEqual(outcome, .restored, json)
+            XCTAssertEqual(try h.store.loadState(), .clean, json)
+            XCTAssertFalse(h.guardFake.sleepDisabled, json)
+        }
+        XCTAssertFalse(h.guardFake.calls.contains("disablesleep 1"), "legacy unlimited sessions must not resume")
+    }
+
+    func testUnlimitedReconcileRestoresInsteadOfResuming() async throws {
+        let m = h.makeManager()
+        await m.startUnlimited()
+        let relaunched = h.makeManager()
+        await relaunched.reconcile()
+        XCTAssertFalse(relaunched.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), .clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+        XCTAssertEqual(h.guardFake.calls.filter { $0.hasPrefix("disablesleep ") }, ["disablesleep 1", "disablesleep 0"])
+        _ = await m.end(reason: .user)
+    }
+
+    func testConvertedSessionSurvivesItsFormerTimedExpiry() async throws {
+        let real = Harness(now: Date())
+        defer { real.home.destroy() }
+        let m = SessionManager(
+            paths: real.home.paths,
+            sleepGuard: real.guardFake,
+            processControl: real.procs,
+            backstop: real.backstop,
+            clamshell: { false },
+            clock: { Date() }
+        )
+        let deadline = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 2).rounded(.up))
+        try real.store.saveSession(Session(startedAt: Date(), endsAt: deadline))
+        await m.reconcile()
+        await m.makeUnlimited()
+        XCTAssertEqual(m.session?.isUnlimited, true)
+        try await Task.sleep(for: .seconds(max(deadline.timeIntervalSinceNow, 0) + 0.2))
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(try real.store.loadSession()?.isUnlimited, true)
+        XCTAssertTrue(real.guardFake.sleepDisabled)
+        XCTAssertEqual(real.guardFake.calls, ["disablesleep 1"])
+        _ = await m.end(reason: .user)
+    }
+
+    func testTimedSessionConvertsWithoutInterruptingSleep() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let original = try XCTUnwrap(m.session)
+        await m.makeUnlimited()
+        let converted = try XCTUnwrap(m.session)
+        XCTAssertTrue(converted.isUnlimited)
+        XCTAssertEqual(converted.startedAt, original.startedAt)
+        XCTAssertEqual(try h.store.loadSession(), converted)
+        XCTAssertEqual(h.guardFake.calls, ["disablesleep 1"])
+        XCTAssertNil(m.scheduledDeadline)
+        h.clock.advance(7200)
+        m.refreshCountdown()
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.countdownText, "∞")
+        await m.extend(by: 3600)
+        XCTAssertEqual(m.session, converted)
+        _ = await m.end(reason: .user)
+    }
+
+    func testUnlimitedStartHasNoDeadlineAndEndsManually() async throws {
+        let m = h.makeManager()
+        await m.startUnlimited()
+        let s = try XCTUnwrap(m.session)
+        XCTAssertTrue(s.isUnlimited)
+        XCTAssertNil(s.endsAt)
+        XCTAssertEqual(try h.store.loadSession(), s)
+        let owner = try XCTUnwrap(s.owner)
+        XCTAssertEqual(owner.pid, ProcessInfo.processInfo.processIdentifier)
+        XCTAssertFalse(owner.identity.bootSession.isEmpty)
+        XCTAssertTrue(owner.executable.hasPrefix("/"))
+        XCTAssertNil(m.scheduledDeadline)
+        XCTAssertEqual(m.remainingText, "∞")
+        XCTAssertEqual(m.countdownText, "∞")
+        h.clock.advance(365 * 86400)
+        m.refreshCountdown()
+        XCTAssertFalse(s.isExpired(at: h.clock.now))
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.countdownText, "∞")
+        let outcome = await m.end(reason: .user)
+        XCTAssertEqual(outcome, .restored)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), .clean)
+        XCTAssertFalse(h.guardFake.sleepDisabled)
+    }
+
     // (a) expired session on disk -> sleep restored, pids resumed, low power cleared, files cleared
     func testExpiredSessionIsFullyRestored() async throws {
         let now = h.clock.now
