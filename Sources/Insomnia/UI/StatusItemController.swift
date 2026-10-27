@@ -342,9 +342,9 @@ final class StatusItemController: NSObject {
     }
 
     /// Collapse to idle, or back to the countdown when a session is running.
-    func collapse() {
+    func collapse(returnFocus: Bool = true) {
         guard model.phase.isEntering else { return }
-        removeMonitors()
+        removeMonitors(returnFocus: returnFocus)
         withAnimation(Motion.base(reduceMotion: reduceMotion)) {
             model.focusVisible = false
         }
@@ -436,6 +436,7 @@ final class StatusItemController: NSObject {
 
     func focus(_ field: DurationInput.Field) {
         guard model.phase.isEntering else { return }
+        keyCatcher?.takeFocus()
         withAnimation(Motion.snappy(reduceMotion: reduceMotion)) {
             model.focused = field
             model.focusVisible = true
@@ -637,6 +638,11 @@ final class StatusItemController: NSObject {
     /// `statusItem.menu`, which would swallow the left click the pills need.
     private func showMenu() {
         guard let button else { return }
+        let typingPanel = keyCatcher
+        collapse(returnFocus: false)
+        defer {
+            if NSApp.keyWindow == nil { typingPanel?.returnFocus() }
+        }
         // The lid, the battery and the watts are read right here, so the menu
         // opens on what the machine is doing now. The SSID and the throttled
         // browser list are whatever the last scan found: both have to be
@@ -751,15 +757,12 @@ final class StatusItemController: NSObject {
 
     private func installMonitors() {
         removeMonitors()
-        // The key monitor below is local, so it only fires on events routed
-        // to a key window this app owns, which an accessory app with no
-        // window never has. The catcher panel is non-activating: making it
-        // key moves key status to it without activating this app, so the
-        // app in front stays frontmost and its windows keep their focus.
+        // Local monitors only receive keys routed to our own key window.
         let panel = KeyCatcherPanel()
         if let button { panel.move(toStatusButton: button) }
-        panel.makeKeyAndOrderFront(nil)
         keyCatcher = panel
+        panel.onFocusLost = { [weak self] in self?.collapse(returnFocus: false) }
+        panel.takeFocus()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Local monitors always run on the main thread.
             let consumed = MainActor.assumeIsolated { self?.handleKey(event) ?? false }
@@ -776,15 +779,18 @@ final class StatusItemController: NSObject {
         }
     }
 
-    private func removeMonitors() {
+    private func removeMonitors(returnFocus: Bool = true) {
         if let m = keyMonitor { NSEvent.removeMonitor(m) }
         if let m = localMouseMonitor { NSEvent.removeMonitor(m) }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m) }
         keyMonitor = nil
         localMouseMonitor = nil
         globalMouseMonitor = nil
-        keyCatcher?.orderOut(nil)
+        let panel = keyCatcher
         keyCatcher = nil
+        panel?.onFocusLost = nil
+        panel?.orderOut(nil)
+        if returnFocus { panel?.returnFocus() }
     }
 
     /// A click anywhere in this app that is not the status item collapses
@@ -794,7 +800,7 @@ final class StatusItemController: NSObject {
         // The catcher panel ignores the mouse so it should never be reported
         // here, but it is ours: it must not dismiss the pills either.
         if let w = window, w === button?.window || w === keyCatcher { return }
-        collapse()
+        collapse(returnFocus: false)
     }
 
     /// Returns true when the key was consumed.

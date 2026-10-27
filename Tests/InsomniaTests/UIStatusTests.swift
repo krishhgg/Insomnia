@@ -1201,16 +1201,15 @@ final class UIStatusTests: XCTestCase {
 
     /// The digits are read by a local key monitor, which only sees events sent
     /// to a window this app owns. The catcher panel is that window, and the
-    /// whole fix rests on it being able to take key without taking a click,
-    /// and without activating this app: the app in front stays frontmost and
-    /// only key status moves to the pills while they are up.
+    /// panel must accept key status without taking clicks. It uses normal
+    /// app activation so keys cannot remain routed to the previous app.
     @MainActor
-    func testTheKeyCatcherPanelTakesKeyStatusWithoutTakingClicksOrActivating() {
+    func testTheKeyCatcherPanelAcceptsKeysWithoutTakingClicks() {
         _ = NSApplication.shared
         let panel = KeyCatcherPanel()
 
         XCTAssertTrue(panel.canBecomeKey)
-        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertFalse(panel.styleMask.contains(.nonactivatingPanel))
         XCTAssertTrue(panel.ignoresMouseEvents)
         XCTAssertEqual(panel.level, .statusBar)
         XCTAssertTrue(panel.collectionBehavior.contains(.canJoinAllSpaces))
@@ -1244,6 +1243,24 @@ final class UIStatusTests: XCTestCase {
 
         XCTAssertFalse(panel?.isVisible ?? true)
         XCTAssertFalse(NSApp.windows.contains { $0 is KeyCatcherPanel && $0.isVisible })
+    }
+
+    @MainActor
+    func testLosingKeyboardFocusClosesThePillsAndDropsTheKeyCatcher() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let controller = StatusItemController(manager: h.makeManager(), status: PlaceholderStatus(), showSettings: {})
+        controller.expand(mode: .start)
+        let panel = NSApp.windows.compactMap { $0 as? KeyCatcherPanel }.first { $0.isVisible }
+        XCTAssertNotNil(panel)
+
+        panel?.resignKey()
+
+        XCTAssertTrue(controller.model.pillsCollapsing)
+        XCTAssertFalse(panel?.isVisible ?? true)
+        XCTAssertFalse(controller.model.focusVisible)
+        XCTAssertNil(panel?.onFocusLost)
     }
 }
 

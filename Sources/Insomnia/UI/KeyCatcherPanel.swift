@@ -8,18 +8,19 @@ import AppKit
 /// the status bar, so without this it has no window at all and the digits go
 /// to whichever app the user was in.
 ///
-/// It is a non-activating `NSPanel`: it becomes key without activating this
-/// app, so the app in front stays frontmost and only key status moves to the
-/// pills while they are up (as with Spotlight). Ordering it out gives key
-/// status back.
+/// Activate Insomnia while typing, then yield to the previous app when the
+/// pills close. A non-activating panel can leave input in the previous app.
 final class KeyCatcherPanel: NSPanel {
+    private var previousApplication: NSRunningApplication?
+    var onFocusLost: (() -> Void)?
+
     /// A borderless window refuses key status by default.
     override var canBecomeKey: Bool { true }
 
     convenience init() {
         self.init(
             contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
@@ -34,6 +35,25 @@ final class KeyCatcherPanel: NSPanel {
         isReleasedWhenClosed = false
         hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+    }
+
+    func takeFocus() {
+        let front = NSWorkspace.shared.frontmostApplication
+        if front != .current { previousApplication = front }
+        NSApp.activate(ignoringOtherApps: true)
+        makeKeyAndOrderFront(nil)
+    }
+
+    func returnFocus() {
+        defer { previousApplication = nil }
+        guard NSApp.isActive, let previousApplication, !previousApplication.isTerminated else { return }
+        NSApp.yieldActivation(to: previousApplication)
+        previousApplication.activate()
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        onFocusLost?()
     }
 
     /// Park the panel on the status item, so it comes up on the screen and the
