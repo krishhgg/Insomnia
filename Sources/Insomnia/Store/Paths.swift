@@ -70,6 +70,10 @@ struct Paths: Sendable, Equatable {
     static let unreadableSessionPrefix = "session.json.unreadable-"
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
+    /// The hotspot the network failover joined last (`NetworkFailover.joinedHotspot`).
+    var joinedHotspotFile: URL { appSupport.appendingPathComponent("joined-hotspot.json") }
+    /// The key insomnia.log's network tags are made with (`NetworkTag`).
+    var networkTagKeyFile: URL { appSupport.appendingPathComponent("network-tag-key.json") }
     /// scripts/backstop.sh as install.sh seals it into a bundle, under
     /// Contents/Resources, before the bundle is signed. The LaunchAgent
     /// verifies the bundle's signature before running it (LaunchdBackstop).

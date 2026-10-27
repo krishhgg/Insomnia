@@ -299,6 +299,14 @@ below cover what only a real Mac shows.
 - Hotspot permission, association, cancellation, and reconnect
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
+- Priority list failover: with a phone and two tablets on the list and the Mac on the phone's hotspot during a session, take the phone and one tablet out of range: the log shows "bluetooth sees 1 of 3 hotspots nearby", "waking hotspot" and "joining woken hotspot" for the tablet left behind, the Mac joins it, and `handoffs.log` records the gap
+- Priority list switch-up: with the Mac on a lower hotspot during a session, bring the top one back in range: 30 to 60 s later the log shows "moving from hotspot" and "moved to hotspot", `handoffs.log` records the gap of the move, and no second move comes within 5 minutes
+- Priority list hand-back: with the Mac on a hotspot Insomnia joined during a session, bring it in range of a saved Wi-Fi network: 30 to 60 s later the log shows "leaving hotspot … for saved Wi-Fi", then possibly "hotspot join held", then "handed back: macOS rejoined saved Wi-Fi network …" with a tag, not the name. `handoffs.log` records a gap of about 15 s, and no second hand-back comes within 5 minutes
+- Wait for macOS: with the aggressive join off and the Mac on home Wi-Fi during a session, turn Wi-Fi off and on: the log shows "macOS has 20 s to rejoin a network before a hotspot is woken", then "back online on network …" with no "waking hotspot"; with the aggressive join on, the hotspot is woken after 5 s
+- Priority list with the top hotspot's password missing: the menu names that hotspot, one notification per outage names it, and the next hotspot on the list joins
+- Priority list Nearby… in Settings lists hotspot names, curly apostrophe included, after Location is allowed, and says names are hidden before
+- Priority list Nearby… lists the phones and tablets on the same Apple Account under "Phones and tablets", with their hotspot off, and picking one fills the name exactly
+- Priority list Nearby… shows names the moment it opens, with "Scanning for more…" under them until the fresh scan is done, and no listed name disappears when it ends
 
 ### Install, upgrade and uninstall
 
