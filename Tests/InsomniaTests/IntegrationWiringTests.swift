@@ -180,11 +180,13 @@ final class IntegrationWiringTests: XCTestCase {
             StatusItemController.menuItems(manager: manager, status: source).map(\.title).filter { $0.contains("Hotspot") }
         }
 
-        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+        // The menu puts the warning sign on the line; the popover draws one.
+        let line = "\u{26A0} \(HotspotPasswordProblem.unreadable.menuLine)"
+        XCTAssertEqual(warnings(), [line])
         manager.config.hotspotSSID = "Other Phone"
         XCTAssertEqual(warnings(), [])
         manager.config.hotspotSSID = " Phone "
-        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+        XCTAssertEqual(warnings(), [line])
     }
 
     /// The line belongs to the last relaunch. Starting another clears it
@@ -508,6 +510,78 @@ final class IntegrationWiringTests: XCTestCase {
         let undetermined = LocationPermission(authorizationStatus: .notDetermined)
         XCTAssertFalse(undetermined.isAuthorized)
         XCTAssertEqual(undetermined.statusDescription, "Not requested")
+    }
+
+    /// Notifications can be off for Insomnia, so the reason a relaunch
+    /// stopped short is also a warning line in the menu, built the way the
+    /// status item builds it. Here the browser quit and `open` failed: the
+    /// browser is closed, and the line says to open it by hand.
+    @MainActor
+    func testARelaunchWhoseOpenFailsLeavesTheReasonInThePopover() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let processes = FakeBrowserProcesses(pids: [42])
+        processes.launchFailure = "LSOpenURLsWithRole() failed with error -10810"
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined),
+            browser: BrowserThrottle(readArgs: { _ in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, processes: processes)
+        )
+        let source = LiveStatusSource(services: services)
+
+        await services.relaunchUnthrottled(Self.chrome)
+
+        let reason = "Chrome quit but could not be relaunched: LSOpenURLsWithRole() failed with error -10810. Open it yourself."
+        XCTAssertEqual(source.relaunchProblems, [reason])
+        let items = StatusItemController.statusItems(manager: h.makeManager(), status: source)
+        // The scan after the relaunch lists whatever browsers this Mac is
+        // running, so only the line itself is checked.
+        XCTAssertTrue(items.contains(StatusMenu.Item(title: reason, kind: .warning)), "\(items.map(\.title))")
+    }
+
+    /// The failover's report about the hotspot password is a menu line
+    /// while that hotspot is the one configured. After an SSID edit it is
+    /// about an item no join reads, and the line goes; editing the SSID
+    /// back brings it back, since nothing has changed that item.
+    @MainActor
+    func testThePopoverShowsTheHotspotReportOnlyForTheConfiguredSSID() {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let services = AppServices(
+            paths: h.home.paths,
+            notifier: RecordingNotifier(),
+            audio: FakeAudioControl(),
+            processControl: FakeProcessControl(),
+            locationPermission: LocationPermission(authorizationStatus: .notDetermined)
+        )
+        let source = LiveStatusSource(services: services)
+        let manager = h.makeManager()
+        manager.config.hotspotSSID = "Phone"
+        services.status.hotspotPasswordReport = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
+        // A debug build also has the lid simulation line.
+        func warnings() -> [String] {
+            StatusItemController.statusItems(manager: manager, status: source).map(\.title).filter { $0.contains("Hotspot") }
+        }
+
+        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+        manager.config.hotspotSSID = "Other Phone"
+        XCTAssertEqual(warnings(), [])
+        manager.config.hotspotSSID = " Phone "
+        XCTAssertEqual(warnings(), [HotspotPasswordProblem.unreadable.menuLine])
+    }
+
+    /// With the name hidden the row just says the Wi-Fi is on, and the
+    /// reason is its tooltip, so the popover row stays short.
+    func testTheWiFiRowExplainsLocationRedactionInThePopover() {
+        let hidden = WiFiStatusName.row(ssid: nil, locationAuthorized: false)
+        XCTAssertEqual(hidden?.text, "On")
+        XCTAssertEqual(hidden?.help, WiFiStatusName.hiddenHelp)
+        XCTAssertTrue(WiFiStatusName.hiddenHelp.contains("Location"))
+        XCTAssertEqual(WiFiStatusName.row(ssid: "Office", locationAuthorized: false), WiFiStatusName.Display(text: "Office", help: nil))
+        XCTAssertNil(WiFiStatusName.row(ssid: nil, locationAuthorized: true))
     }
 }
 

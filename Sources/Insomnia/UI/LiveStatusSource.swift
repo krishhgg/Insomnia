@@ -39,6 +39,10 @@ final class LiveStatusSource: StatusSource {
         services.instantWatts()
     }
 
+    func batteryTimeRemaining() -> BatteryTimeRemaining? {
+        PowerMonitor.readTimeRemaining()
+    }
+
     func relaunchUnthrottled(_ browser: ThrottledBrowser) {
         Task { @MainActor [services] in
             await services.relaunchUnthrottled(browser)

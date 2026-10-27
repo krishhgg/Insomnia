@@ -2,7 +2,8 @@ import SwiftUI
 
 /// Everything drawn inside the status item: the mark, the three pill slots
 /// while entering, or the countdown while a session runs or starts (unless
-/// Settings turns the countdown off, which leaves the mark alone).
+/// Settings turns the countdown off, which leaves the mark alone). Popover
+/// style draws the eye and a short countdown only (`popoverBar`).
 ///
 /// The layout here changes only on state the controller sets outside any
 /// animation transaction (`slotsPresent`, `phase` and `startError`), and
@@ -31,6 +32,7 @@ struct StatusRootView: View {
     private var reduceMotion: Bool { reduceMotionEnv || Motion.reduceMotion }
     private var compact: Bool { manager.config.compactMode }
     private var minimal: Bool { manager.config.menuBarMode == .minimal }
+    private var popover: Bool { manager.config.menuBarMode == .popover }
     /// Sleep is held right now (journal-backed), independent of the UI phase.
     private var isRunning: Bool { manager.isActive }
     /// Both, not either: the phase can lag the manager by a hop when a
@@ -49,6 +51,22 @@ struct StatusRootView: View {
     /// A refused start closes it again with the pills coming back.
     private var eyeOpen: Bool { isRunning || model.phase == .starting }
 
+    /// The eye's size in the bar in Popover style, in points.
+    static let eyeSize: CGFloat = 17
+    /// Space either side of the eye: the item's highlight sits this far
+    /// outside it, as it does around the system's own icons.
+    static let sidePadding: CGFloat = 2.5
+    /// The item's width with the eye alone: the eye and its padding.
+    static let width: CGFloat = eyeSize + 2 * sidePadding
+
+    /// The eye opens the moment a start is asked for, not when the manager
+    /// confirms it: the blink is the first thing that answers the click.
+    /// A refused start closes it again. Static so it can be pinned without
+    /// a manager.
+    static func eyeOpen(isRunning: Bool, phase: MenuBarModel.Phase) -> Bool {
+        isRunning || phase == .starting
+    }
+
     private var countdownText: String {
         Self.countdownText(pending: model.pendingCountdown, live: manager.countdownText, phase: model.phase)
     }
@@ -65,6 +83,14 @@ struct StatusRootView: View {
     }
 
     var body: some View {
+        if popover {
+            popoverBar
+        } else {
+            styledBar
+        }
+    }
+
+    private var styledBar: some View {
         HStack(spacing: DurationPillsView.spacing) {
             if minimal {
                 MinimalStatusIcon(
@@ -117,6 +143,93 @@ struct StatusRootView: View {
         // content must sit at its leading edge rather than centred in it.
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    // MARK: Popover style
+
+    /// The eye, closed while idle and open while sleep is held, and beside
+    /// it the short countdown while a session runs or starts. Nothing in it
+    /// takes a click: the status bar button under it does
+    /// (`StatusHostingView.passesClicksThrough`), and opens the popover.
+    private var popoverBar: some View {
+        HStack(spacing: 4) {
+            EyeMarkView(isRunning: eyeOpen, reduceMotion: reduceMotion, size: Self.eyeSize)
+            if let text = popoverCountdown {
+                Text(text)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    // Never animated, as in the other styles: see
+                    // `Motion.countdownTick`.
+                    .animation(Motion.countdownTick, value: text)
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Insomnia")
+        .accessibilityValue(Self.popoverAccessibilityValue(
+            running: isRunning,
+            starting: model.phase == .starting,
+            style: manager.config.countdownStyle,
+            remaining: manager.remainingText,
+            endTime: manager.countdownText
+        ))
+        .padding(.horizontal, Self.sidePadding)
+        .frame(height: NSStatusBar.system.thickness)
+        .fixedSize()
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { width in
+            onWidthChange(width)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The bar's countdown in Popover style, or nil for the eye alone.
+    private var popoverCountdown: String? {
+        guard showsCountdown else { return nil }
+        let text = Self.countdownText(
+            pending: model.pendingCountdown,
+            live: Self.popoverLiveCountdown(style: manager.config.countdownStyle, remaining: manager.remainingText, endTime: manager.countdownText),
+            phase: model.phase
+        )
+        return text.isEmpty ? nil : text
+    }
+
+    /// The live countdown Popover style shows: the time left to the minute
+    /// ("2h 14m"), which changes once a minute, or the end time, which
+    /// changes only with the session. Only the text the style shows is
+    /// read: in the time-left style the manager's other text is H:MM:SS and
+    /// changes every second, and reading it would redraw the bar every
+    /// second. Static so it can be pinned without a manager.
+    static func popoverLiveCountdown(
+        style: CountdownStyle, remaining: @autoclosure () -> String, endTime: @autoclosure () -> String
+    ) -> String {
+        style == .endTime ? endTime() : remaining()
+    }
+
+    /// What VoiceOver reads on the Popover style's item. It carries the
+    /// session whether or not the bar shows the countdown; in the end-time
+    /// style that is the end time, which stays right without a redraw. Like
+    /// `popoverLiveCountdown`, it reads the end time only in that style.
+    static func popoverAccessibilityValue(
+        running: Bool,
+        starting: Bool,
+        style: CountdownStyle,
+        remaining: @autoclosure () -> String,
+        endTime: @autoclosure () -> String
+    ) -> String {
+        if running {
+            if style == .endTime {
+                let end = endTime()
+                if !end.isEmpty { return "Awake, ends at \(end)" }
+            }
+            let left = remaining()
+            return left.isEmpty ? "Awake" : "Awake, \(left) left"
+        }
+        return starting ? "Starting session" : "Idle"
+    }
+
+    // MARK: Pills, Compact and Minimal
 
     /// A closed eye while idle; it opens while sleep is held, so the app
     /// visibly does something even when Low Power Mode is not showing.

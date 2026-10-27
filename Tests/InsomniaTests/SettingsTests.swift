@@ -168,7 +168,7 @@ final class SettingsTests: XCTestCase {
     /// Each style has a name and one line on what it does, short enough
     /// to sit on one line under the picker's label.
     func testEachMenuBarStyleHasANameAndOneLineOnWhatItDoes() {
-        XCTAssertEqual(Config.MenuBarMode.allCases.map(SettingsView.styleName), ["Pills", "Compact", "Minimal"])
+        XCTAssertEqual(Config.MenuBarMode.allCases.map(SettingsView.styleName), ["Pills", "Compact", "Minimal", "Popover"])
         let lines = Config.MenuBarMode.allCases.map(SettingsView.styleDescription)
         XCTAssertEqual(Set(lines).count, lines.count)
         let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)

@@ -23,6 +23,19 @@ enum BatteryStatus: Equatable, Sendable {
     }
 }
 
+/// How long the battery's charge lasts, or how long it takes to fill, as
+/// the power source list estimates it (the figure the battery menu, Activity
+/// Monitor and `pmset -g batt` show).
+enum BatteryTimeRemaining: Equatable, Sendable {
+    /// On battery: minutes until empty.
+    case untilEmpty(minutes: Int)
+    /// Charging: minutes until full.
+    case untilFull(minutes: Int)
+    /// The system has no estimate yet. It is still working one out, as it is
+    /// for a while after the charger is plugged in or pulled.
+    case calculating
+}
+
 /// Spec section 6 event sources: `IOPSNotificationCreateRunLoopSource` for
 /// battery changes and `ProcessInfo.thermalStateDidChangeNotification`.
 /// Watts are read from `AppleSmartBattery` only when `instantWatts()` is
@@ -221,6 +234,30 @@ final class PowerMonitor {
             amperage -= Int64(UInt32.max) + 1
         }
         return Double(amperage) * Double(voltage) / 1_000_000
+    }
+
+    /// The time remaining, read when the popover opens. nil with no
+    /// internal battery, or on the adapter without charging (full, or held at
+    /// a charge limit), where there is no time to give.
+    nonisolated static func readTimeRemaining() -> BatteryTimeRemaining? {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        let sources = list.compactMap { IOPSGetPowerSourceDescription(info, $0)?.takeUnretainedValue() as? [String: Any] }
+        return timeRemaining(sources: sources)
+    }
+
+    /// The time remaining from power source descriptions: the internal
+    /// battery's time to empty on battery, its time to full while charging.
+    /// The system reports -1 minutes while it is still estimating.
+    nonisolated static func timeRemaining(sources: [[String: Any]]) -> BatteryTimeRemaining? {
+        guard let desc = sources.first(where: { $0[kIOPSTypeKey] as? String == kIOPSInternalBatteryType }) else { return nil }
+        let onBattery = desc[kIOPSPowerSourceStateKey] as? String == kIOPSBatteryPowerValue
+        let charging = desc[kIOPSIsChargingKey] as? Bool ?? false
+        let key = onBattery ? kIOPSTimeToEmptyKey : charging ? kIOPSTimeToFullChargeKey : nil
+        guard let key, let minutes = desc[key] as? Int else { return nil }
+        if minutes < 0 { return .calculating }
+        guard minutes > 0 else { return nil }
+        return onBattery ? .untilEmpty(minutes: minutes) : .untilFull(minutes: minutes)
     }
 
     // MARK: Private

@@ -307,6 +307,7 @@ struct SettingsView: View {
         case .pills: "Pills"
         case .compact: "Compact"
         case .minimal: "Minimal"
+        case .popover: "Popover"
         }
     }
 
@@ -316,6 +317,7 @@ struct SettingsView: View {
         case .pills: "Duration pills and the countdown beside the eye."
         case .compact: "Only the eye. A click opens the pills in a panel."
         case .minimal: "A ring for the time left. Click adds, hold ends."
+        case .popover: "The eye and its countdown. Any click opens a popover."
         }
     }
 

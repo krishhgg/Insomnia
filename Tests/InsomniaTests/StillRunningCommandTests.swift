@@ -75,14 +75,17 @@ final class StillRunningCommandTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.count, postsBefore, "told again on every refused transaction")
         XCTAssertTrue(try XCTUnwrap(m.commandWarning).hasPrefix("end skipped"), m.commandWarning ?? "")
         XCTAssertTrue(try XCTUnwrap(m.commandWarning).contains("sudo kill 4242"), m.commandWarning ?? "")
-        let startRefused = try XCTUnwrap(m.lastError, "the start refused for the pending end said nothing")
+        XCTAssertEqual(m.lastError, SessionManager.endPendingRefusal, "the start refused for the pending end said nothing")
+        // Newer than the command's line. The end that finishes once the
+        // command exits takes the refusal down, but not this.
+        m.fail("a newer failure")
 
         // The command exits: the lock is released and the end retried.
         h.guardFake.stillRunning = []
         h.guardFake.exitStuckCommands()
         await waitUntil("pending end never retried") { m.pendingEnd == nil }
         XCTAssertNil(m.commandWarning, "the menu still names a command that has exited")
-        XCTAssertEqual(m.lastError, startRefused, "the exit took a newer error with the command's line")
+        XCTAssertEqual(m.lastError, "a newer failure", "the exit took a newer error with the command's line")
         XCTAssertEqual(h.guardFake.calls, before + ["disablesleep 0", "lowpowermode 0"], "an undo that exited 0 was run again")
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(h.store.loadUnfinishedCommand(), "the record outlived the command")

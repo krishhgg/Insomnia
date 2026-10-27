@@ -1,11 +1,16 @@
 import Foundation
 
-/// The three pills in the menu bar, as data. Pure: no clocks, no UI.
+/// The Days / Hours / Minutes input, as data: the three pills in the menu
+/// bar and the Compact panel, and the popover's fields. Pure: no clocks,
+/// no UI.
 ///
-/// Each field is `nil` while it still shows its placeholder. Digits are
-/// appended one at a time by the key monitor; a field never holds more than
-/// two digits and never exceeds its ceiling, so what is on screen is always
-/// a value the session can use.
+/// Each field is `nil` while it is empty (a pill then shows its
+/// placeholder). The pills' key monitor edits digits one at a time with
+/// `append(digit:to:)` and `backspace(_:)`; a field edited that way never
+/// holds more than two digits and never passes its ceiling, so what a pill
+/// shows is always a value the session can use. The popover reads what is
+/// typed through `init(texts:)`, and `isValid(_:)` and `total` decide what
+/// it can use.
 struct DurationInput: Equatable, Sendable {
     enum Field: Int, CaseIterable, Sendable {
         case days
@@ -20,7 +25,7 @@ struct DurationInput: Equatable, Sendable {
             }
         }
 
-        /// Tooltip on the "?" badge.
+        /// Tooltip on the pill or the popover's field.
         var help: String {
             switch self {
             case .days: return "Up to \(DurationInput.maxDays) days"
@@ -62,6 +67,20 @@ struct DurationInput: Equatable, Sendable {
         self.minutes = minutes
     }
 
+    /// Read what is typed into the popover's fields. A blank field is
+    /// empty; anything that is not a whole number (letters, a sign, a
+    /// decimal point) reads as -1, so `isValid(_:)` flags that field and
+    /// `total` refuses it, exactly as it refuses a value over its ceiling.
+    init(texts: [Field: String]) {
+        self.init()
+        for field in Field.allCases {
+            let text = (texts[field] ?? "").trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty else { continue }
+            let digits = text.allSatisfy { $0.isASCII && $0.isNumber }
+            self[field] = digits ? Int(text) ?? -1 : -1
+        }
+    }
+
     subscript(field: Field) -> Int? {
         get {
             switch field {
@@ -81,7 +100,7 @@ struct DurationInput: Equatable, Sendable {
 
     // MARK: Validation
 
-    /// True while every pill still shows its placeholder.
+    /// True while every field is empty.
     var isEmpty: Bool { days == nil && hours == nil && minutes == nil }
 
     func isValid(_ field: Field) -> Bool {
@@ -107,8 +126,8 @@ struct DurationInput: Equatable, Sendable {
 
     // MARK: Presets
 
-    /// Fill the pills from a preset. Seconds are floored to the minute; fields
-    /// that would be zero stay empty so the pills read like the chip did
+    /// Fill the fields from a preset. Seconds are floored to the minute; fields
+    /// that would be zero stay empty so the fields read like the chip did
     /// ("2h" fills only Hours). Values beyond 30 days are clamped.
     static func from(seconds: TimeInterval) -> DurationInput {
         let totalMinutes = min(max(Int(seconds / 60), 0), maxDays * 24 * 60)
@@ -120,7 +139,7 @@ struct DurationInput: Equatable, Sendable {
 
     // MARK: Editing
 
-    /// Text shown in the pill, nil while it shows its placeholder.
+    /// Text for the field, nil while it is empty.
     func text(for field: Field) -> String? {
         self[field].map(String.init)
     }
@@ -146,7 +165,7 @@ struct DurationInput: Equatable, Sendable {
     }
 
     /// Remove the last digit of `field`. Returns false when it was already
-    /// empty, so the caller can move focus to the previous pill instead.
+    /// empty, so the caller can move focus to the previous field instead.
     @discardableResult
     mutating func backspace(_ field: Field) -> Bool {
         guard let v = self[field] else { return false }

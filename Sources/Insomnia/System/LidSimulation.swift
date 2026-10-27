@@ -7,8 +7,8 @@ import Foundation
 /// build has no watcher at all: nothing in the app reads the trigger file,
 /// so a file written to the support directory cannot replay the lid-close
 /// actions (darken, mute, freeze, pause Docker) during a session. A build
-/// that has it says so in the log at launch, in the status menu and in
-/// Settings.
+/// that has it says so in the log at launch, in the right-click menu, with
+/// a badge in the menu bar popover's footer, and in Settings.
 enum LidSimulationBuild {
     static let isCompiledIn: Bool = {
         #if DEBUG || INSOMNIA_LID_SIMULATION
@@ -28,15 +28,18 @@ enum LidSimulationBuild {
         #endif
     }
 
-    /// One line for the log, the status menu and Settings. Every use is
-    /// behind `isCompiledIn`, but whether the text is left out of a plain
-    /// release binary then depends on what the optimizer inlines, and
-    /// scripts/check-lid-simulation-gate.sh fails on any copy. So the text
-    /// is compiled in only with the watcher.
+    /// One line for the log, the right-click menu, the popover badge's
+    /// tooltip and Settings. Every use is behind `isCompiledIn`, but
+    /// whether the text is left out of a plain release binary then depends
+    /// on what the optimizer inlines, and scripts/check-lid-simulation-gate.sh
+    /// fails on any copy. So the text is compiled in only with the watcher.
     #if DEBUG || INSOMNIA_LID_SIMULATION
     static let marker = "Lid simulation build: scripts/simulate-lid.sh is honoured during sessions"
+    /// The popover footer's badge; `marker` is its tooltip.
+    static let badge = "Lid simulation build"
     #else
     static let marker = ""
+    static let badge = ""
     #endif
 }
 
