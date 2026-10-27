@@ -10,6 +10,9 @@ import Foundation
 /// signature against the requirement pinned in the plist and only then
 /// execs the script, so a backstop.sh edited on disk is never run by
 /// launchd. Nothing executable lives in a writable support directory.
+/// Before launching the native entry point, launchd enforces SpawnConstraint
+/// against the pinned cdhashes. A replacement binary cannot bypass the check
+/// by declining to verify the script. Older bundles use the external shell.
 ///
 /// What the app pins is the requirement of the code it is itself running
 /// (CodeRequirement.pin), after checking that the bundle on disk still is
@@ -34,6 +37,7 @@ struct BackstopTarget: Sendable, Equatable {
     /// Designated requirement of the bundle's signature, in requirement
     /// language, as `codesign -d -r-` prints it (see CodeRequirement).
     let requirement: String
+    var nativeExecutable: URL? = nil
 
     var script: URL { Paths.backstopScript(inBundle: bundle) }
 }
@@ -45,11 +49,12 @@ struct LaunchdBackstop: BackstopScheduling {
     typealias BundlePinner = @Sendable (_ bundle: URL) throws -> String
 
     static let launchctl = "/bin/launchctl"
+    static let csrutil = "/usr/bin/csrutil"
     /// Seconds between backstop.sh runs while loaded. install.sh writes the same value.
     static let pollInterval = 60
     static let commandTimeout: TimeInterval = 15
 
-    /// What launchd runs: `/bin/sh -c <agentProgram> sh <requirement> <bundle>`.
+    /// The external verifier for bundles without a constrained native command.
     /// The program verifies the bundle ($2) against the requirement ($1) with
     /// codesign and execs the sealed backstop.sh only when that passes; the
     /// resource seal covers the script, so an edited copy fails here. On
@@ -111,10 +116,28 @@ struct LaunchdBackstop: BackstopScheduling {
         } catch {
             throw BackstopError(message: "the recovery agent cannot pin \(bundle.path): \(error.localizedDescription). Reinstall with scripts/install.sh")
         }
-        let desired = Self.plistDictionary(label: label, target: BackstopTarget(bundle: bundle, requirement: requirement))
+        var executable = Self.nativeExecutable(in: bundle)
+        if executable != nil, CodeRequirement.launchHashes(in: requirement) != nil {
+            // Recheck each arm: launch constraints rely on SIP enforcement.
+            do {
+                let status = try await run(Self.csrutil, ["status"])
+                let output = status.stdout.hasSuffix("\n") ? String(status.stdout.dropLast()) : status.stdout
+                if !status.succeeded || !status.stderr.isEmpty || output != "System Integrity Protection status: enabled." {
+                    executable = nil
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                executable = nil
+            }
+        }
+        let desired = Self.plistDictionary(label: label, target: BackstopTarget(
+            bundle: bundle, requirement: requirement, nativeExecutable: executable
+        ))
         // Armed when the plist the next login loads is this build's and the
         // loaded job is the one it describes: the same command line, started
-        // every `pollInterval` seconds. A loaded label alone may be another
+        // every `pollInterval` seconds, with the native spawn constraint
+        // present. A loaded label alone may be another
         // build's job, pinning a bundle or requirement this one does not
         // satisfy (install.sh can leave one loaded when it stops between its
         // bootstrap and publishing the plist), or a job loaded from a plist
@@ -137,15 +160,30 @@ struct LaunchdBackstop: BackstopScheduling {
 
     // MARK: Plist
 
+    static func nativeExecutable(in bundle: URL) -> URL? {
+        guard let data = try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist")),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              info["InsomniaBackstopCommand"] as? String == BackstopCommand.argument,
+              let name = info["CFBundleExecutable"] as? String,
+              !name.isEmpty, name != ".", name != "..", !name.contains("/") else { return nil }
+        return bundle.appendingPathComponent("Contents/MacOS").appendingPathComponent(name)
+    }
+
     /// Pure builder, testable without launchd. Must produce exactly what
     /// install.sh writes, or every arm() reloads the agent.
     static func plistDictionary(label: String, target: BackstopTarget) -> [String: Any] {
-        [
+        var plist: [String: Any] = [
             "Label": label,
             "ProgramArguments": ["/bin/sh", "-c", agentProgram, "sh", target.requirement, target.bundle.path],
             "RunAtLoad": true,
             "StartInterval": pollInterval,
         ]
+        if let executable = target.nativeExecutable, let hashes = CodeRequirement.launchHashes(in: target.requirement) {
+            plist["ProgramArguments"] = [executable.path, BackstopCommand.argument, target.requirement]
+            plist["SpawnConstraint"] = ["cdhash": ["$in": hashes]]
+            plist["AssociatedBundleIdentifiers"] = [Paths.bundleIdentifier]
+        }
+        return plist
     }
 
     func plistOnDiskMatches(_ desired: [String: Any]) -> Bool {
@@ -225,15 +263,19 @@ struct LaunchdBackstop: BackstopScheduling {
         /// StartInterval in seconds; nil when the job has none, so launchd
         /// never starts it again by itself.
         var runInterval: Int?
+        /// Older native agents ran the same command without enforcing its pin.
+        var hasSpawnConstraint: Bool
 
-        init(arguments: [String], runInterval: Int?) {
+        init(arguments: [String], runInterval: Int?, hasSpawnConstraint: Bool = false) {
             self.arguments = arguments
             self.runInterval = runInterval
+            self.hasSpawnConstraint = hasSpawnConstraint
         }
 
         /// The job a plist from `plistDictionary` loads as.
         init(plist: [String: Any]) {
-            self.init(arguments: plist["ProgramArguments"] as? [String] ?? [], runInterval: plist["StartInterval"] as? Int)
+            self.init(arguments: plist["ProgramArguments"] as? [String] ?? [], runInterval: plist["StartInterval"] as? Int,
+                      hasSpawnConstraint: plist["SpawnConstraint"] != nil)
         }
     }
 
@@ -250,12 +292,14 @@ struct LaunchdBackstop: BackstopScheduling {
     /// seconds` is there only for a job with a StartInterval. nil when the
     /// arguments block is missing, repeated, unclosed or holds a line this
     /// does not know; a run interval in another form reads as none. Either
-    /// way the job does not match a plist, and arm() reloads it.
+    /// way the job does not match a plist, and arm() reloads it. The top-level
+    /// properties line reports whether the native spawn constraint is loaded.
     static func loadedJob(fromPrint output: String) -> LoadedJob? {
         let intervalPrefix = "\trun interval = ", intervalSuffix = " seconds"
         var arguments: [String]?
         var inArguments = false
         var runInterval: Int?
+        var hasSpawnConstraint = false
         for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
             if inArguments {
                 if line == "\t}" {
@@ -271,10 +315,13 @@ struct LaunchdBackstop: BackstopScheduling {
                 inArguments = true
             } else if line.hasPrefix(intervalPrefix), line.hasSuffix(intervalSuffix) {
                 runInterval = Int(line.dropFirst(intervalPrefix.count).dropLast(intervalSuffix.count))
+            } else if line.hasPrefix("\tproperties = ") {
+                hasSpawnConstraint = line.dropFirst("\tproperties = ".count)
+                    .components(separatedBy: " | ").contains("has spawn constraint")
             }
         }
         guard let arguments, !inArguments else { return nil }
-        return LoadedJob(arguments: arguments, runInterval: runInterval)
+        return LoadedJob(arguments: arguments, runInterval: runInterval, hasSpawnConstraint: hasSpawnConstraint)
     }
 
     /// bootout by service target (ignored if not loaded: the trusted path may
