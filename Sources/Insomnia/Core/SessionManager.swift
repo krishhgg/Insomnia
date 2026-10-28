@@ -438,6 +438,13 @@ final class SessionManager {
     /// nil in tests. Started after a session starts, stopped when it ends.
     @ObservationIgnored var services: AppServices?
 
+    /// The display hold behind `Config.keepScreenAwake` (`ScreenAwake`).
+    @ObservationIgnored private let screenAwake: ScreenAwake
+    /// Set by an end request, cleared when a session starts. From the
+    /// request on the display is not held, even while a refused end (busy
+    /// lock, unreadable journal) leaves the session active.
+    @ObservationIgnored private var endRequestedSinceStart = false
+
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
@@ -539,6 +546,7 @@ final class SessionManager {
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
+        displayAssertions: any DisplayAssertionHolding = NoopDisplayAssertions(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
         clock: @escaping @Sendable () -> Date = { Date() },
@@ -560,6 +568,7 @@ final class SessionManager {
         self.display = display
         self.keyboard = keyboard
         self.appNap = appNap
+        self.screenAwake = ScreenAwake(assertions: displayAssertions)
         self.notifier = notifier
         self.clamshell = clamshell
         self.clock = clock
@@ -642,6 +651,7 @@ final class SessionManager {
             display: display,
             keyboard: keyboard,
             appNap: CFAppNapPreferences(),
+            displayAssertions: IOPMDisplayAssertions(),
             notifier: notifier
         )
         let services = AppServices(
@@ -656,6 +666,29 @@ final class SessionManager {
         services.logStartupSnapshot()
         return m
     }
+
+    // MARK: Screen awake
+
+    /// Whether the display is held awake right now.
+    var screenAwakeHeld: Bool { screenAwake.isHeld }
+
+    /// Holds the display awake while a session is active with
+    /// `Config.keepScreenAwake` on and no end requested since it started,
+    /// and releases it otherwise. Settings calls it when the toggle changes.
+    /// A release macOS refuses stays held and goes to the menu; quitting
+    /// Insomnia releases it, since the assertion belongs to the process.
+    /// Once the hold matches again, that menu line goes if it is still the
+    /// line shown; a newer failure of anything else stays.
+    func syncScreenAwake() {
+        let hold = isActive && config.keepScreenAwake && !endRequestedSinceStart
+        if screenAwake.set(hold) {
+            if lastError == Self.screenAwakeReleaseFailure { lastError = nil }
+        } else if !hold {
+            fail(Self.screenAwakeReleaseFailure)
+        }
+    }
+
+    private static let screenAwakeReleaseFailure = "could not release the display hold, so the display stays on and the screen does not lock on its own; quit Insomnia to release it"
 
     // MARK: Lifecycle queue
 
@@ -1263,6 +1296,8 @@ final class SessionManager {
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
         applyAppNapInJournal()
+        endRequestedSinceStart = false
+        syncScreenAwake()
         // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
@@ -1312,6 +1347,11 @@ final class SessionManager {
     @discardableResult
     func end(reason: EndReason) async -> EndOutcome {
         endTicket += 1
+        // Before the lock or the journal can refuse the end: a refused end
+        // leaves the session active, and the display must not stay held
+        // past the deadline or the user's end.
+        endRequestedSinceStart = true
+        syncScreenAwake()
         if reason == .quit { quitRequested = true }
         retryTimer?.invalidate()
         retryTimer = nil
@@ -1383,6 +1423,7 @@ final class SessionManager {
         }
         let stuck = await restoreAll()
         services?.stop()
+        syncScreenAwake()
 
         if let stuck {
             // restoreAll stopped at a sudo pmset that did not stop on SIGTERM
@@ -2661,6 +2702,7 @@ final class SessionManager {
             countdownPaused = lidClosed == true
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
+            syncScreenAwake()
             services?.start(for: self)
             return
         }

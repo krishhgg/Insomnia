@@ -43,6 +43,21 @@ final class ConfigTests: XCTestCase {
 
     /// Enter after `continue` is opt-in: a config.json written before the
     /// key existed, or without it, keeps it off; an explicit true is honoured.
+    /// Keeping the screen awake leaves the Mac unlocked, so it is opt-in: a
+    /// config.json without the key keeps it off; an explicit true is honoured.
+    func testKeepScreenAwakeDecodesAndDefaultsOff() throws {
+        XCTAssertFalse(Config().keepScreenAwake)
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"tmuxTargets": ["agents:0.0"]}"#.utf8))
+        XCTAssertFalse(legacy.keepScreenAwake)
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"keepScreenAwake": true}"#.utf8))
+        XCTAssertTrue(on.keepScreenAwake)
+        var expected = earlierBuild()
+        expected.keepScreenAwake = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+    }
+
     func testTmuxNudgePressesEnterDecodesAndDefaultsOff() throws {
         let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"tmuxTargets": ["agents:0.0"]}"#.utf8))
         XCTAssertFalse(legacy.tmuxNudgePressesEnter)

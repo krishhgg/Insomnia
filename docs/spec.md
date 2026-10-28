@@ -122,6 +122,21 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
 - Nothing else runs as root.
+- `disablesleep` stops system sleep only. The display still sleeps after
+  `displaysleep` minutes, and with Lock Screen set to require a password
+  immediately the screen locks then, which stops agents that drive the
+  screen. With "Keep the screen on and unlocked" on (`keepScreenAwake`,
+  default off), `SessionManager` holds a `PreventUserIdleDisplaySleep`
+  assertion (`ScreenAwake`, the one `caffeinate -d` holds) while a session
+  is active, and Settings applies the toggle to a running session. An end
+  request releases it before the recovery lock or the journal can refuse
+  the end, so a refused end never keeps the screen unlocked past the
+  deadline. A release macOS refuses keeps the hold and says so in the
+  menu; quitting Insomnia releases it. No
+  root, no journal entry: the assertion belongs to the process, so macOS
+  drops it when the app quits or crashes, and the backstop has nothing to
+  undo. The lock setting is never read or written. Lid close then darkens
+  without asking the display to sleep (section 4).
 
 ### 3. Lid observer
 
@@ -437,7 +452,9 @@ does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
 is best effort. It is made only when a display or keyboard brightness is
 journaled, because the wake that undoes it on open, or on reconcile after
-a relaunch, runs only for such an entry. Display brightness 0 does not
+a relaunch, runs only for such an entry. With "Keep the screen on and
+unlocked" on it is not made at all: a display that sleeps locks the screen,
+and Insomnia's own assertion would refuse it anyway. Display brightness 0 does not
 switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
@@ -1078,6 +1095,7 @@ older build is tightened when the app reads it:
 
 - presets, default preset, default field (the pill focused when the pills open:
   days, hours or minutes; hours by default)
+- keep the screen on and unlocked on/off (default off; section 2)
 - freeze list (bundle ids), freeze every other app on/off (default off),
   Docker rule on/off, mute on lid close on/off (default on). Under the mute
   toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
@@ -1293,6 +1311,7 @@ Insomnia/
       LidSimulation.swift
       LocationPermission.swift
       NetworkFailover.swift
+      ScreenAwake.swift
       Notifier.swift
       PowerMonitor.swift
       ShellTimeout.swift

@@ -323,6 +323,11 @@ final class LidActions {
             Log.info("display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open")
             return
         }
+        // A display that sleeps locks the screen; brightness 0 keeps it dark.
+        guard !manager.config.keepScreenAwake else {
+            Log.info("display sleep not requested: keep the screen awake is on, so brightness 0 keeps the display dark and the screen unlocked")
+            return
+        }
         do {
             try display.requestSleep()
             Log.info("display sleep requested")
