@@ -6136,6 +6136,33 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: launchAgents), ["com.insomnia.backstop.plist"], "staging directory not removed")
     }
 
+    func testUpgradeReusesExistingGrantWithoutRootWrites() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("launchctl", "loaded")
+        let r = try fx.run(fx.installRedirected, ["--reuse-sudoers"], extraEnvironment: ["USER": "tester"])
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        for command in ["-a disablesleep 1", "-a disablesleep 0", "-b lowpowermode 1", "-b lowpowermode 0"] {
+            XCTAssertEqual(calls.filter { $0 == "sudo -n -l /usr/bin/pmset \(command)" }.count, 2, "checked before quitting and under the recovery lock")
+        }
+        XCTAssertTrue(calls.contains { $0.hasPrefix("launchctl bootstrap") })
+    }
+
+    func testUpgradeWithoutExistingGrantRefusesWithoutPromptOrReplacement() throws {
+        try fx.prepareInstall()
+        try fx.installMachinery()
+        fx.setMode("sudo", "rule-not-effective")
+        let r = try fx.run(fx.installRedirected, ["--reuse-sudoers"], extraEnvironment: ["USER": "tester"])
+        XCTAssertNotEqual(r.status, 0)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+        XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+    }
+
     /// The password prompt (visudo + install of the sudoers rule) comes
     /// before the running app is asked to quit and before the bundle, the
     /// installed backstop.sh or the LaunchAgent are touched: a failed or

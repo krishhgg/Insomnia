@@ -108,7 +108,7 @@ CANDIDATE_DIR=""
 WORK=""
 
 step() { printf '\n==> %s\n' "$*"; }
-usage() { echo "usage: $0 [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
+usage() { echo "usage: $0 [--reuse-sudoers] [--app /path/to/Insomnia.app [--allow-unverified-origin]]" >&2; }
 # A command for the user to paste, each word quoted for the shell, so a space,
 # quote or $ in a path stays part of that path.
 command_line() { local line; line="$(printf '%q ' "$@")"; printf '%s' "${line% }"; }
@@ -225,10 +225,12 @@ loaded_state() { # -> yes | no | unknown:<rc>
 
 PREBUILT=""
 ALLOW_UNVERIFIED_ORIGIN=0
+REUSE_SUDOERS=0
 while (( $# )); do
   case "$1" in
     --app) [[ $# -ge 2 ]] || { usage; exit 2; }; PREBUILT="$2"; shift 2 ;;
     --allow-unverified-origin) ALLOW_UNVERIFIED_ORIGIN=1; shift ;;
+    --reuse-sudoers) REUSE_SUDOERS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -442,6 +444,13 @@ fi
 #    The password prompt comes first: until the rule is installed and proven
 #    effective, the running app is not asked to quit and neither the bundle
 #    (backstop.sh included) nor the LaunchAgent are touched.
+if (( REUSE_SUDOERS )); then
+  # An upgrade needs no root writes when all four commands are already
+  # granted. The same bounded, noninteractive checks below (and under the
+  # recovery lock) still have to pass before the app or agent is replaced.
+  # Never fall back to prompting or installing a grant in this mode.
+  step "Reusing the existing pmset grant (no sudoers changes)"
+else
 step "Writing $SUDOERS (requires your password once)"
 TMP_SUDOERS="$("$MKTEMP")"
 cat > "$TMP_SUDOERS" <<SUDO
@@ -456,6 +465,7 @@ if "$SUDO" visudo -cf "$TMP_SUDOERS" >/dev/null; then
 else
   echo "sudoers file failed validation (or sudo did not authenticate); not installed. Nothing was changed." >&2
   exit 1
+fi
 fi
 # The backstop cannot undo anything without the rule, so stop here. Checked
 # again once this run holds the recovery lock (step 5).
