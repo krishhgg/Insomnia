@@ -81,6 +81,7 @@ final class AppServices {
     private var lidActions: LidActions?
     private var floors: FloorRuleDriver?
     private var network: NetworkFailover?
+    private let networkKeepAlive = NetworkKeepAlive()
     private var networkTask: Task<Void, Never>?
     private var lidTasks: [Task<Void, Never>] = []
     private var floorTasks: [Task<Void, Never>] = []
@@ -134,6 +135,7 @@ final class AppServices {
         running = true
         self.manager = manager
         let config = manager.config
+        if config.keepNetworkActive { networkKeepAlive.start() }
         status.lastGap = nil
         status.hotspotPasswordReport = nil
         status.relaunchProblems = [:]
@@ -213,6 +215,7 @@ final class AppServices {
         floorTasks.removeAll()
         cancelBrowserTasks()
         network?.stop()
+        networkKeepAlive.stop()
         network = nil
         status.hotspotPasswordReport = nil
         lidActions = nil

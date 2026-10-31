@@ -654,7 +654,17 @@ provided by the standalone backstop. Performance effects depend on workload.
 
 ### 7. Network failover
 
-- `NWPathMonitor` on the Wi-Fi interface. Event-driven.
+- `NWPathMonitor` on the default route. A working Ethernet or USB tether
+  suppresses Wi-Fi failover too.
+- `keepNetworkActive` is opt-in (default off). During a session it holds a
+  process activity token to keep Insomnia's timers responsive and sends an
+  ephemeral, uncached HTTPS HEAD to `https://cp.cloudflare.com/generate_204`
+  every 30 seconds, including on expensive/constrained connections. Requests
+  time out after 10 seconds at most and never overlap. Ending the session
+  cancels the request, timer and activity token. No display assertion is
+  held. Failures are logged on transitions only; they never restart tunnels
+  or rejoin Wi-Fi. This traffic may help an idle hotspot stay active, but
+  does not preserve another process's NAT mapping or prove a tunnel healthy.
 - Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
   scan, then join with `associate(to:password:)`. The password is read from
   the login Keychain (generic-password service `insomnia-hotspot`, account =

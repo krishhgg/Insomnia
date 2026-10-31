@@ -257,6 +257,10 @@ struct SettingsView: View {
 
     private var networkSection: some View {
         Section {
+            Toggle("Keep network active during sessions", isOn: bind(\.keepNetworkActive))
+            Text("From the next session, sends a small HTTPS request to Cloudflare every 30 seconds, including on cellular hotspots. Helps keep an idle hotspot active; T3 and Rex manage their own tunnel reconnects. Uses mobile data.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             TextField("Hotspot SSID", text: bind(\.hotspotSSID))
             HStack {
                 SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }))

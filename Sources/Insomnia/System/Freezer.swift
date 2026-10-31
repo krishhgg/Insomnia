@@ -118,6 +118,8 @@ enum FreezePlanner {
         "org.alacritty",                    // Alacritty (cask alacritty)
         "net.kovidgoyal.kitty",             // kitty (cask kitty)
         "com.github.wez.wezterm",           // WezTerm (cask wezterm)
+        "com.superlogical.rex",            // Rex (installed, including Beta)
+        "com.superlogical.rex.server",     // Rex Server (installed)
         "org.tabby",                        // Tabby (cask tabby)
         "co.zeit.hyper",                    // Hyper (cask hyper)
         // Browsers agents drive
