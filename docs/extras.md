@@ -66,6 +66,24 @@ agent-list App Nap setting is opt-in and writes journaled preferences for every
 listed app during a session; see [recovery.md](recovery.md). Keeping the network
 active does not itself enable that setting.
 
+### Checking stability and cost
+
+During ordinary hotspot use, note approximate session start/end times, how long
+the lid was closed, and any T3 or Rex disconnects. Check those connections
+separately, then compare incidents with the available Insomnia and tunnel logs.
+Logs rotate, so save the relevant time window soon after a failure. A week
+without an incident is useful feedback, but does not establish that the
+heartbeat caused the improvement.
+
+To measure overhead, compare equal-length sessions with the option on and off,
+starting a new session after each change. Keep the network, workload, power
+source, and lid state comparable. Record laptop and phone battery levels and
+mobile-data counters before and after; use process/network instruments for
+Insomnia-specific CPU and bytes. HEAD has no response body, but DNS, TLS, HTTP
+headers, and retransmissions still use data. Each probe currently creates a
+fresh URLSession, and the activity token can affect power use. Overhead has not
+yet been measured; overall hotspot usage includes all other apps as well.
+
 ## tmux nudge
 
 After a long outage (90 seconds by default) Insomnia types `continue` into
