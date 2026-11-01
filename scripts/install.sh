@@ -265,10 +265,34 @@ move_bundle() { # from to
 # is still running (BOUNDED_PID), 1 otherwise. `sudo -n -l <command>` checks
 # the rule without running pmset (nothing on the machine changes).
 pmset_rule_check() { # pmset arguments
-  local rc=0
-  bounded "$SUDO" -n -l /usr/bin/pmset "$@" || rc=$?
-  if (( rc == 0 || rc == 124 || rc == 125 )); then return "$rc"; fi
-  return 1
+  local rc=0 line options nopass=0 matched=0
+  if (( REUSE_SUDOERS )); then
+    # A successful -l can use cached authentication or an unrelated
+    # NOPASSWD entry. Inspect the effective rule for this exact root command
+    # instead; -ll includes its authentication option and matched command.
+    LC_ALL=C bounded "$SUDO" -n -ll -u root /usr/bin/pmset "$@" || rc=$?
+  else
+    bounded "$SUDO" -n -l /usr/bin/pmset "$@" || rc=$?
+  fi
+  if (( rc == 124 || rc == 125 )); then return "$rc"; fi
+  (( rc == 0 )) || return 1
+  if (( REUSE_SUDOERS )); then
+    while IFS= read -r line; do
+      case "$line" in
+        '    Options: '*)
+          options="${line#*Options: }"
+          options=",${options//[[:space:]]/},"
+          case "$options" in *,authenticate,*) return 1 ;; esac
+          case "$options" in *,!authenticate,*) nopass=1 ;; esac ;;
+        '    Matched: '*)
+          [[ "${line#*Matched: }" == "/usr/bin/pmset $*" ]] || return 1
+          matched=$((matched + 1)) ;;
+      esac
+    done <<< "$BOUNDED_OUTPUT"
+    # Refuse unrecognized/ambiguous output rather than assume permission.
+    (( nopass == 1 && matched == 1 )) || return 1
+  fi
+  return 0
 }
 # The part of a message about a sudo check that is still running.
 sudo_alive_note() {

@@ -9,7 +9,9 @@ Requires **macOS 26 or later on an Apple Silicon Mac**.
 
 For an upgrade with an existing Insomnia pmset grant, add `--reuse-sudoers`
 to the install command. This skips all administrator writes and prompts.
-It still verifies permission for all four pmset commands, before quitting
+It verifies each exact root command's effective passwordless rule, rather
+than trusting cached sudo credentials or an unrelated passwordless grant.
+It checks all four pmset commands, before quitting
 the old app and again under the recovery lock; a missing grant stops the
 upgrade without replacing the app or agent. Omit the flag for a first install.
 

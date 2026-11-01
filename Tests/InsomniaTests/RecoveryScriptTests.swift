@@ -6146,7 +6146,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
         for command in ["-a disablesleep 1", "-a disablesleep 0", "-b lowpowermode 1", "-b lowpowermode 0"] {
-            XCTAssertEqual(calls.filter { $0 == "sudo -n -l /usr/bin/pmset \(command)" }.count, 2, "checked before quitting and under the recovery lock")
+            XCTAssertEqual(calls.filter { $0 == "sudo -n -ll -u root /usr/bin/pmset \(command)" }.count, 2, "checked before quitting and under the recovery lock")
         }
         XCTAssertTrue(calls.contains { $0.hasPrefix("launchctl bootstrap") })
     }
@@ -6161,6 +6161,31 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") || $0.hasPrefix("osascript") || $0.hasPrefix("launchctl") }, "\(calls)")
         XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
         XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+    }
+
+    func testUpgradeRejectsCachedCredentialsWithoutPasswordlessPmset() throws {
+        try checkUpgradeRejectsPasswordedPmset("cached-auth")
+    }
+
+    func testUpgradeRejectsUnrelatedPasswordlessRule() throws {
+        try checkUpgradeRejectsPasswordedPmset("unrelated-nopasswd")
+    }
+
+    private func checkUpgradeRejectsPasswordedPmset(_ mode: String) throws {
+        for underLock in [false, true] {
+            try fx.prepareInstall()
+            try fx.installMachinery()
+            fx.clearCalls()
+            fx.setMode("sudo", mode + (underLock ? "-under-lock" : ""))
+            let r = try fx.run(fx.installRedirected, ["--reuse-sudoers"], extraEnvironment: ["USER": "tester"])
+            XCTAssertNotEqual(r.status, 0, "\(mode), underLock=\(underLock): \(r.stdout)")
+            let calls = fx.calls()
+            XCTAssertEqual(calls.filter { $0 == "sudo -n -ll -u root /usr/bin/pmset -a disablesleep 1" }.count, underLock ? 2 : 1)
+            XCTAssertFalse(calls.contains { $0.hasPrefix("sudo visudo") || $0.hasPrefix("sudo install") || $0.hasPrefix("launchctl bootstrap") }, "\(calls)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n /usr/bin/pmset") }, "a permission check never changes power settings")
+            XCTAssertEqual(try String(contentsOf: fx.app.appendingPathComponent("Contents/MacOS/Insomnia"), encoding: .utf8), "binary")
+            XCTAssertEqual(try String(contentsOf: fx.sudoers, encoding: .utf8), "rule")
+        }
     }
 
     /// The password prompt (visudo + install of the sudoers rule) comes
@@ -6991,7 +7016,17 @@ private final class ScriptFixture {
         # write command.ended = released | watchdog, so a test can tell a
         # command that is still alive (no file) from one that ended, and why.
         case "${1:-}" in
-          -n) if [[ "${2:-}" == -l ]]; then
+          -n) if [[ "${2:-}" == -l || "${2:-}" == -ll ]]; then
+                if [[ "${2:-}" == -ll ]]; then
+                  [[ "${3:-}" == -u && "${4:-}" == root ]] || exit 1
+                  options='!authenticate'
+                  case "$mode" in
+                    cached-auth|unrelated-nopasswd) options=authenticate ;;
+                    cached-auth-under-lock|unrelated-nopasswd-under-lock)
+                      if lock_held; then options=authenticate; fi ;;
+                  esac
+                  printf 'Sudoers entry:\\n    RunAsUsers: root\\n    Options: %s\\n    Commands:\\n\\t%s\\n    Matched: %s\\n' "$options" "${*:5}" "${*:5}"
+                fi
                 case "$mode" in
                   auth-fail|rule-not-effective) exit 1 ;;
                   rule-gone-under-lock) if lock_held; then exit 1; fi; exit 0 ;;
