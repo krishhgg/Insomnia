@@ -296,12 +296,24 @@ below cover what only a real Mac shows.
 
 ### Hotspot
 
+- With the network heartbeat enabled, start a session and verify real HTTPS
+  traffic while the lid is closed on a phone hotspot, including Low Data Mode.
+  Check T3 and Rex remote connections separately; heartbeat success alone is
+  not evidence that their tunnels stayed connected. End the session and verify
+  requests stop and Insomnia's activity assertion is released. Repeat with the
+  option off and confirm there is no heartbeat traffic.
+- With Ethernet or USB tethering online and Wi-Fi offline, no hotspot join is
+  attempted. After all routes drop, the configured Wi-Fi retry path starts.
 - Hotspot permission, association, cancellation, and reconnect
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
 
 ### Install, upgrade and uninstall
 
+- An upgrade with `--reuse-sudoers` checks all four existing grants without
+  administrator writes or prompts. Missing grants refuse replacement. The
+  uninstaller's shipped app list includes Rex and Rex Server even after those
+  apps are removed from config.json.
 - Install/upgrade/uninstall with recoverable failure conditions
 - Settings > App shows the version from the installed bundle's Info.plist, and the launch line in insomnia.log carries the same; "Check for updates" names the newest stable and nightly tags as the releases page shows them and says whether the installed version is behind, and with Wi-Fi off it shows "Could not check" with the reason, the log has the failure line, and nothing else changes
 - Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why

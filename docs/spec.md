@@ -122,6 +122,9 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
 - Nothing else runs as root.
+- `install.sh --reuse-sudoers` skips writing the rule. It must verify all four
+  existing grants before quitting the old app and again under the recovery
+  lock. A missing grant stops the upgrade without prompting for new access.
 
 ### 3. Lid observer
 
@@ -522,7 +525,7 @@ last held while it was on was the battery or thermal floor, not the lid.
 ### 5. Agent apps: keep them fast
 
 - Agent list (bundle ids, default: T3 Code, Conductor, Terminal, iTerm,
-  Ghostty, Warp, Chrome, Chromium, Arc, Docker Desktop, VS Code, Cursor, Zed,
+  Ghostty, Warp, Rex, Rex Server, Chrome, Chromium, Arc, Docker Desktop, VS Code, Cursor, Zed,
   Antigravity, Claude, ChatGPT/Codex, Tailscale, LM Studio, Ollama). Editable.
 - Built-in protection (section 4): the same editors, agent hosts, terminals,
   browsers, VPN and local model runtimes, plus password managers, local
@@ -1109,6 +1112,8 @@ older build is tightened when the app reads it:
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
+- `keepNetworkActive` (default off): heartbeat and Insomnia activity token
+  during sessions; changes take effect at the next session start
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
@@ -1261,6 +1266,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
+| network heartbeat (opt-in) | common-mode timer and bounded HTTPS HEAD | one request every 30 s during a session, including metered connections |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
 | hotspot retry | only during an outage | none otherwise |
