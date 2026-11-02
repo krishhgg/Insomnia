@@ -39,6 +39,13 @@ final class StatusItemController: NSObject {
     private var keyMonitor: Any?
     private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
+    /// Swallows a click on the × before SwiftUI sees it. On macOS 27 the
+    /// event's window location is the item's centre, so the same click would
+    /// also open the time fields.
+    private var endClickMonitor: Any?
+    private var swallowEndMouseUp = false
+    /// mouseDown and the monitor can both see one click. One end is enough.
+    private var endRequested = false
     /// Holds keyboard focus while the pills are open; see `KeyCatcherPanel`.
     private var keyCatcher: KeyCatcherPanel?
     /// 1 Hz redraw of the projected countdown while a start is pending, so
@@ -114,6 +121,11 @@ final class StatusItemController: NSObject {
         )
         let host = Self.makeHostingView(root)
         host.onRightMouseDown = { [weak self] in self?.showMenu() }
+        host.onEndZoneClick = { [weak self] in
+            guard let self, self.manager.isActive else { return false }
+            self.holdToEnd()
+            return true
+        }
         host.translatesAutoresizingMaskIntoConstraints = true
         // The height follows the button; the width is set from the layout
         // (`retargetWidth`) and never from the button, whose width is the
@@ -135,7 +147,34 @@ final class StatusItemController: NSObject {
         host.frame.size.width = max(widthTarget, host.fittingSize.width.rounded(.up), 24)
         widthChanged(host.fittingSize.width)
         logFrames("installed")
+        installEndClickMonitor()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.logFrames("after 1s") }
+    }
+
+    /// Runs before the view gets the click, so SwiftUI cannot also treat it
+    /// as a tap on the countdown.
+    private func installEndClickMonitor() {
+        if let endClickMonitor { NSEvent.removeMonitor(endClickMonitor) }
+        endClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+            let consume = MainActor.assumeIsolated { self?.consumeEndClick(event) ?? false }
+            return consume ? nil : event
+        }
+    }
+
+    private func consumeEndClick(_ event: NSEvent) -> Bool {
+        guard let host = hostingView, event.window === host.window else { return false }
+        if event.type == .leftMouseUp {
+            if swallowEndMouseUp {
+                swallowEndMouseUp = false
+                return true
+            }
+            return false
+        }
+        if event.modifierFlags.contains(.control) { return false }
+        guard StatusHostingView.pointerIsInEndZone(of: host), manager.isActive else { return false }
+        holdToEnd()
+        swallowEndMouseUp = true
+        return true
     }
 
     /// Centralizes the AppKit/SwiftUI boundary so its sizing contract can be
@@ -226,6 +265,7 @@ final class StatusItemController: NSObject {
     }
 
     private func managerChanged() {
+        if !manager.isActive { endRequested = false }
         reminder.sync(endsAt: manager.session?.endsAt)
         if let next = Self.phase(forActive: manager.isActive, phase: model.phase) {
             switch next {
@@ -611,17 +651,14 @@ final class StatusItemController: NSObject {
 
     // MARK: Session actions
 
-    private func endNow() {
+    /// The end control was clicked. Ignored while a start is still in flight.
+    func holdToEnd() {
+        guard manager.isActive, !endRequested else { return }
+        endRequested = true
         Task { @MainActor in
             await manager.end(reason: .user)
+            if manager.isActive { endRequested = false }
         }
-    }
-
-    /// The status item's hold-to-end ring completed. Ignored while a start is
-    /// still in flight.
-    func holdToEnd() {
-        guard manager.isActive else { return }
-        endNow()
     }
 
     /// Clicking the mark or the countdown while a session runs: reopen the
@@ -844,11 +881,29 @@ final class StatusItemController: NSObject {
     }
 }
 
+/// The trailing band of the status item, where the end control sits.
+///
+/// On macOS 27 a status-item click reports `locationInWindow` at the item's
+/// centre, so the hit test uses the screen pointer instead.
+enum EndZone {
+    static let width: CGFloat = 30
+
+    /// `x` is in the item's coordinates, origin at the leading edge.
+    static func contains(x: CGFloat, itemWidth: CGFloat, zone: CGFloat = width) -> Bool {
+        guard itemWidth > 0, zone > 0, x.isFinite, itemWidth.isFinite else { return false }
+        return x >= itemWidth - zone && x <= itemWidth
+    }
+}
+
 /// The SwiftUI host covers the status bar button, so the right click has to
 /// be caught here rather than on the button. Ctrl-click is the same gesture
 /// on a one-button mouse.
 final class StatusHostingView: NSHostingView<StatusRootView> {
     var onRightMouseDown: (() -> Void)?
+    /// Returns true when a running session consumed the click. The local
+    /// monitor is what actually ends the session; this is the same check if
+    /// the click is delivered here first.
+    var onEndZoneClick: (() -> Bool)?
 
     override func rightMouseDown(with event: NSEvent) {
         onRightMouseDown?()
@@ -859,6 +914,25 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
             onRightMouseDown?()
             return
         }
+        if Self.pointerIsInEndZone(of: self), onEndZoneClick?() == true {
+            return
+        }
         super.mouseDown(with: event)
+    }
+
+    /// Screen pointer converted into `view`. `event.locationInWindow` is the
+    /// item's centre on macOS 27, whichever part was clicked.
+    ///
+    /// The host's frame only grows, so after the time fields have opened it
+    /// stays wider than the countdown. The visible item is the button under
+    /// it, and the × is the trailing edge of that, not of the grown host.
+    static func pointerIsInEndZone(of view: NSView) -> Bool {
+        guard let window = view.window else { return false }
+        let inWindow = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let point = view.convert(inWindow, from: nil)
+        let visible = view.superview?.bounds.width ?? view.bounds.width
+        guard point.x >= 0, point.x <= visible else { return false }
+        guard point.y >= 0, point.y <= max(view.bounds.height, view.superview?.bounds.height ?? 0) else { return false }
+        return EndZone.contains(x: point.x, itemWidth: visible)
     }
 }

@@ -93,6 +93,16 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(MenuBarModel.projectedStartCountdown(now: now, duration: 5 * 3600, maxDuration: 3600), "1:00:00")
     }
 
+    func testEndZoneIsTheRightEdgeOfTheItem() {
+        // A 118pt item: the centre (what macOS 27 reports) is not the ×.
+        XCTAssertFalse(EndZone.contains(x: 59, itemWidth: 118))
+        XCTAssertFalse(EndZone.contains(x: 87.9, itemWidth: 118))
+        XCTAssertTrue(EndZone.contains(x: 88, itemWidth: 118))
+        XCTAssertTrue(EndZone.contains(x: 118, itemWidth: 118))
+        XCTAssertFalse(EndZone.contains(x: 118.1, itemWidth: 118))
+        XCTAssertFalse(EndZone.contains(x: 10, itemWidth: 0))
+    }
+
     @MainActor
     func testHoldToEndIsSubSecond() {
         XCTAssertEqual(Motion.holdDuration, 0.6, accuracy: 0.0001)
