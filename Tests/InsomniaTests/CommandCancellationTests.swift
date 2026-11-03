@@ -19,8 +19,7 @@ final class CommandCancellationTests: XCTestCase {
 
     private func script(_ name: String, _ body: String) throws -> String {
         let path = dir.appendingPathComponent(name).path
-        try "#!/bin/sh\n\(body)\n".write(toFile: path, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        try TestScripts.write("#!/bin/sh\n\(body)\n", to: URL(fileURLWithPath: path))
         return path
     }
 

@@ -187,8 +187,10 @@ struct StatusRootView: View {
         Text(countdownText)
             .font(.system(size: 13, weight: .medium, design: .rounded))
             .monospacedDigit()
-            .contentTransition(.numericText(countsDown: true))
-            .animation(Motion.tick(reduceMotion: reduceMotion), value: countdownText)
+            // No content transition and no animation: a per-frame one is a
+            // per-frame status item re-render, about 23 ms each. See
+            // `Motion.countdownTick`.
+            .animation(Motion.countdownTick, value: countdownText)
             .padding(.trailing, 1)
             .transition(Motion.countdownTransition(reduceMotion: reduceMotion))
             .contentShape(Rectangle())

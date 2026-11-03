@@ -68,8 +68,8 @@
     {
       "id": "sudoers-rule-is-four-exact-lines",
       "severity": "high",
-      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "README.md", "SECURITY.md", "docs/spec.md"],
-      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these four commands and nothing else: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. SleepGuard.swift runs only those four argument lists, and README.md, SECURITY.md and docs/spec.md list the same four."
+      "scope": ["scripts/install.sh", "scripts/uninstall.sh", "Sources/Insomnia/Core/SleepGuard.swift", "README.md", "docs/install.md", "SECURITY.md", "docs/spec.md"],
+      "rule": "The file install.sh writes to /etc/sudoers.d/insomnia grants NOPASSWD for exactly these four commands and nothing else: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -b lowpowermode 1, /usr/bin/pmset -b lowpowermode 0. No wildcard, no ALL, no bare /usr/bin/pmset, no other command, and it is validated with visudo -cf before it is installed. SleepGuard.swift runs only those four argument lists, and README.md, docs/install.md, SECURITY.md and docs/spec.md list the same four."
     },
     {
       "id": "behavior-changes-come-with-regression-tests",
@@ -90,10 +90,10 @@
       "rule": "Nothing user-identifying reaches the unified log (os.Logger) as public: no SSID or hotspot name, tmux target or pane id, process name, bundle id, app name, path under the home directory, or pane content. Such values keep the default private privacy; only fixed phrases, counts, numbers and error kinds may be marked privacy: .public. The plain-text insomnia.log file is a separate local file and may hold them (SECURITY.md)."
     },
     {
-      "id": "release-validation-rows-need-hardware-evidence",
+      "id": "real-mac-checks-need-hardware-evidence",
       "severity": "high",
-      "scope": ["docs/release-validation.md"],
-      "rule": "A row in the 'Hardware validation still required' table changes from 'Not run' only together with the tested commit, hardware, macOS version, date and observed result written into the same file. New behavior that needs a check on real hardware adds a 'Not run' row. Passing tests, a source review or a green CI run are never recorded as hardware evidence."
+      "scope": ["docs/release-validation.md", "docs/releasing.md"],
+      "rule": "New behavior that needs a check on a real Mac adds an item to the 'Real-Mac checks before a release' list in docs/releasing.md. A release's results in docs/release-validation.md name the tested commit, the Mac, the macOS version, the date and the result of each check. Passing tests, a source review or a green CI run are never recorded as a real-Mac result."
     },
     {
       "id": "writing-style",

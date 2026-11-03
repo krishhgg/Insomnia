@@ -313,7 +313,7 @@ final class StatusItemController: NSObject {
         // is not seen jumping back.
         endFoldIfAny()
         model.input = DurationInput()
-        model.focused = .hours
+        model.focused = manager.config.defaultFocusField
         model.focusVisible = false
         stopPendingTick()
         model.pendingCountdown = nil

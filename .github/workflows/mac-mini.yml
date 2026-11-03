@@ -1,0 +1,104 @@
+name: Mac mini
+
+# The Swift tests again, on the owner's Mac mini, in a throwaway macOS 27 VM
+# with Xcode 27: one VM per job, deleted after it. The VM runs the whole
+# suite, the UI and Keychain tests included, which nobody runs on their own
+# Mac. docs/mac-mini-ci.md has the setup and what a job in the VM can reach.
+#
+# Not a required check. A job waits in the queue while the mini is off,
+# and GitHub cancels it after 24 hours. Runs for pull requests from outside
+# contributors start only once the owner approves them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # As in ci.yml: `merge-gate.sh rerun` toggles draft to test again.
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mini-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  swift:
+    name: Swift test (Mac mini, macOS 27 VM)
+    runs-on: [self-hosted, insomnia-mini]
+    timeout-minutes: 60
+    steps:
+      - name: Check the VM
+        # mini-base.sh turns on pf with a block on private and tailnet
+        # addresses, and installs tmux. A base VM that lost either fails
+        # here instead of running the job with one fence fewer.
+        run: |
+          sudo -n /sbin/pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'
+          sudo -n /sbin/pfctl -s rules 2>/dev/null | grep -q '100.64.0.0/10'
+          /opt/homebrew/bin/tmux -V
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Note which main this run tests
+        # The same note as ci.yml's. merge-gate.sh check needs one in each
+        # required check, so this job can become one without a change here.
+        if: github.event_name == 'pull_request'
+        run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
+      - name: Print macOS and toolchain versions
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+          {
+            echo "### Mac mini VM"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| macOS | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) |"
+            echo "| Xcode | $(xcodebuild -version | paste -sd ' ' -) |"
+            echo "| Swift | $(swift --version 2>&1 | grep -m1 'Swift version') |"
+            echo "| tmux | $(/opt/homebrew/bin/tmux -V) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build release
+        run: swift build -c release -Xswiftc -warnings-as-errors
+
+      - name: Run tests
+        # The same watchdog as ci.yml's Run tests step: after 50 minutes it
+        # samples every xctest process, so the log shows what a hung test
+        # waits on, and fails the step.
+        env:
+          NSUnbufferedIO: "YES"
+        run: |
+          swift test &
+          test_pid=$!
+          for ((i = 0; i < 3000; i++)); do
+            kill -0 "$test_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$test_pid" 2>/dev/null; then
+            echo "::error::swift test still running after 50 minutes; sampling xctest"
+            ps -axo pid,ppid,stat,etime,command
+            for x in $(pgrep -x xctest); do
+              echo "::group::xctest pid $x"
+              /usr/bin/sample "$x" 3 -mayDie || true
+              echo "::endgroup::"
+            done
+            pkill -KILL -x xctest 2>/dev/null || true
+            exit 1
+          fi
+          wait "$test_pid"

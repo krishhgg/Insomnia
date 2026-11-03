@@ -53,6 +53,7 @@ final class BrowserThrottleTests: XCTestCase {
         XCTAssertTrue(ids.contains("com.google.Chrome"))
         XCTAssertTrue(ids.contains("org.chromium.Chromium"))
         XCTAssertTrue(ids.contains("company.thebrowser.Browser"))
+        XCTAssertTrue(ids.contains("ai.perplexity.comet"))
         XCTAssertTrue(ids.contains("com.example.chromeagent"))
         XCTAssertTrue(ids.contains("dev.some.Chromium-Fork"))
         XCTAssertFalse(ids.contains("com.apple.Safari"))

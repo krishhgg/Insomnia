@@ -538,4 +538,35 @@ final class ConfigLoadTests: XCTestCase {
         XCTAssertEqual(try h.store.loadConfig()?.lidCloseDefaultsApplied, true)
         XCTAssertTrue(log().contains("config.json: lid-close update: nothing to change; saved"), log())
     }
+
+    // MARK: Default focused field
+
+    private func decode(_ json: String) throws -> Config {
+        try JSONDecoder().decode(Config.self, from: Data(json.utf8))
+    }
+
+    func testTheDefaultFocusedFieldIsHours() {
+        XCTAssertEqual(Config().defaultFocusField, .hours)
+    }
+
+    func testAConfigFromAnEarlierBuildKeepsHoursFocused() throws {
+        XCTAssertEqual(try decode("{}").defaultFocusField, .hours)
+    }
+
+    func testTheDefaultFocusedFieldIsSavedByName() throws {
+        for field in DurationInput.Field.allCases {
+            var c = Config()
+            c.defaultFocusField = field
+            let data = try JSONEncoder().encode(c)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(json["defaultFocusField"] as? String, "\(field)")
+            XCTAssertEqual(try JSONDecoder().decode(Config.self, from: data).defaultFocusField, field)
+        }
+    }
+
+    func testAnUnknownFocusedFieldFallsBackToHoursAndKeepsTheRestOfTheConfig() throws {
+        let c = try decode(#"{"defaultFocusField": "seconds", "endFloor": 15}"#)
+        XCTAssertEqual(c.defaultFocusField, .hours)
+        XCTAssertEqual(c.endFloor, 15, "one bad value must not throw the whole config away")
+    }
 }

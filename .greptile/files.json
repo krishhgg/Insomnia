@@ -13,7 +13,7 @@
   },
   {
     "path": "docs/release-validation.md",
-    "description": "What has and has not been validated on real hardware; a hardware row changes from Not run only with recorded evidence."
+    "description": "The real-Mac checks each release passed, with the commit, Mac, macOS version and date, and the audits behind the safety fixes."
   },
   {
     "path": "scripts/backstop.sh",

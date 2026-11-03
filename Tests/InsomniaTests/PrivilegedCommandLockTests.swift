@@ -28,8 +28,7 @@ final class PrivilegedCommandLockTests: XCTestCase {
 
     private func script(_ name: String, _ body: String) throws -> String {
         let path = file(name)
-        try "#!/bin/sh\n\(body)\n".write(toFile: path, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        try TestScripts.write("#!/bin/sh\n\(body)\n", to: URL(fileURLWithPath: path))
         return path
     }
 

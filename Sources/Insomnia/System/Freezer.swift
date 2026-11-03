@@ -132,6 +132,7 @@ enum FreezePlanner {
         "org.mozilla.firefoxdeveloperedition", // Firefox Developer Edition (cask firefox@developer-edition)
         "org.mozilla.nightly",              // Firefox Nightly (cask firefox@nightly)
         "app.zen-browser.zen",              // Zen (cask zen)
+        "ai.perplexity.comet",              // Comet (installed)
         // VPN and local model runtimes
         "io.tailscale.ipn.macsys",          // Tailscale (installed)
         "ai.elementlabs.lmstudio",          // LM Studio (installed)

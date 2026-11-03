@@ -8,6 +8,9 @@ struct Config: Codable, Equatable, Sendable {
     /// Preset durations in seconds, shown as chips.
     var presets: [TimeInterval] = Config.defaultPresets
     var defaultPreset: TimeInterval = 4 * 3600
+    /// The pill that is focused when the pills open, for a start and for an
+    /// extend.
+    var defaultFocusField: DurationInput.Field = .hours
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
 
@@ -143,6 +146,9 @@ struct Config: Codable, Equatable, Sendable {
         let d = Config()
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
+        // A value this build does not know falls back to hours; it must not
+        // cost the user the rest of the config.
+        defaultFocusField = (try? c.decodeIfPresent(DurationInput.Field.self, forKey: .defaultFocusField)) ?? d.defaultFocusField
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps

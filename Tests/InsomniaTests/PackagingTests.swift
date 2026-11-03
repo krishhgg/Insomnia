@@ -133,8 +133,7 @@ final class PackagingTests: XCTestCase {
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: bundle.appendingPathComponent("Contents/Info.plist"))
         let script = Paths.backstopScript(inBundle: bundle)
-        try "#!/bin/bash\nprintf 'ran %s\\n' \"$*\" >> \"$HOME/backstop.ran\"\n".write(to: script, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try TestScripts.write("#!/bin/bash\nprintf 'ran %s\\n' \"$*\" >> \"$HOME/backstop.ran\"\n", to: script)
         let sign = try run("/usr/bin/codesign", ["--force", "--sign", "-", bundle.path])
         XCTAssertEqual(sign.status, 0, sign.output)
         return bundle
@@ -251,11 +250,11 @@ final class PackagingTests: XCTestCase {
         try (String(contentsOf: script, encoding: .utf8) + "echo tampered\n").write(to: script, atomically: true, encoding: .utf8)
         XCTAssertEqual(try CodeRequirement.designated(ofCodeAt: bundle), requirement, "the requirement alone still reads")
         XCTAssertThrowsError(try CodeRequirement.verify(codeAt: bundle, satisfies: requirement)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains(securityMessage(errSecCSBadResource)), error.localizedDescription)
         }
         XCTAssertThrowsError(try CodeRequirement.pin(bundle: bundle)) { error in
             XCTAssertTrue(error.localizedDescription.contains(bundle.path), error.localizedDescription)
-            XCTAssertTrue(error.localizedDescription.contains("sealed resource"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains(securityMessage(errSecCSBadResource)), error.localizedDescription)
         }
     }
 
@@ -276,7 +275,7 @@ final class PackagingTests: XCTestCase {
         XCTAssertNotEqual(replacement, launched.requirement, "re-signing gives the bundle a new cdhash")
         XCTAssertNoThrow(try CodeRequirement.verify(codeAt: bundle, satisfies: replacement), "the replacement is a valid bundle in its own right")
         XCTAssertThrowsError(try CodeRequirement.pin(bundle: bundle, running: { launched }, mainBundle: bundle)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("failed to satisfy"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains(securityMessage(errSecCSReqFailed)), error.localizedDescription)
         }
 
         // A process running from one bundle never pins another.
@@ -307,7 +306,9 @@ final class PackagingTests: XCTestCase {
     /// codesign can sign the result) and whose `codesign` is either the real
     /// tool or a recorder. Its `rm`, `mkdir`, `cp` and `chmod` record each
     /// call and then run the real tool. ROOT is a scratch checkout with the
-    /// real Info.plist, icon and backstop.sh copied in.
+    /// real Info.plist, icon and backstop.sh copied in. The fake's `build`
+    /// exits with the status in `swiftBuildStatus` (0 when there is none),
+    /// and `-print-target-info` reports `fakeToolchainLib` as its resources.
     private func patchedBuildApp(recordingCodesign: Bool) throws -> (script: URL, calls: URL) {
         let fm = FileManager.default
         let checkout = scratch.appendingPathComponent("checkout", isDirectory: true)
@@ -325,14 +326,22 @@ final class PackagingTests: XCTestCase {
 
         func fake(_ name: String, _ body: String) throws -> URL {
             let url = bin.appendingPathComponent(name)
-            try ("#!/bin/bash\n" + body).write(to: url, atomically: true, encoding: .utf8)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            try TestScripts.write("#!/bin/bash\n" + body, to: url)
             return url
         }
         let swift = try fake("swift", """
         printf 'swift %s\\n' "$*" >> "\(calls.path)"
         for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(binroot.path)"; exit 0; }; done
-        exit 0
+        if [[ "${1:-}" == -print-target-info ]]; then
+          printf '{\\n  "paths": {\\n    "runtimeResourcePath": "%s"\\n  }\\n}\\n' "\(fakeToolchainLib.path)"
+          exit 0
+        fi
+        status="$(cat "\(swiftBuildStatus.path)" 2>/dev/null || echo 0)"
+        if [[ "$status" != 0 ]]; then
+          echo "error: 'checkout': Invalid manifest" >&2
+          echo "Package.swift:7:17: error: reference to member 'v26' cannot be resolved without a contextual type" >&2
+        fi
+        exit "$status"
         """)
         let codesign = recordingCodesign
             ? try fake("codesign", """
@@ -461,8 +470,7 @@ final class PackagingTests: XCTestCase {
         try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
         for name in ["rm", "mkdir", "cp", "chmod"] {
             let url = shadow.appendingPathComponent(name)
-            try "#!/bin/bash\nprintf 'PATH \(name) %s\\n' \"$*\" >> \"\(calls.path)\"\nexit 1\n".write(to: url, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            try TestScripts.write("#!/bin/bash\nprintf 'PATH \(name) %s\\n' \"$*\" >> \"\(calls.path)\"\nexit 1\n", to: url)
         }
 
         let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "\(shadow.path):/usr/bin:/bin", "HOME": scratch.path])
@@ -493,6 +501,96 @@ final class PackagingTests: XCTestCase {
             XCTAssertTrue(r.output.contains("usage:"), r.output)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: calls.path), "nothing was built or signed")
+    }
+
+    // MARK: build-app.sh after a failed build: package interfaces an older Swift left behind
+
+    /// The fake swift's resource folder. The space stands in for a toolchain
+    /// in an app such as "Xcode-beta 2.app" and checks the quoting of the
+    /// printed command.
+    private var fakeToolchainLib: URL { scratch.appendingPathComponent("Xcode beta.app/usr/lib/swift", isDirectory: true) }
+    private var swiftBuildStatus: URL { scratch.appendingPathComponent("swift-build.status") }
+    private static let currentSwift = "Apple Swift version 6.3.3 effective-5.10 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)"
+    private static let olderSwift = "Apple Swift version 5.10 (swiftlang-5.10.0.13 clang-1500.3.9.4)"
+
+    /// One interface file of a SwiftPM module in the fake toolchain, such
+    /// as `writeInterface("ManifestAPI/PackageDescription", private: true,
+    /// writer: olderSwift)`, with the header the compiler writes.
+    @discardableResult
+    private func writeInterface(_ module: String, private isPrivate: Bool, writer: String) throws -> URL {
+        let dir = fakeToolchainLib.appendingPathComponent("pm/\(module).swiftmodule", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("arm64-apple-macos\(isPrivate ? ".private" : "").swiftinterface")
+        try "// swift-interface-format-version: 1.0\n// swift-compiler-version: \(writer)\nimport Swift\n"
+            .write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    /// A Command Line Tools update that kept the previous version's
+    /// .private.swiftinterface makes the manifest fail on API newer than
+    /// that Swift. The failed build names exactly the interfaces an older
+    /// Swift wrote, keeps swift's exit status, assembles and signs nothing,
+    /// and prints a command that deletes those files and nothing else.
+    func testBuildAppNamesPackageInterfacesAnOlderSwiftLeftWhenTheBuildFails() throws {
+        let (script, calls) = try patchedBuildApp(recordingCodesign: true)
+        try writeInterface("ManifestAPI/PackageDescription", private: false, writer: Self.currentSwift)
+        let stale = try writeInterface("ManifestAPI/PackageDescription", private: true, writer: Self.olderSwift)
+        let pluginPublic = try writeInterface("PluginAPI/PackagePlugin", private: false, writer: Self.currentSwift)
+        let pluginPrivate = try writeInterface("PluginAPI/PackagePlugin", private: true, writer: Self.currentSwift)
+        let support = try writeInterface("ManifestAPI/CompilerPluginSupport", private: false, writer: Self.currentSwift)
+        try "3".write(to: swiftBuildStatus, atomically: true, encoding: .utf8)
+        let out = scratch.appendingPathComponent("out", isDirectory: true)
+
+        let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertEqual(r.status, 3, "swift's exit status: \(r.output)")
+        XCTAssertTrue(r.output.contains("  \(stale.path)\n    written by \(Self.olderSwift)\n"), r.output)
+        XCTAssertFalse(r.output.contains(pluginPrivate.path), "written by the same Swift as the interface beside it: \(r.output)")
+        XCTAssertTrue(r.output.contains("reference to member 'v26' cannot be resolved"), r.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: out.appendingPathComponent("Insomnia.app").path), "nothing assembled")
+        let recorded = try String(contentsOf: calls, encoding: .utf8).components(separatedBy: "\n")
+        XCTAssertEqual(recorded.filter { $0.hasPrefix("codesign") }, [], "nothing signed")
+
+        // The shell expands the printed arguments (printf in place of
+        // `sudo rm`, so nothing is deleted): exactly the stale file, its
+        // space intact.
+        let command = try XCTUnwrap(r.output.components(separatedBy: "\n").first { $0.hasPrefix("  sudo rm ") }, r.output)
+        let words = try run("/bin/bash", ["-c", "printf '%s\\n'" + command.dropFirst("  sudo rm".count)])
+        XCTAssertEqual(words.status, 0, "\(command): \(words.output)")
+        XCTAssertEqual(words.output, stale.path + "\n", command)
+        XCTAssertFalse(words.output.contains(pluginPublic.path) || words.output.contains(support.path), command)
+    }
+
+    /// A failed build with no stale interface gets swift's own errors and
+    /// nothing more.
+    func testBuildAppAddsNoInterfaceAdviceWhenNoneIsStale() throws {
+        let (script, _) = try patchedBuildApp(recordingCodesign: true)
+        try writeInterface("ManifestAPI/PackageDescription", private: false, writer: Self.currentSwift)
+        try writeInterface("ManifestAPI/PackageDescription", private: true, writer: Self.currentSwift)
+        try "1".write(to: swiftBuildStatus, atomically: true, encoding: .utf8)
+
+        let r = try run("/bin/bash", [script.path, "--output", scratch.appendingPathComponent("out").path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertEqual(r.status, 1, r.output)
+        XCTAssertTrue(r.output.contains("Invalid manifest"), r.output)
+        XCTAssertFalse(r.output.contains("older Swift"), r.output)
+        XCTAssertFalse(r.output.contains("sudo rm"), r.output)
+    }
+
+    /// The toolchain is looked at only after a failed build: a successful
+    /// one never asks swift where its resources are, so a stale interface
+    /// that does not break this package changes nothing.
+    func testBuildAppLooksForStaleInterfacesOnlyAfterAFailedBuild() throws {
+        let (script, calls) = try patchedBuildApp(recordingCodesign: true)
+        try writeInterface("ManifestAPI/PackageDescription", private: false, writer: Self.currentSwift)
+        try writeInterface("ManifestAPI/PackageDescription", private: true, writer: Self.olderSwift)
+
+        let r = try run("/bin/bash", [script.path, "--output", scratch.appendingPathComponent("out").path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertEqual(r.status, 0, r.output)
+        XCTAssertFalse(r.output.contains("sudo rm"), r.output)
+        let recorded = try String(contentsOf: calls, encoding: .utf8).components(separatedBy: "\n")
+        XCTAssertFalse(recorded.contains { $0.contains("-print-target-info") }, "\(recorded)")
     }
 
     /// The checked-in files are what `AppIconArtwork` draws now, so a
@@ -751,13 +849,10 @@ private struct IconScriptFixture {
         try text.write(to: script, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
-        try writeFake("swiftc", #"""
-        out=""
-        while [ $# -gt 0 ]; do
-          if [ "$1" = "-o" ]; then out="$2"; shift; fi
-          shift
-        done
-        cat > "$out" <<'GENERATOR'
+        // The generator the fake swiftc "compiles": its own file, so it is
+        // linted like the fakes, copied to swiftc's -o path.
+        let generator = root.appendingPathComponent("icon-generator")
+        try TestScripts.write(#"""
         #!/bin/bash
         set -e
         while [ $# -gt 0 ]; do
@@ -769,9 +864,17 @@ private struct IconScriptFixture {
           esac
           shift 2
         done
-        GENERATOR
+
+        """#, to: generator, executable: false)
+        try writeFake("swiftc", """
+        out=""
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "-o" ]; then out="$2"; shift; fi
+          shift
+        done
+        cat '\(generator.path)' > "$out"
         chmod +x "$out"
-        """#)
+        """)
         try writeFake("iconutil", """
         [ -e '\(root.appendingPathComponent("iconutil-fails").path)' ] && exit 1
         [ "$1" = -c ] && [ "$2" = icns ] && [ -d "$3" ] && [ "$4" = -o ] || exit 2
@@ -782,6 +885,8 @@ private struct IconScriptFixture {
         if [ -e "$flag" ]; then
           while IFS= read -r pattern; do
             for arg in "$@"; do
+              # The patterns are globs, so they stay unquoted.
+              # shellcheck disable=SC2254
               case "$arg" in $pattern) echo "mv: refusing $arg" >&2; exit 1 ;; esac
             done
           done < "$flag"
@@ -792,8 +897,7 @@ private struct IconScriptFixture {
 
     private func writeFake(_ name: String, _ body: String) throws {
         let url = bin.appendingPathComponent(name)
-        try ("#!/bin/bash\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        try TestScripts.write("#!/bin/bash\n" + body + "\n", to: url)
     }
 
     func setWritable(_ dir: URL, _ writable: Bool) throws {

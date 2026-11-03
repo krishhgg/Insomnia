@@ -350,6 +350,21 @@ final class UIStartupTests: XCTestCase {
         XCTAssertGreaterThan(rig.measuredWidth(), idleWidth)
     }
 
+    @MainActor
+    func testThePillsOpenOnTheConfiguredFieldForAStartAndForAnExtend() {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        XCTAssertEqual(rig.manager.config.defaultFocusField, .hours, "hours unless the user chose another")
+        for field in DurationInput.Field.allCases {
+            rig.manager.config.defaultFocusField = field
+            for mode in [MenuBarModel.Mode.start, .extend] {
+                rig.controller.collapse()
+                rig.controller.expand(mode: mode)
+                XCTAssertEqual(rig.model.focused, field, "\(mode) opens on \(field)")
+            }
+        }
+    }
+
     // MARK: Pure transitions
 
     @MainActor

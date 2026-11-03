@@ -279,6 +279,61 @@ pmset_rule_effective() {
     && pmset_rule_check -b lowpowermode 0
 }
 
+# Kong's Insomnia API client runs an executable named Insomnia too, so
+# `pgrep -x Insomnia` finds it as well. A pid pgrep found is skipped only
+# when `codesign --verify` passes it against API_CLIENT_REQUIREMENT: the
+# code the process runs is signed with a certificate Apple issued (such as
+# Developer ID), with the client's identifier and Kong's team in the leaf
+# certificate. codesign checks that signature on the running code, so
+# neither an argv[0] or path made to look like the client's nor a signature
+# that only claims that identifier and team passes. Any other exit counts
+# as this app: 3 when the requirement is not met (this app, ad hoc signed,
+# is one), 1 for a process that is gone or a signature that does not
+# verify, anything else, and (under the lock) no answer in time. A misread
+# the other way would replace the bundle and the LaunchAgent under a
+# running app.
+API_CLIENT_ID=com.insomnia.app
+API_CLIENT_TEAM=FX44YY62GV
+API_CLIENT_REQUIREMENT="anchor apple generic and identifier \"$API_CLIENT_ID\" and certificate leaf[subject.OU] = \"$API_CLIENT_TEAM\""
+# The pids already reported as the API client, so each is named once.
+API_CLIENT_SEEN=" "
+# 0 when the process with this pid is the API client (said once per pid),
+# 1 when it counts as this app. codesign is called the way pgrep is at that
+# point: through bounded() under the recovery lock ($2 = bounded), directly
+# before it ($2 = direct).
+api_client() { # pid bounded|direct
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$2" == bounded ]]; then
+    bounded "$CODESIGN" --verify "-R=$API_CLIENT_REQUIREMENT" "$1" || return 1
+  else
+    "$CODESIGN" --verify "-R=$API_CLIENT_REQUIREMENT" "$1" </dev/null >/dev/null 2>&1 || return 1
+  fi
+  if [[ "$API_CLIENT_SEEN" != *" $1 "* ]]; then
+    echo "Ignoring pid $1: it is Kong's Insomnia API client ($API_CLIENT_ID, team $API_CLIENT_TEAM), not this app."
+    API_CLIENT_SEEN+="$1 "
+  fi
+  return 0
+}
+# 0 when every pid pgrep printed ($1, one per line) is the API client, 1
+# when any one counts as this app, and when none was checked.
+only_api_client() { # pgrep-output bounded|direct
+  local pid checked=0
+  while IFS= read -r pid; do
+    api_client "$pid" "$2" || return 1
+    checked=1
+  done <<< "$1"
+  (( checked == 1 ))
+}
+# Whether this app is running, as step 3 asks before the lock: pgrep and
+# codesign are direct calls, and a pgrep that fails counts as none, since
+# step 5 asks again under the lock.
+app_running() {
+  local pids
+  pids="$("$PGREP" -x Insomnia 2>/dev/null)" || return 1
+  if only_api_client "$pids" direct; then return 1; fi
+  return 0
+}
+
 cleanup() {
   if [[ -n "$TMP_SUDOERS" ]]; then "$RM" -f "$TMP_SUDOERS"; fi
   if [[ -n "$CANDIDATE" ]]; then "$RM" -f "$CANDIDATE"; fi
@@ -428,14 +483,14 @@ step "Staging Insomnia.app"
 # Ask the app to quit and wait until it has actually exited. It refuses to
 # quit while it has unresolved recovery work; that refusal stands (no pkill),
 # and nothing of the old install is overwritten while it is still running.
-if "$PGREP" -x Insomnia >/dev/null 2>&1; then
+if app_running; then
   echo "Insomnia is running; quitting it first (this ends any session)."
   "$OSASCRIPT" -e 'tell application id "com.kgarg.insomnia" to quit' >/dev/null 2>&1 || true
   for (( i = 0; i < QUIT_WAIT_SECONDS; i++ )); do
-    "$PGREP" -x Insomnia >/dev/null 2>&1 || break
+    app_running || break
     sleep 1
   done
-  if "$PGREP" -x Insomnia >/dev/null 2>&1; then
+  if app_running; then
     echo "Insomnia is still running after ${QUIT_WAIT_SECONDS}s (it may be refusing to quit until its own recovery finishes)." >&2
     echo "Let it finish or quit it from its menu, then rerun. $SUDOERS is installed; the app (with backstop.sh) and the LaunchAgent were not touched." >&2
     exit 1
@@ -516,8 +571,12 @@ fi
 # the lock, so the app and the agent's backstop can take it again and undo a
 # session. A sudo that does not stop on SIGTERM keeps the lock until it ends.
 # A pgrep that cannot answer does not say the app is gone, so the run stops.
+# Finding only the API client is finding none.
 pgrep_rc=0
 bounded "$PGREP" -x Insomnia || pgrep_rc=$?
+if (( pgrep_rc == 0 )) && only_api_client "$BOUNDED_OUTPUT" bounded; then
+  pgrep_rc=1
+fi
 if (( pgrep_rc == 0 )); then
   echo "Insomnia started again; quit it and rerun. The app at $APP and the LaunchAgent were not touched." >&2
   exit 1

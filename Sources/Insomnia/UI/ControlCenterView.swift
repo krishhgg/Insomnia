@@ -66,6 +66,7 @@ struct ControlCenterView: View {
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
     let loginItem: LoginItem
+    let releases: ReleaseChecker
 
     @State private var page: ControlPage = .overview
     @State private var duration = "4h"
@@ -101,7 +102,7 @@ struct ControlCenterView: View {
                 } else {
                     SettingsView(manager: manager, secrets: secrets,
                                  locationPermission: locationPermission,
-                                 loginItem: loginItem, page: page)
+                                 loginItem: loginItem, releases: releases, page: page)
                         .id(page)
                         .padding(.horizontal, 12)
                 }

@@ -16,8 +16,18 @@ enum Motion {
     static let base: Animation = .spring(response: baseResponse, dampingFraction: baseDampingFraction)
     /// Focus bounce and icon taps: snappier, with a slight overshoot.
     static let snappy: Animation = .spring(response: 0.25, dampingFraction: 0.6)
-    /// One digit roll of the 1 Hz countdown; must settle well inside a second.
-    static let tick: Animation = .spring(response: 0.18, dampingFraction: 0.85)
+    /// The countdown's 1 Hz text change carries no animation.
+    ///
+    /// Every frame of an animation is a content change, and AppKit re-renders
+    /// the whole status item on each one: `NSStatusItem _updateReplicants`
+    /// takes a fresh snapshot of the SwiftUI host, lays it out again and
+    /// blurs it (`RenderBox`, `vImageSepConvolve`). One content change
+    /// measured at about 23 ms of main thread, so the 0.18 s spring this
+    /// replaced ran about twenty of them a second and held the app at about
+    /// 46% of one core for as long as a session lasted. With no animation a
+    /// session reads 2.3%, and one text change a second is affordable. The
+    /// digits change in one step, as the menu bar clock's do.
+    static let countdownTick: Animation? = nil
     /// How long the end button must be held before the session ends.
     static let holdDuration: TimeInterval = 0.6
     /// Delay between consecutive pills appearing (reversed on collapse).
@@ -114,10 +124,6 @@ enum Motion {
 
     static func snappy(reduceMotion: Bool = Motion.reduceMotion) -> Animation {
         reduceMotion ? reduced : snappy
-    }
-
-    static func tick(reduceMotion: Bool = Motion.reduceMotion) -> Animation {
-        reduceMotion ? reduced : tick
     }
 
     /// Delay for pill `index` of `count` when expanding (`reversed == false`)

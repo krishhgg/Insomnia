@@ -26,6 +26,9 @@ final class RecoveryScriptTests: XCTestCase {
     }
 
     override func tearDown() {
+        // The fake codesign logs this when a script checks a pid against a
+        // requirement other than Kong's client's (see writeFakes).
+        XCTAssertFalse(fx.calls().contains("codesign BAD-REQUIREMENT"), "\(fx.calls())")
         fx.destroy()
         fx = nil
     }
@@ -65,6 +68,60 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), clean, "journal must not be rewritten")
         XCTAssertFalse(fx.exists(fx.session))
         XCTAssertFalse(fx.exists(fx.logFile), "an idle minute must not spam the log")
+    }
+
+    private static let compactCleanJournal = #"{"appNapOverrides":[],"dockerFrozen":false,"frozenProcesses":[],"lowPowerSetByUs":false,"savedAudioOutputs":[],"sleepDisabledByUs":false}"#
+
+    /// The run launchd makes every minute between sessions ends before the
+    /// lock: it returns 0 while another process holds it. A full run would
+    /// wait for the lock and exit 75.
+    func testIdleRunDoesNotWaitForTheLock() throws {
+        let clean = try Store.makeEncoder().encode(RuntimeState.clean)
+        try clean.write(to: fx.state)
+        let holder = try fx.holdLock()
+        defer { holder.stop() }
+
+        let r = try fx.run(fx.backstop)
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(fx.calls(), [])
+        XCTAssertEqual(try Data(contentsOf: fx.state), clean, "journal must not be rewritten")
+        XCTAssertFalse(fx.exists(fx.logFile), "an idle minute must not spam the log")
+    }
+
+    /// Whitespace between tokens does not matter, so a Foundation that lays
+    /// the JSON out differently keeps the early exit.
+    func testIdleRunAcceptsTheCleanJournalInAnyLayout() throws {
+        try fx.writeState(Self.compactCleanJournal + "\n")
+        let holder = try fx.holdLock()
+        defer { holder.stop() }
+
+        XCTAssertEqual(try fx.run(fx.backstop).status, 0)
+    }
+
+    /// Everything else takes the full run, seen here as exit 75 under a held lock.
+    func testOnlyTheCleanJournalWithNoSessionSkipsTheLock() throws {
+        let clean = Self.compactCleanJournal
+        let holder = try fx.holdLock()
+        defer { holder.stop() }
+
+        let others = [
+            "one more key": String(clean.dropLast()) + #","someFutureKey":1}"#,
+            "keys in another order": #"{"sleepDisabledByUs":false,"appNapOverrides":[],"dockerFrozen":false,"frozenProcesses":[],"lowPowerSetByUs":false,"savedAudioOutputs":[]}"#,
+            "a flag set": clean.replacingOccurrences(of: #""sleepDisabledByUs":false"#, with: #""sleepDisabledByUs":true"#),
+            "an entry": clean.replacingOccurrences(of: #""frozenProcesses":[]"#, with: #""frozenProcesses":[{"pid":1}]"#),
+            "a NUL byte at the end": clean + "\u{0}",
+        ]
+        for (what, journal) in others {
+            try fx.writeState(journal)
+            XCTAssertEqual(try fx.run(fx.backstop).status, 75, what)
+        }
+
+        try fx.writeState(clean)
+        XCTAssertEqual(try fx.run(fx.backstop, ["--force"]).status, 75, "--force")
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: 3600))
+        XCTAssertEqual(try fx.run(fx.backstop).status, 75, "a session.json")
+        XCTAssertEqual(fx.calls(), [])
     }
 
     func testMissingJournalAndNoSessionDoesNothing() throws {
@@ -497,10 +554,35 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.log().contains("com.apple.Terminal NSAppSleepDisabled failed and the key is still set"), fx.log())
     }
 
-    /// A failed delete followed by a read that fails for any reason other
-    /// than "does not exist" (cfprefsd not answering, say) proves nothing
-    /// about the key. The entry stays, the run fails, and the next run
-    /// finishes the job once `defaults` answers again.
+    /// macOS 27 says an absent key is not there in other words: "Could not
+    /// find key" when the domain exists and "Domain ... not found" when it
+    /// does not. Either one clears the entry after a failed delete, as
+    /// "does not exist" does on macOS 26 (#95).
+    func testDeleteOfAlreadyAbsentKeyCountsAsRestoredWithMacOS27Wording() throws {
+        for wording in ["27-key", "27-domain"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.aone.keka"}]}"#)
+            try fx.defaultsTable([])
+            try fx.setDefaultsWording(wording)
+
+            let r = try fx.run(fx.backstop)
+
+            XCTAssertEqual(r.status, 0, "\(wording): " + r.stderr + fx.log())
+            XCTAssertEqual(fx.calls(), [
+                "defaults delete com.aone.keka NSAppSleepDisabled",
+                "defaults read com.aone.keka NSAppSleepDisabled",
+            ], wording)
+            XCTAssertEqual((try fx.stateJSON()["appNapOverrides"] as? [Any])?.count, 0, wording)
+            XCTAssertTrue(fx.log().contains("com.aone.keka NSAppSleepDisabled: the key is already absent"), "\(wording): " + fx.log())
+            XCTAssertFalse(fx.log().contains("could not tell whether the key is still set"), "\(wording): " + fx.log())
+        }
+    }
+
+    /// A failed delete followed by a read that fails without an absent-key
+    /// message (cfprefsd not answering, say) proves nothing about the key.
+    /// The entry stays, the run fails, and the next run finishes the job
+    /// once `defaults` answers again.
     func testDeleteAndReadBothFailingKeepsTheEntryForTheNextRun() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome"}]}"#)
@@ -1404,7 +1486,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// cannot get App Nap entries past uninstall's own check.
     func testUninstallRejectsAppNapEntriesEvenWhenBackstopExitsZero() throws {
         try fx.installMachinery()
-        try "#!/bin/bash\nexit 0\n".write(to: fx.backstop, atomically: true, encoding: .utf8)
+        try TestScripts.write("#!/bin/bash\nexit 0\n", to: fx.backstop, executable: false)
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[{"bundleId":"com.google.Chrome"}]}"#)
 
         let r = try fx.run(fx.uninstall)
@@ -1462,20 +1544,29 @@ final class RecoveryScriptTests: XCTestCase {
 
     /// Nothing to list: the check still runs, reads the shipped list plus
     /// config.json's (each once), and says how many it checked rather than
-    /// claiming nothing is left anywhere.
+    /// claiming nothing is left anywhere. On macOS 27 an app without the
+    /// key reads as "Could not find key", or "Domain ... not found" when it
+    /// has no preferences at all; both count as checked, as macOS 26's
+    /// "does not exist" does, not as unreadable (#95).
     func testUninstallReportsNoUnrecordedAppNapWhenNoneIsSet() throws {
-        try fx.installMachinery()
-        try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
-        try fx.writeConfig(#"{"agentList":["com.google.Chrome","com.example.extra"]}"#)
+        for wording in ["26", "27-key", "27-domain"] {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try fx.writeConfig(#"{"agentList":["com.google.Chrome","com.example.extra"]}"#)
+            try fx.setDefaultsWording(wording)
 
-        let r = try fx.run(fx.uninstall)
+            let r = try fx.run(fx.uninstall)
 
-        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
-        let expected = (Config.defaultAgentList + ["com.example.extra"]).map { "defaults read \($0) NSAppSleepDisabled" }
-        XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, expected)
-        XCTAssertTrue(r.stdout.contains("Checking App Nap settings of agent apps"), r.stdout)
-        XCTAssertTrue(r.stdout.contains("none of the \(expected.count) agent apps checked has NSAppSleepDisabled set"), r.stdout)
-        XCTAssertFalse(r.stdout.contains("defaults delete"), r.stdout)
+            XCTAssertEqual(r.status, 0, "\(wording): " + r.stderr + r.stdout)
+            let expected = (Config.defaultAgentList + ["com.example.extra"]).map { "defaults read \($0) NSAppSleepDisabled" }
+            XCTAssertEqual(fx.calls().filter { $0.hasPrefix("defaults") }, expected, wording)
+            XCTAssertTrue(r.stdout.contains("Checking App Nap settings of agent apps"), "\(wording): " + r.stdout)
+            XCTAssertTrue(r.stdout.contains("none of the \(expected.count) agent apps checked has NSAppSleepDisabled set"), "\(wording): " + r.stdout)
+            XCTAssertFalse(r.stdout.contains("could not read NSAppSleepDisabled"), "\(wording): " + r.stdout)
+            XCTAssertFalse(r.stdout.contains("defaults delete"), "\(wording): " + r.stdout)
+        }
     }
 
     /// An app the user took off the list may still carry a value an older
@@ -1648,7 +1739,7 @@ final class RecoveryScriptTests: XCTestCase {
                 try ScriptFixture.infoPlist(resumeFrozenVersion: version).write(to: f.appInfo, atomically: true, encoding: .utf8)
                 let copy = sealed ? f.installedBackstop : f.legacyBackstop
                 if !sealed { try FileManager.default.removeItem(at: f.installedBackstop) }
-                try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: copy, atomically: true, encoding: .utf8)
+                try TestScripts.write("printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n", to: copy, executable: false)
                 try f.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
                 let r = try f.run(f.uninstall)
@@ -1673,7 +1764,7 @@ final class RecoveryScriptTests: XCTestCase {
             try f.installMachinery()
             if installedCopy {
                 for copy in [f.installedBackstop, f.legacyBackstop] {
-                    try "printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n".write(to: copy, atomically: true, encoding: .utf8)
+                    try TestScripts.write("printf 'installed backstop %s\\n' \"$*\" >> '\(f.callsLog.path)'\n", to: copy, executable: false)
                 }
             } else {
                 try FileManager.default.removeItem(at: f.installedBackstop)
@@ -1762,7 +1853,7 @@ final class RecoveryScriptTests: XCTestCase {
     func testUninstallVerifiesJournalEvenWhenBackstopExitsZero() throws {
         try fx.installMachinery()
         // An older backstop that claims success without restoring anything.
-        try "#!/bin/bash\nexit 0\n".write(to: fx.backstop, atomically: true, encoding: .utf8)
+        try TestScripts.write("#!/bin/bash\nexit 0\n", to: fx.backstop, executable: false)
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
 
         let r = try fx.run(fx.uninstall)
@@ -2421,7 +2512,7 @@ final class RecoveryScriptTests: XCTestCase {
             let f = try ScriptFixture()
             defer { f.destroy() }
             try f.installMachinery()
-            try "#!/bin/bash\nexit 0\n".write(to: f.backstop, atomically: true, encoding: .utf8)
+            try TestScripts.write("#!/bin/bash\nexit 0\n", to: f.backstop, executable: false)
             try f.writeState(json)
 
             let r = try f.run(f.uninstall, ["--purge"])
@@ -2600,7 +2691,7 @@ final class RecoveryScriptTests: XCTestCase {
             let f = try ScriptFixture()
             defer { f.destroy() }
             try f.installMachinery()
-            try "#!/bin/bash\nexit 0\n".write(to: f.backstop, atomically: true, encoding: .utf8)
+            try TestScripts.write("#!/bin/bash\nexit 0\n", to: f.backstop, executable: false)
             try f.writeState(json)
 
             let r = try f.run(f.uninstall, ["--purge"])
@@ -2638,7 +2729,7 @@ final class RecoveryScriptTests: XCTestCase {
             let u = try ScriptFixture()
             defer { u.destroy() }
             try u.installMachinery()
-            try "#!/bin/bash\nexit 0\n".write(to: u.backstop, atomically: true, encoding: .utf8)
+            try TestScripts.write("#!/bin/bash\nexit 0\n", to: u.backstop, executable: false)
             try u.writeState(Self.keptDisplayJournal(record, ours: false))
 
             let ur = try u.run(u.uninstall, ["--purge"])
@@ -3457,13 +3548,13 @@ final class RecoveryScriptTests: XCTestCase {
         try Data().write(to: fx.lock)
         let lockInode = try XCTUnwrap(try FileManager.default.attributesOfItem(atPath: fx.lock.path)[.systemFileNumber] as? Int)
         let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
-        try """
+        try TestScripts.write("""
         #!/bin/bash
         set -eu
         exec 9<>"\(fx.lock.path)"
         /usr/bin/lockf -t 0 9
         /bin/bash "\(fx.backstop.path)"
-        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        """, to: wrapper, executable: false)
 
         for run in [{ try self.fx.run(self.fx.backstop) }, { try self.fx.run(wrapper) }] {
             try writeMicrosecondEntry(pid: 5304, started: 1_789_388_423, micros: 4)
@@ -3665,18 +3756,49 @@ final class RecoveryScriptTests: XCTestCase {
         try Data().write(to: fx.lock)
         // A bash wrapper that takes the lock on fd 9 and then runs the backstop.
         let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
-        try """
+        try TestScripts.write("""
         #!/bin/bash
         set -eu
         exec 9<>"\(fx.lock.path)"
         /usr/bin/lockf -t 0 9
         /bin/bash "\(fx.backstop.path)"
-        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        """, to: wrapper, executable: false)
 
         let r = try fx.run(wrapper)
 
         XCTAssertEqual(r.status, 0, r.stderr + fx.log())
         XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertFalse(fx.log().contains("still held"), fx.log())
+    }
+
+    /// The same hand-down from a shell with GNU coreutils first on PATH, as
+    /// Homebrew's gnubin puts it: GNU stat reads `-f` as --file-system, so a
+    /// bare `stat -f %i` prints no inode, fd 9 never matches the lock file,
+    /// and the backstop waits on its own caller's lock until it exits 75
+    /// (install.sh then stops). The backstop reaches stat only through
+    /// STAT, so the `stat` stub on PATH, which logs and prints what GNU
+    /// prints, never runs.
+    func testBackstopSharesLockHandedDownOnFd9WithGNUStatFirstOnPath() throws {
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try Data().write(to: fx.lock)
+        let shadow = fx.root.appendingPathComponent("shadow", isDirectory: true)
+        try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
+        let stub = shadow.appendingPathComponent("stat")
+        try TestScripts.write("#!/bin/bash\nprintf 'PATH stat %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nprintf '  File: \"%s\"\\n' \"$*\"\n", to: stub)
+        let wrapper = fx.root.appendingPathComponent("holder-then-backstop.sh")
+        try TestScripts.write("""
+        #!/bin/bash
+        set -eu
+        exec 9<>"\(fx.lock.path)"
+        /usr/bin/lockf -t 0 9
+        /bin/bash "\(fx.backstop.path)"
+        """, to: wrapper, executable: false)
+
+        let r = try fx.run(wrapper, extraEnvironment: ["PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"], "a stat from PATH ran")
         XCTAssertFalse(fx.log().contains("still held"), fx.log())
     }
 
@@ -3851,12 +3973,13 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("sudo", "ignore-term")
         let capture = fx.root.appendingPathComponent("capture.sh")
-        try #"""
+        try TestScripts.write(#"""
         #!/bin/bash
+        # Only the wait for end of file matters, not the output.
+        # shellcheck disable=SC2034
         out="$(/bin/bash "$1" 2>&1)"; rc=$?
         echo "captured rc=$rc"
-        """#.write(to: capture, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: capture.path)
+        """#, to: capture)
 
         let r = try fx.run(capture, [fx.backstop.path])
 
@@ -3914,7 +4037,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false}"#)
         let sentinelScript = fx.root.appendingPathComponent("sentinel.sh")
-        try "exec /bin/sleep 120\n".write(to: sentinelScript, atomically: true, encoding: .utf8)
+        try TestScripts.write("exec /bin/sleep 120\n", to: sentinelScript, executable: false)
         let sentinel = try fx.spawn(sentinelScript)
         defer {
             _ = sentinel.signal(SIGTERM)
@@ -4074,13 +4197,13 @@ final class RecoveryScriptTests: XCTestCase {
         }
         try Data().write(to: fx.lock)
         let sharing = fx.root.appendingPathComponent("holder-then-backstop.sh")
-        try """
+        try TestScripts.write("""
         #!/bin/bash
         set -eu
         exec 9<>"\(fx.lock.path)"
         /usr/bin/lockf -t 0 9
         /bin/bash "\(fx.backstop.path)"
-        """.write(to: sharing, atomically: true, encoding: .utf8)
+        """, to: sharing, executable: false)
 
         for (mode, expected) in [("ok", Int32(0)), ("fail", 1), ("hang", 1)] {
             try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
@@ -4431,9 +4554,7 @@ final class RecoveryScriptTests: XCTestCase {
         try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
         let planted = shared.appendingPathComponent("scripts/build-app.sh")
         try FileManager.default.createDirectory(at: planted.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n"
-            .write(to: planted, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: planted.path)
+        try TestScripts.write("#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n", to: planted)
 
         let r = try fx.run(unpacked.appendingPathComponent("install.sh"), extraEnvironment: ["USER": "tester"])
 
@@ -4461,9 +4582,7 @@ final class RecoveryScriptTests: XCTestCase {
             try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
             try FileManager.default.copyItem(at: fx.installRedirected, to: unpacked.appendingPathComponent("install.sh"))
             let planted = unpacked.appendingPathComponent("build-app.sh")
-            try "#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 0\n"
-                .write(to: planted, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: planted.path)
+            try TestScripts.write("#!/bin/bash\nprintf 'planted build-app.sh %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 0\n", to: planted)
 
             let r = try fx.run(unpacked.appendingPathComponent("install.sh"), extraEnvironment: ["USER": "tester"])
 
@@ -4631,7 +4750,7 @@ final class RecoveryScriptTests: XCTestCase {
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
         fx.setMode("launchctl", "loaded")
         let wrapper = fx.root.appendingPathComponent("umask-002.sh")
-        try "umask 0002\nexec /bin/bash \"\(fx.installRedirected.path)\" \"$@\"\n".write(to: wrapper, atomically: true, encoding: .utf8)
+        try TestScripts.write("umask 0002\nexec /bin/bash \"\(fx.installRedirected.path)\" \"$@\"\n", to: wrapper, executable: false)
 
         let r = try fx.run(wrapper, extraEnvironment: ["USER": "tester"])
 
@@ -5151,8 +5270,7 @@ final class RecoveryScriptTests: XCTestCase {
         try FileManager.default.createDirectory(at: shadow, withIntermediateDirectories: true)
         for tool in ["mkdir", "cp", "chmod", "ditto"] {
             let stub = shadow.appendingPathComponent(tool)
-            try "#!/bin/bash\nprintf 'PATH \(tool) %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n".write(to: stub, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+            try TestScripts.write("#!/bin/bash\nprintf 'PATH \(tool) %s\\n' \"$*\" >> \"\(fx.callsLog.path)\"\nexit 1\n", to: stub)
         }
 
         let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester", "PATH": "\(shadow.path):/usr/bin:/bin:/usr/sbin:/sbin"])
@@ -6143,6 +6261,287 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains("not touched"), "says what was not: \(r.stderr)")
         XCTAssertTrue(r.stderr.contains("still running"), r.stderr)
     }
+
+    // MARK: - Kong's Insomnia API client
+
+    /// Kong's Insomnia API client runs an executable named Insomnia too, so
+    /// `pgrep -x Insomnia` finds it. This is its pid.
+    private let clientPid = 7002
+
+    /// The check each script makes of a pid pgrep printed. Kong's client,
+    /// and only it, passes (codesign exits 0).
+    private func verifyCall(_ pid: Int) -> String {
+        "codesign --verify -R=\(ScriptFixture.apiClientRequirement) \(pid)"
+    }
+
+    private var ignoredLine: String {
+        "Ignoring pid \(clientPid): it is Kong's Insomnia API client (com.insomnia.app, team FX44YY62GV), not this app."
+    }
+
+    private func count(_ line: String, in text: String) -> Int {
+        text.components(separatedBy: line).count - 1
+    }
+
+    /// A process named Insomnia that codesign does not pass as Kong's
+    /// client, each set up in a fresh fixture. Every one counts as this app.
+    private var processesThatCountAsThisApp: [(String, () throws -> Void)] {
+        let process = { (status: Int32?) -> () throws -> Void in
+            { try self.fx.insomniaProcesses([(self.clientPid, status)]) }
+        }
+        return [
+            // codesign checks the code a process runs, not its argv[0]: this
+            // app, ad hoc signed, does not meet the requirement even when
+            // started with argv[0] set to Kong's path, and neither does code
+            // with another identifier or team or a certificate Apple did not
+            // issue.
+            ("this app, also under Kong's path: requirement not met (exit 3)", process(3)),
+            ("a signature that does not verify (exit 1)", process(1)),
+            ("another codesign error (exit 2)", process(2)),
+            ("a codesign that fails", {
+                try self.fx.insomniaProcesses([(self.clientPid, 0)])
+                self.fx.setMode("codesign-pid", "fail")
+            }),
+            ("a pid codesign does not find", process(nil)),
+            ("pgrep printing no pid", { try self.fx.insomniaProcesses([]) }),
+        ]
+    }
+
+    /// With only the API client running there is nothing to quit: uninstall
+    /// sends no quit, names the pid it ignores once, and removes everything.
+    /// Every check (the quit step, under the lock, before the removal) finds
+    /// the client and ignores it.
+    func testUninstallIgnoresTheInsomniaAPIClient() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.insomniaProcesses([(clientPid, 0)])
+        fx.setMode("pgrep", "0\n")   // the client runs the whole time
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing of this app to quit: \(calls)")
+        XCTAssertEqual(calls.filter { $0.hasPrefix("pgrep") }.count, 3, "\(calls)")
+        XCTAssertEqual(calls.filter { $0 == verifyCall(clientPid) }.count, 3, "\(calls)")
+        XCTAssertEqual(count(ignoredLine, in: r.stdout), 1, r.stdout)
+        XCTAssertTrue(calls.contains("sudo -n \(fx.fakePmset) -a disablesleep 0"), "\(calls)")
+        XCTAssertTrue(calls.contains("sudo rm -f \(fx.sudoers.path)"), "\(calls)")
+        XCTAssertFalse(fx.exists(fx.plist))
+        XCTAssertFalse(fx.exists(fx.sudoers))
+        XCTAssertFalse(fx.exists(fx.app))
+        XCTAssertFalse(r.stderr.contains("still running"), r.stderr)
+    }
+
+    /// The client beside this app does not hide this app: the quit request
+    /// goes out, and an app that keeps running still stops the uninstall.
+    func testUninstallStillRefusesWhenThisAppRunsBesideTheAPIClient() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.insomniaProcesses([(clientPid, 0), (fx.appPid, 3)])
+        fx.setMode("pgrep", "0\n")   // both run, and both stay
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertTrue(calls.contains(verifyCall(fx.appPid)), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertTrue(r.stderr.contains("Insomnia is still running (it may be refusing to quit until its own recovery finishes)."), r.stderr)
+        XCTAssertTrue(r.stderr.contains("Nothing was removed."), r.stderr)
+        XCTAssertEqual(count(ignoredLine, in: r.stdout), 1, r.stdout)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+    }
+
+    /// A process codesign does not pass as the client counts as this app:
+    /// uninstall asks it to quit and stops.
+    func testUninstallCountsAProcessItCannotTellApartAsThisApp() throws {
+        for (label, setUp) in processesThatCountAsThisApp {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try fx.installMachinery()
+            try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+            try setUp()
+            fx.setMode("pgrep", "0\n")
+
+            let r = try fx.run(fx.uninstall)
+
+            XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
+            let calls = fx.calls()
+            XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "\(label): \(calls)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(label): \(calls)")
+            XCTAssertFalse(calls.contains("codesign BAD-REQUIREMENT"), "\(label): \(calls)")
+            XCTAssertTrue(r.stderr.contains("Insomnia is still running"), "\(label): \(r.stderr)")
+            XCTAssertTrue(r.stderr.contains("Nothing was removed."), "\(label): \(r.stderr)")
+            XCTAssertFalse(r.stdout.contains("Ignoring pid"), "\(label): \(r.stdout)")
+            XCTAssertTrue(fx.exists(fx.plist), label)
+            XCTAssertTrue(fx.exists(fx.sudoers), label)
+        }
+    }
+
+    /// The check under the lock ignores the client the same way: it was
+    /// not running at the quit step and started before the lock was taken.
+    func testUninstallIgnoresTheAPIClientStartedBeforeTheLock() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.insomniaProcesses([(clientPid, 0)])
+        fx.setMode("pgrep", "1\n0\n")   // none at the quit step, then the client
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(calls.filter { $0 == verifyCall(clientPid) }.count, 2, "\(calls)")
+        XCTAssertEqual(count(ignoredLine, in: r.stdout), 1, r.stdout)
+        XCTAssertFalse(r.stderr.contains("started again"), r.stderr)
+        XCTAssertTrue(calls.contains("sudo rm -f \(fx.sudoers.path)"), "\(calls)")
+        XCTAssertFalse(fx.exists(fx.plist))
+    }
+
+    /// A `codesign --verify` that does not answer under the lock does not
+    /// show the pid is the client: it counts as this app, the call is
+    /// stopped, and uninstall exits before the backstop runs and lets go of
+    /// the lock.
+    func testUninstallCountsACodesignThatDoesNotAnswerUnderTheLockAsThisApp() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        try fx.insomniaProcesses([(clientPid, 0)])
+        fx.setMode("pgrep", "1\n0\n")   // none at the quit step, then the client
+        fx.setMode("codesign-pid", "hang")
+
+        let started = Date()
+        let r = try fx.run(fx.uninstall)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 30)
+        XCTAssertTrue(r.stderr.contains("Insomnia started again; quit it and rerun. Nothing was removed."), r.stderr)
+        XCTAssertFalse(r.stdout.contains("Ignoring pid"), r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains(verifyCall(clientPid)), "\(calls)")
+        XCTAssertTrue(calls.contains("codesign FD9-OPEN"), "\(calls)")
+        XCTAssertTrue(fx.hungProcessGone("codesign", within: 0))
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, true)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// With only the API client running, install sends no quit and does not
+    /// wait: pgrep runs once before the lock and once under it, each check
+    /// ignores the client, and the new build is installed.
+    func testInstallIgnoresTheInsomniaAPIClient() throws {
+        try writePreviousPair()
+        try fx.insomniaProcesses([(clientPid, 0)])
+        fx.setMode("pgrep", "0\n")   // the client runs the whole time
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "nothing of this app to quit: \(calls)")
+        XCTAssertFalse(r.stdout.contains("quitting it first"), r.stdout)
+        XCTAssertEqual(calls.filter { $0.hasPrefix("pgrep") }.count, 2, "no wait for the client to exit: \(calls)")
+        XCTAssertEqual(calls.filter { $0 == verifyCall(clientPid) }.count, 2, "\(calls)")
+        XCTAssertEqual(count(ignoredLine, in: r.stdout), 1, r.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the new bundle is installed")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
+
+    /// The client beside this app does not hide this app: the quit request
+    /// goes out, and an app that keeps running still stops the install with
+    /// the sudoers rule installed and nothing else touched.
+    func testInstallStillStopsWhenThisAppRunsBesideTheAPIClient() throws {
+        try writePreviousPair()
+        try fx.insomniaProcesses([(clientPid, 0), (fx.appPid, 3)])
+        fx.setMode("pgrep", "0\n")   // both run, and both stay
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertTrue(calls.contains(verifyCall(fx.appPid)), "\(calls)")
+        XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertTrue(r.stdout.contains("Insomnia is running; quitting it first"), r.stdout)
+        XCTAssertTrue(r.stderr.contains("Insomnia is still running after 1s"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("\(fx.sudoers.path) is installed; the app (with backstop.sh) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertEqual(count(ignoredLine, in: r.stdout), 1, r.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+    }
+
+    /// A process codesign does not pass as the client counts as this app:
+    /// install asks it to quit and stops.
+    func testInstallCountsAProcessItCannotTellApartAsThisApp() throws {
+        for (label, setUp) in processesThatCountAsThisApp {
+            fx.destroy()
+            fx = try ScriptFixture()
+            try writePreviousPair()
+            try setUp()
+            fx.setMode("pgrep", "0\n")
+
+            let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+            XCTAssertEqual(r.status, 1, "\(label): " + r.stderr + r.stdout)
+            let calls = fx.calls()
+            XCTAssertTrue(calls.contains { $0.hasPrefix("osascript") }, "\(label): \(calls)")
+            XCTAssertFalse(calls.contains { $0.hasPrefix("launchctl") }, "\(label): \(calls)")
+            XCTAssertFalse(calls.contains("codesign BAD-REQUIREMENT"), "\(label): \(calls)")
+            XCTAssertTrue(r.stderr.contains("Insomnia is still running after 1s"), "\(label): \(r.stderr)")
+            XCTAssertFalse(r.stdout.contains("Ignoring pid"), "\(label): \(r.stdout)")
+            XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous", label)
+            XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted", label)
+        }
+    }
+
+    /// The check under the lock ignores the client the same way: it was
+    /// not running at the quit step and started before the lock was taken.
+    func testInstallIgnoresTheAPIClientStartedBeforeTheLock() throws {
+        try writePreviousPair()
+        try fx.insomniaProcesses([(clientPid, 0)])
+        fx.setMode("pgrep", "1\n0\n")   // none at the quit step, then the client
+
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(r.status, 0, r.stderr + r.stdout)
+        let calls = fx.calls()
+        XCTAssertFalse(calls.contains { $0.hasPrefix("osascript") }, "\(calls)")
+        XCTAssertEqual(calls.filter { $0 == verifyCall(clientPid) }.count, 1, "\(calls)")
+        XCTAssertEqual(count(ignoredLine, in: r.stdout), 1, r.stdout)
+        XCTAssertFalse(r.stderr.contains("started again"), r.stderr)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash")
+    }
+
+    /// A `codesign --verify` that does not answer under the lock does not
+    /// show the pid is the client: it counts as this app, the call is
+    /// stopped, and install exits before recovery and lets go of the lock.
+    func testInstallCountsACodesignThatDoesNotAnswerUnderTheLockAsThisApp() throws {
+        try writePreviousPair()
+        try fx.insomniaProcesses([(clientPid, 0)])
+        fx.setMode("pgrep", "1\n0\n")   // none at the quit step, then the client
+        fx.setMode("codesign-pid", "hang")
+
+        let started = Date()
+        let r = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(r.status, 1, r.stderr + r.stdout)
+        XCTAssertLessThan(elapsed, 30)
+        XCTAssertTrue(r.stderr.contains("Insomnia started again; quit it and rerun. The app at \(fx.app.path) and the LaunchAgent were not touched."), r.stderr)
+        XCTAssertFalse(r.stdout.contains("Ignoring pid"), r.stdout)
+        let calls = fx.calls()
+        XCTAssertTrue(calls.contains(verifyCall(clientPid)), "\(calls)")
+        XCTAssertTrue(calls.contains("codesign FD9-OPEN"), "\(calls)")
+        XCTAssertTrue(fx.hungProcessGone("codesign", within: 0))
+        XCTAssertFalse(calls.contains { $0.hasPrefix("sudo -n \(fx.fakePmset)") || $0.hasPrefix("launchctl") }, "\(calls)")
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertEqual(try String(contentsOf: fx.plist, encoding: .utf8), "trusted")
+        XCTAssertTrue(try fx.lockIsFree())
+    }
 }
 
 // MARK: - Fixture
@@ -6200,6 +6599,13 @@ private final class ScriptFixture {
     /// in `bin`, so installMachinery and install.sh can put their own
     /// Contents/MacOS/Insomnia in the bundle.
     var appInfo: URL { app.appendingPathComponent("Contents/Info.plist") }
+    /// The app's own process, which the fake pgrep finds by default when it
+    /// exits 0 (see insomniaProcesses).
+    let appPid = 7001
+    /// The code requirement install.sh and uninstall.sh check a pid pgrep
+    /// found against, to tell Kong's Insomnia API client from this app. The
+    /// fake codesign accepts no other.
+    static let apiClientRequirement = #"anchor apple generic and identifier "com.insomnia.app" and certificate leaf[subject.OU] = "FX44YY62GV""#
 
     private let fm = FileManager.default
 
@@ -6311,8 +6717,7 @@ private final class ScriptFixture {
         let binroot = root.appendingPathComponent("binroot", isDirectory: true)
         try fm.createDirectory(at: binroot, withIntermediateDirectories: true)
         let binary = binroot.appendingPathComponent("Insomnia")
-        try "#!/bin/bash\nexit 0\n".write(to: binary, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        try TestScripts.write("#!/bin/bash\nexit 0\n", to: binary)
         try fm.createDirectory(at: plist.deletingLastPathComponent(), withIntermediateDirectories: true)
     }
 
@@ -6335,8 +6740,7 @@ private final class ScriptFixture {
     /// A stand-in backstop that records which copy ran and claims success.
     func writeMarkerBackstop(at url: URL, name: String) throws {
         try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "#!/bin/bash\nprintf 'backstop \(name) %s\\n' \"$*\" >> \"\(callsLog.path)\"\nexit 0\n"
-            .write(to: url, atomically: true, encoding: .utf8)
+        try TestScripts.write("#!/bin/bash\nprintf 'backstop \(name) %s\\n' \"$*\" >> \"\(callsLog.path)\"\nexit 0\n", to: url, executable: false)
     }
 
     func plistOnDisk() throws -> [String: Any] {
@@ -6523,8 +6927,7 @@ private final class ScriptFixture {
 
     private func writeFake(_ name: String, _ body: String) throws {
         let url = bin.appendingPathComponent(name)
-        try ("#!/bin/bash\n" + body).write(to: url, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        try TestScripts.write("#!/bin/bash\n" + body, to: url)
     }
 
     private func writeFakes() throws {
@@ -6625,6 +7028,8 @@ private final class ScriptFixture {
             # (writePrebuiltApp's dist/Insomnia.app) while the password prompt waits.
             if [[ "$mode" == swap-prebuilt ]]; then printf 'swapped' > "\(r)/dist/Insomnia.app/Contents/MacOS/Insomnia"; fi
             f=""; for a in "$@"; do f="$a"; done
+            # Rejects unless the file is non-empty and has the rule.
+            # shellcheck disable=SC2015
             [[ -s "$f" ]] && grep -q 'NOPASSWD: /usr/bin/pmset' "$f" || { printf 'sudo VISUDO-REJECTED %s\\n' "$*" >> "\(calls)"; exit 1; }
             exit 0 ;;
           install)
@@ -6661,6 +7066,8 @@ private final class ScriptFixture {
         from="${args[0]:-}"; to="${args[1]:-}"
         if [[ -f "\(r)/mv.fail" ]]; then
           while IFS='|' read -r f t; do
+            # The patterns are globs, so they stay unquoted.
+            # shellcheck disable=SC2053
             if [[ -n "$f" && "$from" == $f && "$to" == $t ]]; then
               printf 'mv FAILED %s %s\\n' "$from" "$to" >> "\(calls)"
               echo "mv: rename $from to $to: Permission denied" >&2
@@ -6691,12 +7098,36 @@ private final class ScriptFixture {
         // codesign.rejects (see `rejectSignature(of:)`) fails every form.
         // Mode "verify-hangs": `--verify` never answers (see hangHere);
         // "verify-hangs-under-lock": only while someone holds the recovery
-        // lock.
+        // lock. `--verify -R=<requirement> <pid>`, which install.sh and
+        // uninstall.sh run for each pid pgrep printed, answers from
+        // codesign.pid/<pid> (see insomniaProcesses): its first line is the
+        // exit status, the rest goes to stderr. With no file it says
+        // "<pid>: No such process" and exits 1, as codesign does for a
+        // process that is gone. Its own codesign-pid.mode: "fail" (exit 1
+        // whatever the file says) or "hang" (never answers). A pid check in
+        // any other form, or against any requirement but Kong's client's
+        // (apiClientRequirement), logs "codesign BAD-REQUIREMENT", which
+        // fails the test (see tearDown), and exits 64.
         try writeFake("codesign", """
         printf 'codesign %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/codesign.mode" 2>/dev/null || echo ok)"
         \(hangHere("codesign"))
         \(lockHeldHere())
+        target=""; for a in "$@"; do target="$a"; done
+        if [[ "$1" == --verify && "$target" =~ ^[0-9]+$ ]]; then
+          if [[ $# != 3 || "$2" != '-R=\(Self.apiClientRequirement)' ]]; then
+            echo "codesign BAD-REQUIREMENT" >> "\(calls)"
+            echo "fake codesign: pid $target checked against another requirement: $*" >&2
+            exit 64
+          fi
+          pidmode="$(cat "\(r)/codesign-pid.mode" 2>/dev/null || echo ok)"
+          if [[ "$pidmode" == hang ]]; then hang_here; fi
+          if [[ "$pidmode" == fail ]]; then echo "codesign: internal error in Code Signing subsystem" >&2; exit 1; fi
+          if [[ ! -f "\(r)/codesign.pid/$3" ]]; then echo "$3: No such process" >&2; exit 1; fi
+          status="$(head -n 1 "\(r)/codesign.pid/$3")"
+          tail -n +2 "\(r)/codesign.pid/$3" >&2
+          exit "$status"
+        fi
         signing="$(cat "\(r)/codesign.signing" 2>/dev/null || echo adhoc)"
         last=""; deep=0; pinned=0; for a in "$@"; do last="$a"; [[ "$a" == --deep ]] && deep=1; [[ "$a" == -R=* ]] && pinned=1; done
         for a in "$@"; do
@@ -6838,8 +7269,12 @@ private final class ScriptFixture {
         // write and delete fail; "fail:<domain>" only that domain's. Mode
         // "unreachable" (or "unreachable:<domain>") fails every command,
         // read included, the way a cfprefsd that does not answer would:
-        // non-zero without the "does not exist" message. Mode "hang" (or
-        // "hang:<domain>") never answers; see hangHere.
+        // non-zero without any absent-key message. Mode "hang" (or
+        // "hang:<domain>") never answers; see hangHere. defaults.wording
+        // picks the message for an absent key: macOS 26's "does not exist"
+        // by default, "27-key" for macOS 27's "Could not find key" (a
+        // domain that exists) and "27-domain" for its "Domain ... not
+        // found" (a domain with no preferences at all).
         try writeFake("defaults", """
         printf 'defaults %s\\n' "$*" >> "\(calls)"
         mode="$(cat "\(r)/defaults.mode" 2>/dev/null || echo ok)"
@@ -6859,6 +7294,15 @@ private final class ScriptFixture {
           awk -F'|' -v d="$domain" '$1 != d' "$table" > "$table.next" && mv "$table.next" "$table"
         }
         failing() { [[ "$mode" == fail || "$mode" == "fail:$domain" ]]; }
+        absent() {
+          case "$(cat "\(r)/defaults.wording" 2>/dev/null)" in
+            27-key) echo "Error: Could not find key '$key' in domain '$domain'." >&2 ;;
+            27-domain) echo "Error: Domain '$domain' not found." >&2 ;;
+            ""|26) echo "The domain/default pair of ($domain, $key) does not exist" >&2 ;;
+            *) echo "fake defaults: unknown wording" >&2; exit 2 ;;
+          esac
+          exit 1
+        }
         \(hangHere("defaults"))
         if [[ "$mode" == hang || "$mode" == "hang:$domain" ]]; then hang_here; fi
         if [[ "$mode" == unreachable || "$mode" == "unreachable:$domain" ]]; then
@@ -6866,7 +7310,7 @@ private final class ScriptFixture {
         fi
         case "$cmd" in
           read)
-            v="$(lookup)" || { echo "The domain/default pair of ($domain, $key) does not exist" >&2; exit 1; }
+            v="$(lookup)" || absent
             echo "$v"; exit 0 ;;
           write)
             failing && exit 1
@@ -6881,7 +7325,9 @@ private final class ScriptFixture {
         esac
         """)
         // pgrep: pgrep.mode holds one exit status per line, consumed in
-        // order; the last line repeats. Default 1 (not running).
+        // order; the last line repeats. Default 1 (not running). An exit 0
+        // prints the pids in pgrep.pids, as pgrep prints what it found: by
+        // default the app's own (see insomniaProcesses).
         try writeFake("pgrep", """
         printf 'pgrep %s\\n' "$*" >> "\(calls)"
         f="\(r)/pgrep.mode"
@@ -6890,8 +7336,13 @@ private final class ScriptFixture {
         if (( $(wc -l < "$f") > 1 )); then tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"; fi
         \(hangHere("pgrep"))
         if [[ "$first" == hang ]]; then hang_here; fi
+        if [[ "${first:-1}" == 0 ]]; then cat "\(r)/pgrep.pids"; fi
         exit "${first:-1}"
         """)
+        // The app's own process, which pgrep finds by default. Ad hoc
+        // signed, as install.sh signs it, it does not meet Kong's client's
+        // requirement, so codesign exits 3 for it.
+        try insomniaProcesses([(appPid, 3)])
         for tool in ["pkill", "osascript"] {
             try writeFake(tool, """
             printf '\(tool) %s\\n' "$*" >> "\(calls)"
@@ -7047,6 +7498,14 @@ private final class ScriptFixture {
         try? value.write(to: root.appendingPathComponent("\(name).mode"), atomically: true, encoding: .utf8)
     }
 
+    /// Which message the fake `defaults` prints for an absent key (see its
+    /// comment): "27-key", "27-domain", or "26" (the default) for macOS
+    /// 26's. Any other wording makes the fake fail, so a typo cannot pass
+    /// for macOS 26.
+    func setDefaultsWording(_ wording: String) throws {
+        try wording.write(to: root.appendingPathComponent("defaults.wording"), atomically: true, encoding: .utf8)
+    }
+
     /// The word the fake app binary answers per pid; the exit status follows
     /// from the words.
     func insomniaTable(_ rows: [(pid: Int, word: String)]) throws {
@@ -7065,6 +7524,32 @@ private final class ScriptFixture {
     func psTable(_ rows: [(pid: Int, lstart: String, stat: String, uid: String)]) throws {
         let text = rows.map { "\($0.pid)|\($0.lstart)|\($0.stat)|\($0.uid)" }.joined(separator: "\n") + "\n"
         try text.write(to: root.appendingPathComponent("ps.table"), atomically: true, encoding: .utf8)
+    }
+
+    /// The processes named Insomnia: the pids the fake pgrep prints when it
+    /// exits 0, and the status the fake `codesign --verify -R=<Kong's
+    /// client's requirement> <pid>` exits with for each, with an error line
+    /// like codesign's on stderr: 0 for Kong's client, 3 for code that does
+    /// not meet the requirement (macOS 26's wording), 1 for a signature
+    /// that does not verify. A nil one gets no file, so codesign answers
+    /// "No such process" and exits 1, as for a process that is gone.
+    func insomniaProcesses(_ rows: [(pid: Int, verify: Int32?)]) throws {
+        try rows.map { "\($0.pid)\n" }.joined()
+            .write(to: root.appendingPathComponent("pgrep.pids"), atomically: true, encoding: .utf8)
+        let dir = root.appendingPathComponent("codesign.pid", isDirectory: true)
+        try? fm.removeItem(at: dir)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        for row in rows {
+            guard let status = row.verify else { continue }
+            let stderr: String
+            switch status {
+            case 0: stderr = ""
+            case 1: stderr = "\(row.pid): invalid signature (code or signature have been modified)\n"
+            case 3: stderr = "test-requirement: code failed to satisfy specified code requirement(s)\n"
+            default: stderr = "\(row.pid): codesign failed with status \(status)\n"
+            }
+            try "\(status)\n\(stderr)".write(to: dir.appendingPathComponent(String(row.pid)), atomically: true, encoding: .utf8)
+        }
     }
 
     /// What `TZ=UTC LC_ALL=C ps -o lstart=` prints for a start second.
@@ -7098,7 +7583,14 @@ private final class ScriptFixture {
     /// it and keeps running until the test calls releaseCommand (or the
     /// fixture goes, or a 60 s watchdog), then writes command.ended. Both
     /// note an inherited fd 9 and record the pid in `sudo.hung.pid`, once
-    /// the SIGTERM trap is in place.
+    /// the SIGTERM trap and the watchdog's deadline are in place. The
+    /// watchdog runs on bash's SECONDS, so the fake forks nothing but
+    /// /bin/sleep while it waits. A test may signal the fake's process
+    /// group as soon as the pid appears, and a signal that killed a `date`
+    /// setting the deadline would leave it at 60, ending the fake at once.
+    /// A command substitution would also log one signal twice. Bash 3.2
+    /// starts it with the shell's pending traps and trap commands, so a
+    /// SIGTERM that lands just before the fork runs the trap in both.
     func sudoHangHere() -> String {
         """
         hang_on_term() {
@@ -7109,9 +7601,9 @@ private final class ScriptFixture {
           else
             trap 'echo "sudo SIGTERM" >> "$calls_log"' TERM
           fi
+          deadline=$(( SECONDS + 60 ))
           echo $$ > "\(root.path)/sudo.hung.pid"
-          deadline=$(( $(date +%s) + 60 ))
-          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $(date +%s) -lt $deadline ]]; do /bin/sleep 0.1; done
+          while [[ ! -e "\(root.path)/release" && -d "\(root.path)" && $SECONDS -lt $deadline ]]; do /bin/sleep 0.1; done
           if [[ -e "\(root.path)/release" ]]; then echo released > "\(root.path)/command.ended"
           elif [[ -d "\(root.path)" ]]; then echo watchdog > "\(root.path)/command.ended"; fi
           exit 0
@@ -7328,14 +7820,13 @@ private final class ScriptFixture {
         let dir = root.appendingPathComponent("slow-poll", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let stub = dir.appendingPathComponent("sleep")
-        try """
+        try TestScripts.write("""
         #!/bin/bash
         echo "$*" >> "\(root.path)/slow-poll.log"
         /bin/sleep 0.25
         exec /bin/sleep "$@"
 
-        """.write(to: stub, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub.path)
+        """, to: stub)
         return "\(dir.path):/usr/bin:/bin:/usr/sbin:/sbin"
     }
 

@@ -94,11 +94,84 @@ final class UIStatusTests: XCTestCase {
     }
 
     @MainActor
-    func testTickAnimationIsShorterThanBaseAndHoldIsSubSecond() {
+    func testHoldToEndIsSubSecond() {
         XCTAssertEqual(Motion.holdDuration, 0.6, accuracy: 0.0001)
         XCTAssertLessThan(Motion.holdDuration, 1)
-        XCTAssertEqual(Motion.tick(reduceMotion: true), Motion.reduced)
-        XCTAssertNotEqual(Motion.tick(reduceMotion: false), Motion.base)
+    }
+
+    /// Every frame of an animated countdown is a content change, and AppKit
+    /// re-renders the whole status item on each one, about 23 ms of main
+    /// thread per frame. The 0.18 s spring that used to run here held the app
+    /// at about 46% of one core for the whole session, against 2.3% with no
+    /// animation. The tick must stay unanimated.
+    ///
+    /// This pins the constant only; the test below pins the view that has to
+    /// use it, since a transition re-added in the body animates the digits
+    /// with this still nil.
+    @MainActor
+    func testTheCountdownDoesNotAnimateItsDigits() {
+        XCTAssertNil(Motion.countdownTick)
+    }
+
+    /// The digits must land in one step: the frame the text changes on
+    /// already reads the new value, exactly as a countdown rendered fresh
+    /// with that value would. The animated content transition this PR removed
+    /// (`.numericText(countsDown:)` under a 0.18 s spring) instead spends its
+    /// first frames rolling from the old digits, so the changed frame does
+    /// not match a fresh one. That is the regression: the cost is in AppKit
+    /// re-snapshotting the status item once per animated frame, and pinning
+    /// `Motion.countdownTick` to nil does not see a transition put back in
+    /// the view.
+    @MainActor
+    func testTheRenderedCountdownChangesItsDigitsInOneStep() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 4 * 3600)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+        let model = MenuBarModel()
+        model.phase = .running
+
+        // The same view the controller installs, laid out at its own size and
+        // rasterised offscreen; no window and no run loop needed.
+        func makeHost() -> StatusHostingView {
+            let host = StatusItemController.makeHostingView(StatusRootView(
+                model: model,
+                manager: manager,
+                onTapIcon: {},
+                onTapPill: { _ in },
+                onTapCountdown: {},
+                onHoldEnd: {},
+                onWidthChange: { _ in }
+            ))
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            return host
+        }
+        func snapshot(_ host: StatusHostingView) -> Data {
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+                XCTFail("the countdown did not rasterise")
+                return Data()
+            }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            return rep.representation(using: .png, properties: [:]) ?? Data()
+        }
+
+        // One host across the change, so the frame after it is a frame of the
+        // same view mid-transition, not a view built with the new text.
+        let host = makeHost()
+        let before = snapshot(host)
+        h.clock.advance(1)
+        manager.refreshCountdown()
+        XCTAssertEqual(manager.countdownText, "3:59:59")
+        // The very next frame, with no time for a spring to run.
+        let after = snapshot(host)
+        // And what that state looks like with no change to interpolate.
+        let fresh = snapshot(makeHost())
+
+        XCTAssertNotEqual(before, after, "the digits must change")
+        XCTAssertEqual(after, fresh, "the changed frame must already read the new digits, not roll to them")
     }
 
     /// The blink was over in a handful of frames and barely read. It has to
@@ -328,7 +401,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(KeychainError(status: errSecAuthFailed).problem, .unreadable)
         XCTAssertEqual(KeychainError(status: errSecInteractionNotAllowed).problem, .unreadable)
         XCTAssertEqual(KeychainError(status: errSecInvalidOwnerEdit).problem, .unreadable)
-        XCTAssertEqual(KeychainError(status: errSecParam).problem, .error("keychain: One or more parameters passed to a function were not valid."))
+        XCTAssertEqual(KeychainError(status: errSecParam).problem, .error("keychain: \(securityMessage(errSecParam))"))
     }
 
     /// The relaunch item asks first, since the browser is quit and its

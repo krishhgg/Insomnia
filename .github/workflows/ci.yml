@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+    # ready_for_review on top of the default three: `merge-gate.sh rerun`
+    # marks a pull request draft and then ready, so CI tests it against the
+    # current main without a push. A re-run would not: it keeps the merge
+    # with main its first run made.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Least privilege: nothing in this workflow writes to the repo, checks, or packages.
 permissions:
@@ -20,25 +25,74 @@ concurrency:
 
 jobs:
   swift:
-    name: Swift test and release build (macOS 26)
-    # macos-26 (arm64) hosted image: Xcode 26.6 is the image default; 26.4.1 is
-    # also installed. The image default is used as-is (no xcode-select).
-    runs-on: macos-26
-    timeout-minutes: 30
+    name: Swift test and release build (${{ matrix.label }})
+    # One job per macOS major release GitHub hosts, each on its image's
+    # default Xcode (no xcode-select). GitHub picks the point release and
+    # moves it forward, so the first step records the one each run used.
+    #   macos-26 (arm64): Xcode 26.6 default, 26.4.1 also installed.
+    #   xcode-27 (arm64, public preview): Xcode 27 on macOS 27.
+    # On 2026-10-11 these were macOS 26.6.2 (25G83) and 27.0.1 (26A434).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: macos-26
+            label: macOS 26
+          - image: xcode-27
+            label: macOS 27
+    runs-on: ${{ matrix.image }}
+    # The test watchdog below allows 50 minutes for swift test, which builds
+    # the tests and then runs them; the other 10 cover setup, the release
+    # build and the lid simulation check.
+    timeout-minutes: 60
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Print toolchain versions
+      - name: Note which main this run tests
+        # A pull_request run tests a merge of the pull request into main as
+        # main was when the run started, and a re-run keeps that merge.
+        # .github/scripts/merge-gate.sh check reads this note to tell whether
+        # a passing result still covers the current main. git cat-file reads
+        # the parent lines from the merge commit itself, which the shallow
+        # checkout has.
+        if: github.event_name == 'pull_request'
         run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
+      - name: Print macOS and toolchain versions
+        # Also written to the job summary, so each run names the macOS
+        # build it tested without opening the log.
+        env:
+          LABEL: ${{ matrix.label }}
+        run: |
+          sw_vers
           xcodebuild -version
           swift --version
+          {
+            echo "### $LABEL runner"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| macOS | $(sw_vers -productVersion) ($(sw_vers -buildVersion)) |"
+            echo "| Xcode | $(xcodebuild -version | paste -sd ' ' -) |"
+            echo "| Swift | $(swift --version 2>&1 | grep -m1 'Swift version') |"
+            echo "| Runner image | ${ImageOS:-unknown} ${ImageVersion:-unknown} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Syntax-check scripts with /bin/bash 3.2
         # The LaunchAgent runs backstop.sh with macOS /bin/bash 3.2, and
-        # install.sh and uninstall.sh run under it too. ShellCheck runs on
+        # install.sh and uninstall.sh run under it too, as does the
+        # maintainer's .github/scripts/merge-gate.sh. ShellCheck runs on
         # Linux and assumes bash 5, so bash 4 syntax passes lint. `bash -n`
         # parses each script under the real interpreter without executing
         # it; it rejects parse-level bash 4 syntax (;;&, |&, [[ -v x ]]).
@@ -55,16 +109,37 @@ jobs:
               exit 1
               ;;
           esac
-          for script in scripts/*.sh; do
+          for script in scripts/*.sh .github/scripts/*.sh; do
             /bin/bash -n "$script"
             echo "syntax ok: $script"
           done
           bash4='^[^#]*((^|[^A-Za-z0-9_])(mapfile|readarray|coproc)([^A-Za-z0-9_]|$)|declare +-[a-zA-Z]*A|(^|[^A-Za-z0-9_])local +-[a-zA-Z]*n([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])wait +-n([^A-Za-z0-9_]|$)|\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?(,,|\^\^|@[QEPAa])|\[-[0-9]+\])'
-          if grep -nE "$bash4" scripts/*.sh; then
+          if grep -nE "$bash4" scripts/*.sh .github/scripts/*.sh; then
             echo "bash 4 construct found above; /bin/bash 3.2 fails it at run time" >&2
             exit 1
           fi
           echo "no bash 4 builtins or expansions found"
+
+      - name: Test the merge gate with /bin/bash 3.2
+        # merge-gate-test.sh runs merge-gate.sh against a stand-in for gh
+        # that answers from files, so it reads and writes nothing on GitHub.
+        run: /bin/bash .github/scripts/merge-gate-test.sh
+
+      - name: Build release
+        # docs/release-validation.md cites "no compiler warnings" as evidence,
+        # so a warning fails this build instead of scrolling past. This and
+        # the lid check run before the tests: from the tests on, the pull
+        # request's own code runs in this job, and it could change what a
+        # later step does, for example by writing BASH_ENV to $GITHUB_ENV or
+        # by editing the checkout.
+        run: swift build -c release -Xswiftc -warnings-as-errors
+
+      - name: Check the lid simulation is compiled out of the release binary
+        # Looks at the binaries, not the compilation condition: the plain
+        # release build above must lack the simulate-lid.sh watcher, and a
+        # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
+        # for INSOMNIA_LID_SIMULATION=1) must have it.
+        run: scripts/check-lid-simulation-gate.sh
 
       - name: Install tmux
         # The hosted macOS image has no tmux, so the tmux integration tests skip.
@@ -91,24 +166,28 @@ jobs:
           "$tmux_bin" -V
 
       - name: Run tests
+        id: tests
         # NSUnbufferedIO makes XCTest write each line as it happens. With
         # the default 16 KB stdout buffer the log of a hung run stops up to
         # 16 KB before the test that hung, which has already misled one
-        # investigation. If the run is still going after 20 minutes (a
-        # normal run takes about 3), the watchdog samples every xctest
-        # process so the log shows what the hung test is waiting on, then
-        # fails the step instead of waiting for the job timeout.
+        # investigation. If swift test is still going after 50 minutes (on
+        # main in October 2026 it took 11 to 16, build included), the
+        # watchdog samples every xctest process so the log shows what the
+        # hung test is waiting on, then fails the step instead of waiting
+        # for the job timeout. The tests copy every shell script they write
+        # (fakes of sudo, pmset, launchctl and the rest) into
+        # INSOMNIA_TEST_SCRIPT_DUMP for the ShellCheck step below.
         env:
           NSUnbufferedIO: "YES"
         run: |
-          swift test &
+          INSOMNIA_TEST_SCRIPT_DUMP="$RUNNER_TEMP/test-scripts" swift test &
           test_pid=$!
-          for ((i = 0; i < 1200; i++)); do
+          for ((i = 0; i < 3000; i++)); do
             kill -0 "$test_pid" 2>/dev/null || break
             sleep 1
           done
           if kill -0 "$test_pid" 2>/dev/null; then
-            echo "::error::swift test still running after 20 minutes; sampling xctest"
+            echo "::error::swift test still running after 50 minutes; sampling xctest"
             echo "::group::processes"
             ps -axo pid,ppid,stat,etime,command
             echo "::endgroup::"
@@ -136,33 +215,132 @@ jobs:
           fi
           wait "$test_pid"
 
-      - name: Build release
-        # docs/release-validation.md cites "no compiler warnings" as evidence,
-        # so a warning fails this build instead of scrolling past.
-        run: swift build -c release -Xswiftc -warnings-as-errors
-
-      - name: Check the lid simulation is compiled out of the release binary
-        # Looks at the binaries, not the compilation condition: the plain
-        # release build above must lack the simulate-lid.sh watcher, and a
-        # build with -DINSOMNIA_LID_SIMULATION (what build-app.sh adds
-        # for INSOMNIA_LID_SIMULATION=1) must have it.
-        run: scripts/check-lid-simulation-gate.sh
+      - name: ShellCheck the scripts the tests wrote
+        # A broken fake makes a test pass or fail for the wrong reason: a
+        # fake gh that used $10, which bash reads as ${1}0, faked 16
+        # failures on #51. The image has no ShellCheck, so this fetches a
+        # pinned release and checks its digest before running it. An empty
+        # folder fails, so a renamed variable cannot pass by checking
+        # nothing. index.tsv names the test line that wrote each script.
+        # It runs after the tests, which write the scripts, and only if they
+        # passed. Code the tests run can change what this step does, so the
+        # Codex review checks the tests for that.
+        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          # sha256 of shellcheck-v0.11.0.darwin.aarch64.tar.gz, as GitHub
+          # lists it for the release asset.
+          SHELLCHECK_SHA256: 339b930feb1ea764467013cc1f72d09cd6b869ebf1013296ba9055ab2ffbd26f
+        run: |
+          tools="$RUNNER_TEMP/shellcheck"
+          dump="$RUNNER_TEMP/test-scripts"
+          mkdir -p "$tools"
+          curl -sSfL --retry 3 -o "$tools/shellcheck.tar.gz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.darwin.aarch64.tar.gz"
+          echo "${SHELLCHECK_SHA256}  $tools/shellcheck.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$tools/shellcheck.tar.gz" -C "$tools" --strip-components 1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          "$tools/shellcheck" --version
+          if [ ! -s "$dump/index.tsv" ]; then
+            echo "::error::the tests wrote no scripts to $dump; INSOMNIA_TEST_SCRIPT_DUMP did not reach them"
+            exit 1
+          fi
+          echo "$(wc -l < "$dump/index.tsv" | tr -d ' ') distinct scripts"
+          echo "::group::index.tsv"
+          cat "$dump/index.tsv"
+          echo "::endgroup::"
+          cd "$dump" || exit 1
+          cut -f1 index.tsv | tr '\n' '\0' | xargs -0 "$tools/shellcheck"
 
   shellcheck:
     name: ShellCheck scripts
-    # shellcheck ships preinstalled on ubuntu-24.04; the macOS image has none.
+    # ShellCheck is pinned, as in the macOS jobs, since each version finds
+    # different things and .github/shellcheck-hidden.txt lists what one
+    # version finds.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      SHELLCHECK_VERSION: "0.11.0"
+      # sha256 of shellcheck-v0.11.0.linux.x86_64.tar.gz, as GitHub lists it
+      # for the release asset.
+      SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Lint shell scripts
+      - name: Note which main this run tests
+        # A pull_request run tests a merge of the pull request into main as
+        # main was when the run started, and a re-run keeps that merge.
+        # .github/scripts/merge-gate.sh check reads this note to tell whether
+        # a passing result still covers the current main. git cat-file reads
+        # the parent lines from the merge commit itself, which the shallow
+        # checkout has.
+        if: github.event_name == 'pull_request'
         run: |
-          shellcheck --version
-          shellcheck scripts/*.sh
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
+      - name: Install ShellCheck
+        run: |
+          tools="$RUNNER_TEMP/shellcheck"
+          mkdir -p "$tools"
+          curl -sSfL --retry 3 -o "$tools/shellcheck.tar.gz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          echo "${SHELLCHECK_SHA256}  $tools/shellcheck.tar.gz" | sha256sum -c -
+          tar -xzf "$tools/shellcheck.tar.gz" -C "$tools" --strip-components 1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+
+      - name: Lint shell scripts
+        # Every script runs under bash, so its first line must say so.
+        # ShellCheck picks its rules from that line: a pull request that
+        # changed backstop.sh to #!/bin/ksh would be linted as ksh while the
+        # LaunchAgent still runs it with /bin/bash, and the bash checks in
+        # the macOS jobs would no longer match how ./install.sh runs.
+        # --shell=bash lints as bash whatever a file says.
+        run: |
+          shellcheck="$RUNNER_TEMP/shellcheck/shellcheck"
+          "$shellcheck" --version
+          for script in scripts/*.sh .github/scripts/*.sh; do
+            case $(head -n 1 "$script") in
+              '#!/bin/bash' | '#!/usr/bin/env bash') ;;
+              *)
+                echo "::error file=$script,line=1::$script must start with #!/bin/bash or #!/usr/bin/env bash"
+                exit 1
+                ;;
+            esac
+          done
+          "$shellcheck" --shell=bash scripts/*.sh .github/scripts/*.sh
+
+      - name: Test the check of what ShellCheck directives hide
+        run: SHELLCHECK="$RUNNER_TEMP/shellcheck/shellcheck" bash .github/scripts/shellcheck-hidden-test.sh
+
+      - name: Check what ShellCheck directives hide
+        # A directive covers the next command, so a pull request can widen
+        # one without touching it, for example with a "{" right after an
+        # existing directive and a "}" at the end of the file. The script
+        # lists every finding a directive hides, however far it reaches,
+        # and the list must match .github/shellcheck-hidden.txt, which
+        # counts as config. .github/scripts needs no list: it is config.
+        run: |
+          SHELLCHECK="$RUNNER_TEMP/shellcheck/shellcheck" .github/scripts/shellcheck-hidden.sh >"$RUNNER_TEMP/hidden.txt"
+          if ! diff -u .github/shellcheck-hidden.txt "$RUNNER_TEMP/hidden.txt"; then
+            echo "::error file=.github/shellcheck-hidden.txt::ShellCheck directives hide other findings than this file lists (diff above). If the change is right, put the new list in it; the owner OKs that as config."
+            echo "::group::the new list"
+            cat "$RUNNER_TEMP/hidden.txt"
+            echo "::endgroup::"
+            exit 1
+          fi
+
+      - name: Test the merge gate with bash 5
+        # The macOS jobs run these tests with /bin/bash 3.2; the workflow
+        # that posts the merge-gate statuses runs on this runner's bash.
+        run: bash .github/scripts/merge-gate-test.sh
 
   lint-workflows:
     name: Lint workflows
@@ -188,6 +366,24 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Note which main this run tests
+        # A pull_request run tests a merge of the pull request into main as
+        # main was when the run started, and a re-run keeps that merge.
+        # .github/scripts/merge-gate.sh check reads this note to tell whether
+        # a passing result still covers the current main. git cat-file reads
+        # the parent lines from the merge commit itself, which the shallow
+        # checkout has.
+        if: github.event_name == 'pull_request'
+        run: |
+          parents=$(git cat-file -p HEAD | sed -n 's/^parent //p')
+          base=$(printf '%s\n' "$parents" | sed -n 1p)
+          head=$(printf '%s\n' "$parents" | sed -n 2p)
+          if [ -z "$head" ]; then
+            echo "::warning::HEAD is not a merge commit, so this run names no main"
+          else
+            echo "::notice title=Tested merge::main $base, pull request head $head"
+          fi
+
       - name: Install actionlint
         run: |
           tools="$RUNNER_TEMP/actionlint"
@@ -205,10 +401,11 @@ jobs:
 
       - name: Install zizmor
         # A private venv; pip refuses the install unless the downloaded wheel
-        # matches the pinned hash.
+        # matches the pinned hash. -I keeps the checkout off Python's path,
+        # so a venv.py on a pull request's branch can't stand in for venv.
         run: |
           python3 --version
-          python3 -m venv "$RUNNER_TEMP/zizmor"
+          python3 -I -m venv "$RUNNER_TEMP/zizmor"
           printf 'zizmor==%s --hash=sha256:%s\n' "$ZIZMOR_VERSION" "$ZIZMOR_SHA256" > "$RUNNER_TEMP/zizmor-requirements.txt"
           "$RUNNER_TEMP/zizmor/bin/pip" install --require-hashes --only-binary=:all: --no-deps \
             -r "$RUNNER_TEMP/zizmor-requirements.txt"

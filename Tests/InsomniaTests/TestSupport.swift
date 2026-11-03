@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import XCTest
 import InsomniaTestHome
 @testable import Insomnia
@@ -761,6 +762,17 @@ final class FakeBackstop: BackstopScheduling, @unchecked Sendable {
     }
 }
 
+/// The Security framework's message for `status`, in the language the test
+/// process runs in. `CodeRequirement` and `KeychainError` word their errors
+/// with it, so a test that checks which failure an error names compares
+/// against this, not the English text, and passes on a Mac set to another
+/// language. Not for text a child process prints: `codesign` and the other
+/// command line tools answer in English whatever the language, so a test
+/// that reads their output keeps the literal text.
+func securityMessage(_ status: OSStatus) -> String {
+    SecCopyErrorMessageString(status, nil) as String? ?? "OSStatus \(status)"
+}
+
 /// A mutable fake clock usable from the @Sendable clock closure.
 final class FakeClock: @unchecked Sendable {
     private let lock = NSLock()
@@ -815,6 +827,8 @@ struct Harness {
     /// the private-call guard refuses; `sleepGuard` wraps `guardFake`.
     /// `bootSession` stands in for `kern.bootsessionuuid`, for a launch
     /// after a restart.
+    /// `customClock` replaces the harness clock, for a test that needs time to
+    /// pass by itself, as a real timer does.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
         retryDelay: TimeInterval = 60,
@@ -825,7 +839,8 @@ struct Harness {
         display: (any DisplayDimming)? = nil,
         keyboard: (any KeyboardBacklighting)? = nil,
         sleepGuard: (any SleepGuarding)? = nil,
-        bootSession: String = SignalProcessControl.bootSession
+        bootSession: String = SignalProcessControl.bootSession,
+        clock customClock: (@Sendable () -> Date)? = nil
     ) -> SessionManager {
         let c = clock
         let lid = clamshell
@@ -841,7 +856,7 @@ struct Harness {
             appNap: appNap,
             notifier: notifier,
             clamshell: { lid.closed },
-            clock: { c.now },
+            clock: customClock ?? { c.now },
             processLookup: { table.lookup($0) },
             recoveryLockTimeout: lockTimeout,
             recoveryRetryDelay: retryDelay,

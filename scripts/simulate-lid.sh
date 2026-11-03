@@ -1,6 +1,6 @@
 #!/bin/bash
 # Drive Insomnia's lid-close action path without touching the hinge, for
-# release validation (docs/release-validation.md) on a machine whose lid has
+# the real-Mac checks (docs/releasing.md) on a machine whose lid has
 # to stay open. Writes "closed" or "open" to APP_SUPPORT/simulate-lid; the
 # running app (LidSimulation.swift) reads and deletes the file and runs the
 # same actions a real lid event would: darken the display and keyboard

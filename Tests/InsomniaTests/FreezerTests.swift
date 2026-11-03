@@ -234,7 +234,7 @@ final class FreezerTests: XCTestCase {
                    "net.kovidgoyal.kitty", "com.github.wez.wezterm", "org.tabby", "co.zeit.hyper",
                    "company.thebrowser.Browser", "com.google.Chrome", "org.chromium.Chromium", "com.microsoft.edgemac",
                    "com.brave.Browser", "com.vivaldi.Vivaldi", "com.operasoftware.Opera", "org.mozilla.firefox",
-                   "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly", "app.zen-browser.zen",
+                   "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly", "app.zen-browser.zen", "ai.perplexity.comet",
                    "io.tailscale.ipn.macsys", "ai.elementlabs.lmstudio", "com.electron.ollama", "com.electron.dockerdesktop",
                    "com.1password.1password", "com.bitwarden.desktop", "com.postgresapp.Postgres2", "dev.kdrag0n.MacVirt"] {
             XCTAssertTrue(FreezePlanner.isBuiltInProtected(id), id)

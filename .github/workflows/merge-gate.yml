@@ -1,0 +1,95 @@
+name: Merge gate
+
+# Posts the merge-gate/* statuses the main ruleset requires on the head
+# commit of each open pull request into main. .github/scripts/merge-gate.sh
+# says what each status checks, and CONTRIBUTING.md, "How a pull request
+# merges", says what a contributor needs.
+#
+# pull_request_target runs this file as it is on main, with a token that
+# can write statuses, also for pull requests from forks. That is safe only
+# because nothing here checks out, builds or runs a pull request's code: the
+# jobs check out main and read pull requests through the API. Keep it so.
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] runs main's script only; reads the pull request through the API
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled, ready_for_review]
+  # A safety net for an event that ran before GitHub's data caught up, such
+  # as a Greptile edit read before the edit history listed it.
+  schedule:
+    - cron: '41 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number, or all
+        required: true
+        default: all
+
+permissions: {}
+
+jobs:
+  list:
+    name: List pull requests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.list.outputs.prs }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # pull_request_target already checks out main; naming it keeps a
+          # later edit from pointing this at the pull request's branch.
+          ref: main
+
+      - name: List
+        id: list
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr || 'all' }}
+        run: |
+          prs=$(.github/scripts/merge-gate.sh list "$PR")
+          echo "$prs"
+          echo "prs=$prs" >> "$GITHUB_OUTPUT"
+
+  evaluate:
+    name: Post merge-gate statuses
+    needs: list
+    if: needs.list.outputs.prs != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        pr: ${{ fromJSON(needs.list.outputs.prs) }}
+    # Every run for one pull request, from an event, the hourly run or a
+    # dispatch, queues in this one group, so two runs never interleave their
+    # reads and posts. A group holds one pending job and drops an older
+    # pending one; the newer job reads the pull request after every event
+    # before it, so it posts what the older one would have.
+    concurrency:
+      group: merge-gate-pr-${{ matrix.pr }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: main
+
+      - name: Post statuses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ matrix.pr }}
+        run: .github/scripts/merge-gate.sh evaluate "$PR"
