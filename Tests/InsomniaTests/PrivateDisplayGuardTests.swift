@@ -964,6 +964,40 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(logText().contains("display brightness 0.8, restored, cleared from the journal"), logText())
     }
 
+    /// The same restore whose clear the journal refuses. The entry left on
+    /// disk is still flagged as refused, so it reads as nothing to undo,
+    /// but it is still there and quit still waits for its clear. A menu
+    /// opening reads it and keeps the line (issue #124's recheck).
+    func testAMenuOpeningKeepsTheLineOfAKeptValueWhoseClearTheJournalRefused() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.display.throwOnSet = true
+        let m = h.makeManager(retryDelay: 3600)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await m.reconcile()
+        h.display.throwOnSet = false
+        h.display.asleep = true
+        _ = await m.end(reason: .quit)
+        let line = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(line.contains("could not be cleared"), line)
+        let onDisk = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(onDisk.savedDisplayBrightness, 0.8)
+        XCTAssertFalse(onDisk.isDirty, "the flag hides the entry from isDirty")
+
+        m.recheckUnclearedEntry()
+
+        XCTAssertEqual(m.lastError, line, "the entry is still on disk")
+        XCTAssertEqual(m.pendingEnd, .quit)
+    }
+
     /// A launch with no session retries a kept keyboard value, and both
     /// the write and the clearing of its flag fail. Nothing else would
     /// retry it, and the agent cannot see it, so the launch ends as for a

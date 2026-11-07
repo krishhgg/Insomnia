@@ -764,7 +764,7 @@ final class SessionManager {
     private func loadJournal() throws {
         state = try store.loadState() ?? .clean
         if claimsLowPowerInThisBoot(state) { lowPowerWasOurs = true }
-        dropUnclearedLine(ifSettledIn: state)
+        dropUnclearedLine(ifSettledIn: state, writtenHere: false)
     }
 
     /// Re-read the journal while a failed clear's line is up, and drop the
@@ -780,7 +780,7 @@ final class SessionManager {
     func recheckUnclearedEntry() {
         guard uncleared != nil else { return }
         guard let s = try? store.loadState() ?? .clean else { return }
-        dropUnclearedLine(ifSettledIn: s)
+        dropUnclearedLine(ifSettledIn: s, writtenHere: false)
         guard uncleared == nil else { return }
         state = s
         if claimsLowPowerInThisBoot(s) { lowPowerWasOurs = true }
@@ -3004,19 +3004,23 @@ final class SessionManager {
         try store.saveState(s)
         state = s
         if claimsLowPowerInThisBoot(s) { lowPowerWasOurs = true }
-        dropUnclearedLine(ifSettledIn: s)
+        dropUnclearedLine(ifSettledIn: s, writtenHere: true)
     }
 
     /// The entry a failed clear left is gone once its clear changes no
-    /// undo entry of `s`, or nothing is left to undo, whoever wrote it. The
-    /// display write owed after Low Power Mode is left out: a retry made
-    /// once the mode is off owes none, where the failed clear did. A newer
-    /// error in the menu stays.
-    private func dropUnclearedLine(ifSettledIn s: RuntimeState) {
+    /// undo entry of `s`, whoever wrote it. When this process wrote `s`,
+    /// it is also gone once nothing is left to undo. A read alone doesn't
+    /// show that: an entry kept after a refused restore doesn't count as
+    /// something to undo, but after a later restore whose clear failed it
+    /// is still on disk, and quit waits for that clear. The display write
+    /// owed after Low Power Mode is left out: a retry made once the mode
+    /// is off owes none, where the failed clear did. A newer error in the
+    /// menu stays.
+    private func dropUnclearedLine(ifSettledIn s: RuntimeState, writtenHere: Bool) {
         guard let (message, clear) = uncleared else { return }
         var cleared = s
         clear(&cleared)
-        guard cleared.undoEntries == s.undoEntries || !s.isDirty else { return }
+        guard cleared.undoEntries == s.undoEntries || (writtenHere && !s.isDirty) else { return }
         if lastError == message { lastError = nil }
         uncleared = nil
     }
