@@ -287,7 +287,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// does not log an error every minute, and an expired session goes.
     func testSavedOutputDeviceAudioIsKeptAndAloneLeavesTheJournalClean() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
-        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":"5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A"},{"deviceUID":"BuiltInSpeakerDevice","name":null,"volume":1,"muted":true,"saveID":null}]}"#
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false,"saveID":"5F2C9A10-7B3E-4D21-A8C4-0E6F1B2D3C4A"},{"deviceUID":"BuiltInSpeakerDevice","name":null,"volume":1,"muted":true,"saveID":null},{"deviceUID":"LG-HDMI","name":"LG UltraGear","volume":0,"muted":false,"noVolume":true}]}"#
         try fx.writeState(json)
 
         let r = try fx.run(fx.backstop)
@@ -296,7 +296,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(fx.calls(), [])
         XCTAssertFalse(fx.exists(fx.session))
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json)
-        XCTAssertTrue(fx.log().contains("saved audio for 2 output device(s), kept for the app"), fx.log())
+        XCTAssertTrue(fx.log().contains("saved audio for 3 output device(s), kept for the app"), fx.log())
         XCTAssertFalse(fx.log().contains("[error]"), fx.log())
 
         // With no session to remove, a later run says nothing.
@@ -1404,7 +1404,7 @@ final class RecoveryScriptTests: XCTestCase {
     /// names the device and says how to get it back or let it go.
     func testUninstallAbortsOnAnOutputDeviceStillMutedAndNamesIt() throws {
         try fx.installMachinery()
-        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false},{"deviceUID":"70-8C-F2:output","volume":0.5,"muted":false}]}"#
+        let json = #"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":"USB Headset","volume":0.3,"muted":false},{"deviceUID":"70-8C-F2:output","volume":0.5,"muted":false},{"deviceUID":"LG-HDMI","name":"LG UltraGear","volume":0,"muted":false,"noVolume":true}]}"#
         try fx.writeState(json)
 
         let r = try fx.run(fx.uninstall, ["--purge"])
@@ -1417,6 +1417,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fx.state, encoding: .utf8), json)
         XCTAssertTrue(r.stderr.contains("USB Headset is still muted from a lid close"), r.stderr)
         XCTAssertTrue(r.stderr.contains("70-8C-F2:output is still muted from a lid close"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("LG UltraGear is still muted from a lid close"), r.stderr)
         XCTAssertTrue(r.stderr.contains("Stop waiting for <device>"), r.stderr)
     }
     func testUninstallAbortsOnSavedDisplayBrightnessAndExplainsReopeningTheApp() throws {
@@ -2462,6 +2463,8 @@ final class RecoveryScriptTests: XCTestCase {
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":7,"volume":0.3,"muted":false}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":"loud","muted":false}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","muted":false}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","muted":false,"noVolume":true}]}"#,
+        #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0,"muted":false,"noVolume":"yes"}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3,"muted":1}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","volume":0.3}]}"#,
         #"{"sleepDisabledByUs":false,"savedAudioOutputs":[{"deviceUID":"usb-headset","name":3,"volume":0.3,"muted":false}]}"#,

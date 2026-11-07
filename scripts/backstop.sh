@@ -71,7 +71,9 @@
 #       savedOutputVolume / savedMuted -> CoreAudio; only the app can restore
 #                              these. Kept for the app's reconcile.
 #       savedAudioOutputs   -> CoreAudio volume and mute of each output
-#                              device a lid close muted, by device UID; only
+#                              device a lid close muted, by device UID (volume
+#                              0 and noVolume true for a device without a
+#                              volume); only
 #                              the app can restore these, and only while the
 #                              device is connected. Kept for the app, and on
 #                              their own they leave the journal clean: an
@@ -768,6 +770,8 @@ journal_shape_problems() { # file
           [[ "$(type_of "$f" "savedAudioOutputs.$i.deviceUID")" == string ]] || echo "savedAudioOutputs[$i].deviceUID is not a string"
           t="$(type_of "$f" "savedAudioOutputs.$i.volume")"
           [[ "$t" == float || "$t" == integer ]] || echo "savedAudioOutputs[$i].volume is not a number"
+          t="$(type_of "$f" "savedAudioOutputs.$i.noVolume")"
+          [[ -z "$t" || "$t" == bool || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].noVolume is a $t, not a bool"
           [[ "$(type_of "$f" "savedAudioOutputs.$i.muted")" == bool ]] || echo "savedAudioOutputs[$i].muted is not a bool"
           t="$(type_of "$f" "savedAudioOutputs.$i.name")"
           [[ -z "$t" || "$t" == string || "$t" == "(any)" ]] || echo "savedAudioOutputs[$i].name is a $t, not a string"

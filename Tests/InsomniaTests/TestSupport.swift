@@ -385,14 +385,15 @@ extension SavedAudioOutput {
 }
 
 /// Fake output devices by UID, one of them the default output, with a hook
-/// fired inside `mute`. It starts with the built-in speakers only.
+/// fired inside `mute`. It starts with the built-in speakers only. A nil
+/// volume or mute is a control the device does not have.
 final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     static let speakers = "BuiltInSpeakerDevice"
     static let speakersName = "MacBook Pro Speakers"
     private let lock = NSLock()
-    private var _devices: [String: (name: String?, volume: Float, muted: Bool)]
+    private var _devices: [String: (name: String?, volume: Float?, muted: Bool?)]
     private var _defaultUID = FakeAudioControl.speakers
-    private var _applied: [(volume: Float, muted: Bool, deviceUID: String?)] = []
+    private var _applied: [(volume: Float?, muted: Bool, deviceUID: String?)] = []
     private var _mutes = 0
     private var _devicesChanged: (@Sendable () -> Void)?
     var throwOnRead = false
@@ -406,20 +407,20 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     }
 
     /// The default output device's volume and mute.
-    var volume: Float { lock.withLock { _devices[_defaultUID]?.volume ?? 0 } }
+    var volume: Float? { lock.withLock { _devices[_defaultUID]?.volume ?? nil } }
     var muted: Bool { lock.withLock { _devices[_defaultUID]?.muted ?? false } }
-    var applied: [(volume: Float, muted: Bool, deviceUID: String?)] { lock.withLock { _applied } }
+    var applied: [(volume: Float?, muted: Bool, deviceUID: String?)] { lock.withLock { _applied } }
     var mutes: Int { lock.withLock { _mutes } }
 
     /// A connected device's volume and mute; nil when it is not connected.
-    func device(_ uid: String) -> (volume: Float, muted: Bool)? {
+    func device(_ uid: String) -> (volume: Float?, muted: Bool?)? {
         lock.withLock { _devices[uid].map { ($0.volume, $0.muted) } }
     }
 
     /// Connects a device and makes it the default output, as plugging in
     /// a headset does. Does not call the devices-changed handler; tests
     /// that need it call `fireDevicesChanged()`.
-    func connect(_ uid: String, name: String? = nil, volume: Float, muted: Bool = false) {
+    func connect(_ uid: String, name: String? = nil, volume: Float?, muted: Bool? = false) {
         lock.withLock {
             _devices[uid] = (name, volume, muted)
             _defaultUID = uid
@@ -450,7 +451,7 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
     func read() throws -> AudioOutput {
         if throwOnRead { throw AudioControlError(what: "read", status: -1) }
         return lock.withLock {
-            let d = _devices[_defaultUID] ?? (nil, 0, false)
+            let d = _devices[_defaultUID] ?? (nil, 0, false as Bool?)
             return AudioOutput(deviceUID: _defaultUID, name: d.name, volume: d.volume, muted: d.muted)
         }
     }
@@ -463,12 +464,14 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
         }
     }
 
-    func apply(volume: Float, muted: Bool, deviceUID: String?) throws {
+    func apply(volume: Float?, muted: Bool, deviceUID: String?) throws {
         if throwOnApply { throw AudioControlError(what: "apply", status: -1) }
         try lock.withLock {
             let uid = deviceUID ?? _defaultUID
-            guard _devices[uid] != nil else { throw AudioDeviceMissingError(deviceUID: uid) }
-            _devices[uid]?.volume = volume
+            guard let d = _devices[uid] else { throw AudioDeviceMissingError(deviceUID: uid) }
+            if volume != nil, d.volume == nil { throw AudioControlError(what: "set volume", status: 2003332927) }
+            guard d.muted != nil else { throw AudioControlError(what: "set mute", status: 2003332927) }
+            if let volume { _devices[uid]?.volume = volume }
             _devices[uid]?.muted = muted
             _applied.append((volume, muted, deviceUID))
         }
@@ -477,7 +480,8 @@ final class FakeAudioControl: AudioControlling, @unchecked Sendable {
 
     func mute(deviceUID: String) throws {
         try lock.withLock {
-            guard _devices[deviceUID] != nil else { throw AudioDeviceMissingError(deviceUID: deviceUID) }
+            guard let d = _devices[deviceUID] else { throw AudioDeviceMissingError(deviceUID: deviceUID) }
+            guard d.muted != nil else { throw AudioControlError(what: "mute", status: 2003332927) }
             _devices[deviceUID]?.muted = true
             _mutes += 1
         }
