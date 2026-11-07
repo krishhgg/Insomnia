@@ -139,8 +139,16 @@ struct SettingsView: View {
             LabeledContent("Maximum session") {
                 Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
             }
+            Toggle("Keep the screen on and unlocked", isOn: bind(\.keepScreenAwake))
+                .onChange(of: manager.config.keepScreenAwake) { manager.syncScreenAwake() }
+            Text(Self.keepScreenAwakeNote)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
+
+    /// Under the keep-awake toggle.
+    static let keepScreenAwakeNote = "Off by default. When on, the display never turns off on its own during a session, so the screen saver never starts and the screen never locks, and agents that drive the screen keep working. With the lid closed the display goes to brightness 0 instead of sleeping. When the session ends, idle display sleep and the lock come back. Anyone who opens the Mac during the session finds it unlocked."
 
     private func addPreset() {
         guard let s = DurationParser.seconds(from: newPreset) else { return }

@@ -243,6 +243,7 @@ below cover what only a real Mac shows.
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
+- Keep the screen on and unlocked (Settings > Session, off by default), with Lock Screen set to require a password immediately: with it on, `pmset -g assertions` lists Insomnia's `PreventUserIdleDisplaySleep` named "Insomnia session: keep the screen on and unlocked" for the whole session, and the screen is still unlocked after the Mac sits idle past its `displaysleep` minutes (`ioreg -n Root -d1 | grep CGSSessionScreenIsLocked` prints nothing); a lid close with "Turn off the display and keyboard backlight" on logs "display sleep not requested: keep the screen awake is on", leaves the panel at brightness 0 and the screen unlocked, and the open restores the brightness; the assertion is gone after a normal end, after turning the toggle off mid-session and after a force-quit, and the display then sleeps and locks after its idle time; with the toggle off, a session holds no display assertion
 
 ### Menu bar
 

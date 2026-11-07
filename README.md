@@ -112,6 +112,16 @@ file and explains how upgrades replace them.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
+Insomnia stops system sleep, not display sleep, so the display still turns
+off when idle. If your Mac then asks for a password, agents that drive the
+screen stop at the lock screen. **Keep the screen on and unlocked** in Settings >
+Session holds the display awake during a session, like `caffeinate -d`, so the
+screen saver never starts and the screen never locks. With the lid closed, the
+display goes to brightness 0 instead of sleeping. When the session ends or
+Insomnia quits or crashes, macOS drops the hold, and the display sleeps and
+locks as before. Insomnia never changes the lock setting. The switch is off by
+default because anyone who opens the Mac during a session finds it unlocked.
+
 On battery power, Insomnia turns on Low Power Mode below 40% and ends the
 session below 10%. Those are the defaults. You can change both in Settings,
 and an end floor of 0 turns the battery end off. The heat rules turn on Low Power
