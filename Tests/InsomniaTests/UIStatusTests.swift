@@ -94,6 +94,15 @@ final class UIStatusTests: XCTestCase {
     }
 
     @MainActor
+    func testEndZoneIsTheRightEdgeOfTheItem() {
+        // The end control sits at the right edge; the countdown to its left
+        // is outside the zone.
+        XCTAssertTrue(StatusItemController.isInEndZone(buttonMaxX: 1324, pointerX: 1306))
+        XCTAssertTrue(StatusItemController.isInEndZone(buttonMaxX: 1324, pointerX: 1324))
+        XCTAssertFalse(StatusItemController.isInEndZone(buttonMaxX: 1324, pointerX: 1270))
+    }
+
+    @MainActor
     func testHoldToEndIsSubSecond() {
         XCTAssertEqual(Motion.holdDuration, 0.6, accuracy: 0.0001)
         XCTAssertLessThan(Motion.holdDuration, 1)

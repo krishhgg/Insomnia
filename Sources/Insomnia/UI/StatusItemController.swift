@@ -114,6 +114,12 @@ final class StatusItemController: NSObject {
         )
         let host = Self.makeHostingView(root)
         host.onRightMouseDown = { [weak self] in self?.showMenu() }
+        // A monitor rather than a view override: SwiftUI takes the mouse
+        // through gesture recognizers, which never reach `mouseDown`.
+        endZoneMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            let taken = MainActor.assumeIsolated { self?.endZoneClicked(event) ?? false }
+            return taken ? nil : event
+        }
         host.translatesAutoresizingMaskIntoConstraints = true
         // The height follows the button; the width is set from the layout
         // (`retargetWidth`) and never from the button, whose width is the
@@ -203,6 +209,8 @@ final class StatusItemController: NSObject {
             self.model.phase = landing()
         }
     }
+
+    private var endZoneMonitor: Any?
 
     private var button: NSStatusBarButton? { statusItem.button }
 
@@ -622,6 +630,29 @@ final class StatusItemController: NSObject {
     func holdToEnd() {
         guard manager.isActive else { return }
         endNow()
+    }
+
+    /// Width, from the item's right edge, of the area the end control sits in.
+    private static let endZoneWidth: CGFloat = 30
+
+    static func isInEndZone(buttonMaxX: CGFloat, pointerX: CGFloat) -> Bool {
+        buttonMaxX - pointerX <= endZoneWidth
+    }
+
+    /// A left click in the end control's zone while a session runs. The zone
+    /// is read from the pointer's position on screen, not from the event or
+    /// SwiftUI's hit test: macOS reports a click on a status item at the
+    /// centre of its window whatever was clicked, so SwiftUI saw every click
+    /// land on the countdown and the end control at the right edge was never
+    /// reached. The control always sits at the right edge. Returns true when
+    /// the click was taken.
+    func endZoneClicked(_ event: NSEvent) -> Bool {
+        guard model.phase.showsRunningControls, manager.isActive,
+              let button, let window = button.window, event.window === window else { return false }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        guard Self.isInEndZone(buttonMaxX: frame.maxX, pointerX: NSEvent.mouseLocation.x) else { return false }
+        holdToEnd()
+        return true
     }
 
     /// Clicking the mark or the countdown while a session runs: reopen the

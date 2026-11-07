@@ -99,7 +99,7 @@ recovery; newly written journals use `frozenProcesses`.
   Enter with empty fields uses the configured default preset. Maximum 30 days.
 - While active the menu bar shows a second-resolution countdown. The redraw
   timer runs at 1 Hz and stops while the lid is closed.
-- Click the cup/countdown to enter an extension; hold the end control to end.
+- Click the cup/countdown to enter an extension; click the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
