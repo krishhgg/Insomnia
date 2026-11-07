@@ -14,6 +14,13 @@ note that `merge-gate.sh check` reads for each entry there. Wait for a week
 of clean runs first. Once it is required, no pull request can merge while
 the mini is off.
 
+The job runs for pushes to `main`, manual runs, and pull requests from
+branches in this repository. A pull request from a fork skips it. To test a
+fork's change on the mini, land it through a branch here, as the integration
+pull requests do. GitHub counts a skipped job as passing a required check,
+but `merge-gate.sh check` doesn't: it fails any required job that didn't
+succeed.
+
 ## How a job runs
 
 `.github/scripts/mini-runner.sh` runs on the mini in a loop:
@@ -43,13 +50,17 @@ credentials.
 
 ## What a job can reach
 
-A job runs a pull request's code. For a pull request from a fork, GitHub
-gives the job a read-only token and no secrets. Three fences cover the rest:
+A job runs a pull request's code. The job skips pull requests from forks,
+but a fork's pull request can edit the workflow file to drop that check, or
+add a workflow of its own that asks for this runner. GitHub gives such a job
+a read-only token and no secrets. Three fences cover the rest:
 
 - **Approval.** Settings > Actions > General > "Approval for running fork
   pull request workflows from contributors" is set to "Require approval for
-  all external contributors". The owner reads the diff, then approves the
-  run.
+  all external contributors". No workflow runs for a fork's pull request
+  until the owner approves it. Before approving, check that the pull
+  request doesn't change anything under `.github/`. The weaker settings let
+  some forks run without approval, and those runs could reach the mini.
 - **Softnet**, on the mini. With `tart run --net-softnet`, Softnet's
   documented default lets the VM reach the internet and its gateway address
   on the mini, and nothing else: no tailnet, no home network, no other VM.
@@ -96,7 +107,9 @@ mini's administrator password.
    ```
 
 5. On GitHub, set fork run approval to "Require approval for all external
-   contributors" (Settings > Actions > General).
+   contributors" (Settings > Actions > General). Check it with
+   `gh api repos/OWNER/REPO/actions/permissions/fork-pr-contributor-approval --jq .approval_policy`,
+   which should print `all_external_contributors`.
 6. Start the loop from a LaunchAgent, so it restarts after a crash or a
    login. Save this as `~/Library/LaunchAgents/org.insomnia.mini-runner.plist`,
    with the path of your checkout of this repository on `main`:
