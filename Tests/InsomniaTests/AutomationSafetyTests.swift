@@ -77,6 +77,8 @@ private final class GatedJoiner: HotspotJoining, @unchecked Sendable {
         await gate.wait()
         return true
     }
+
+    func leave(interfaceName: String) async throws {}
 }
 
 // MARK: - NetworkFailover: ending a session must end its nudges
@@ -216,7 +218,7 @@ final class NetworkFailoverCancellationTests: XCTestCase {
         let joiner = GatedJoiner()
         let n = try makeJoiningDriver(joiner: joiner)
         await n.simulate(satisfied: false)
-        clock.advance(FailoverMachine.initialDelay)
+        clock.advance(FailoverMachine.patientDelay)
         n.fireTimer()
         await joiner.gate.waitUntilStarted()
 
@@ -235,7 +237,7 @@ final class NetworkFailoverCancellationTests: XCTestCase {
         let joiner = GatedJoiner()
         let n = try makeJoiningDriver(joiner: joiner)
         await n.simulate(satisfied: false)
-        clock.advance(FailoverMachine.initialDelay)
+        clock.advance(FailoverMachine.patientDelay)
         n.fireTimer()
         await joiner.gate.waitUntilStarted()
         n.stop()

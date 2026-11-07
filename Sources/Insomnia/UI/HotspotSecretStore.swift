@@ -20,6 +20,16 @@ protocol HotspotSecretStore: AnyObject, Sendable {
     /// Clears the current SSID's password and the loaded account's, and
     /// returns both.
     @discardableResult func delete() async throws -> HotspotPasswordChange
+
+    // The priority list: each hotspot's own item, by SSID. None of these
+    // changes the loaded account the calls above work from.
+
+    /// The password saved for `ssid`, read without a prompt.
+    func peek(ssid: String) async throws -> String?
+    /// Saves `password` for `ssid`, and removes nothing else.
+    func save(_ password: String, for ssid: String) async throws
+    /// Removes the password saved for `ssid`.
+    func delete(ssid: String) async throws
 }
 
 /// Login-keychain implementation. The SSID provider keeps the Keychain
@@ -32,15 +42,21 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
     private let keychain: any KeychainStoring
     private let queue: KeychainQueue
     private let ssidProvider: @MainActor () -> String
+    /// Whether another setting still names an SSID (the priority list):
+    /// the loaded account's item is then kept
+    /// when the SSID is edited away, since that hotspot still uses it.
+    private let stillNamed: @MainActor (String) -> Bool
     private var selectedSSID: String?
 
     init(
         keychain: any KeychainStoring = KeychainStore(),
         queue: KeychainQueue = .shared,
+        stillNamed: @escaping @MainActor (String) -> Bool = { _ in false },
         ssid: @escaping @MainActor () -> String
     ) {
         self.keychain = keychain
         self.queue = queue
+        self.stillNamed = stillNamed
         ssidProvider = ssid
     }
 
@@ -57,7 +73,7 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
     @discardableResult
     func save(_ password: String) async throws -> HotspotPasswordChange {
         let ssid = currentSSID()
-        let previous = selectedSSID.flatMap { $0 == ssid ? nil : $0 }
+        let previous = previousAccount(besides: ssid)
         let keychain = self.keychain
         try await queue.run {
             try keychain.set(service: KeychainStore.service, account: ssid, value: password)
@@ -72,7 +88,7 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
     @discardableResult
     func delete() async throws -> HotspotPasswordChange {
         let current = currentSSID()
-        let previous = selectedSSID.flatMap { $0 == current ? nil : $0 }
+        let previous = previousAccount(besides: current)
         let keychain = self.keychain
         try await queue.run {
             try keychain.delete(service: KeychainStore.service, account: current)
@@ -82,6 +98,30 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
         }
         selectedSSID = current
         return HotspotPasswordChange(ssid: current, removed: previous)
+    }
+
+    func peek(ssid: String) async throws -> String? {
+        try await read(HotspotSSID.normalized(ssid))
+    }
+
+    func save(_ password: String, for ssid: String) async throws {
+        let ssid = HotspotSSID.normalized(ssid)
+        let keychain = self.keychain
+        try await queue.run { try keychain.set(service: KeychainStore.service, account: ssid, value: password) }
+    }
+
+    func delete(ssid: String) async throws {
+        let ssid = HotspotSSID.normalized(ssid)
+        let keychain = self.keychain
+        try await queue.run { try keychain.delete(service: KeychainStore.service, account: ssid) }
+    }
+
+    /// The loaded account a save or clear for `ssid` removes: the one the
+    /// window loaded, when the SSID was edited since, unless the priority
+    /// list still names it.
+    private func previousAccount(besides ssid: String) -> String? {
+        guard let selected = selectedSSID, selected != ssid, !stillNamed(selected) else { return nil }
+        return selected
     }
 
     private func read(_ ssid: String) async throws -> String? {
@@ -94,10 +134,11 @@ final class KeychainHotspotSecretStore: HotspotSecretStore {
     }
 }
 
-/// Test store that forgets the password when the process exits.
+/// Test store that forgets the passwords when the process exits.
 @MainActor
 final class InMemoryHotspotSecretStore: HotspotSecretStore {
     private var password: String?
+    private(set) var listed: [String: String] = [:]
 
     init() {}
 
@@ -114,4 +155,8 @@ final class InMemoryHotspotSecretStore: HotspotSecretStore {
         password = nil
         return HotspotPasswordChange(ssid: "")
     }
+
+    func peek(ssid: String) async throws -> String? { listed[HotspotSSID.normalized(ssid)] }
+    func save(_ password: String, for ssid: String) async throws { listed[HotspotSSID.normalized(ssid)] = password }
+    func delete(ssid: String) async throws { listed[HotspotSSID.normalized(ssid)] = nil }
 }

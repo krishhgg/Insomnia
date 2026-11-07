@@ -186,6 +186,14 @@ your login Keychain. Insomnia asks for Location Services access, because
 macOS requires it to read Wi-Fi network names. It never reads your location.
 After you reinstall Insomnia, enter the password again.
 
+With more than one phone or tablet, turn on "Join several hotspots in priority
+order" and add each hotspot. When the Wi-Fi drops, Insomnia joins the highest
+one on the list that is in range. During a session it also moves the Mac back
+up the list once a higher hotspot is in range again, at most once every 5
+minutes. Once a saved Wi-Fi network such as your home's is in range again,
+Insomnia leaves the hotspot and macOS rejoins that network. Each move takes the
+Mac offline for a few seconds, and you can turn either one off.
+
 After 90 seconds without a network, Insomnia can also type `continue` into a
 tmux pane running a coding agent. It only types into panes you list in
 Settings and mark yourself:

@@ -138,7 +138,7 @@ final class AppServices {
         status.hotspotPasswordReport = nil
         status.relaunchProblems = [:]
 
-        if !config.hotspotSSID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !config.hotspotsToJoin.isEmpty {
             locationPermission.requestWhenInUse()
         }
 
@@ -174,7 +174,7 @@ final class AppServices {
         // Apply the floors once: the battery may already be below one.
         powerChanged()
 
-        let net = NetworkFailover(paths: paths, keychain: keychain, notifier: notifier) { [weak manager] in
+        let net = NetworkFailover(paths: paths, keychain: keychain, waker: SharingHotspotWaker(), notifier: notifier) { [weak manager] in
             manager?.config ?? Config()
         }
         net.onRecovered = { [weak self] gap in self?.status.lastGap = gap }
@@ -319,10 +319,23 @@ final class AppServices {
     /// its items (`HotspotPasswordReport.stands`), and the next outage
     /// reports afresh.
     func hotspotPasswordChanged(_ change: HotspotPasswordChange, configuredSSID: String) {
-        if status.hotspotPasswordReport?.stands(after: change, configuredSSID: configuredSSID) != true {
+        hotspotPasswordChanged(change, configuredSSIDs: [configuredSSID])
+    }
+
+    /// The same for a save or removal in the priority list, with the
+    /// hotspots an outage tries now (`Config.hotspotsToJoin`).
+    func hotspotPasswordChanged(_ change: HotspotPasswordChange, configuredSSIDs: [String]) {
+        if status.hotspotPasswordReport?.stands(after: change, configuredSSIDs: configuredSSIDs) != true {
             status.hotspotPasswordReport = nil
         }
-        network?.passwordChanged(change, configuredSSID: configuredSSID)
+        network?.passwordChanged(change, configuredSSIDs: configuredSSIDs)
+    }
+
+    /// Settings turned the hotspot priority list, its switch-up or its
+    /// hand-back on or off: start or stop the hotspot checks now, not at
+    /// the next session. A no-op outside a session.
+    func hotspotSettingsChanged() {
+        network?.syncHotspotChecks()
     }
 
     /// Re-run the floors with the current inputs. Settings that change a

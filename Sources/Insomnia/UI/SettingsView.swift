@@ -11,6 +11,10 @@ struct SettingsView: View {
     let loginItem: LoginItem
     /// The "Check for updates" button's one request and its report.
     let releases: ReleaseChecker
+    /// Finds nearby network names for the priority list.
+    var scanner: any HotspotScanning = CoreWLANHotspotScanner()
+    /// Finds nearby phones and tablets for the priority list.
+    var nearbyDevices: any NearbyHotspotBrowsing = SharingHotspotBrowser()
 
     @State private var newPreset = ""
     @State private var presetError: String?
@@ -257,16 +261,33 @@ struct SettingsView: View {
 
     private var networkSection: some View {
         Section {
-            TextField("Hotspot SSID", text: bind(\.hotspotSSID))
-            HStack {
-                SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }))
-                    .onSubmit(savePassword)
-                Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID), action: savePassword)
-                    .disabled(hotspot.password.isEmpty || hotspot.saving)
+            Toggle("Join several hotspots in priority order", isOn: hotspotPriority)
+                .onChange(of: manager.config.hotspotPriorityEnabled) { manager.services?.hotspotSettingsChanged() }
+            if manager.config.hotspotPriorityEnabled {
+                PriorityHotspotList(
+                    manager: manager,
+                    secrets: secrets,
+                    locationPermission: locationPermission,
+                    scanner: scanner,
+                    devices: nearbyDevices,
+                    update: { update($0) }
+                )
+            } else {
+                TextField("Hotspot SSID", text: bind(\.hotspotSSID))
+                HStack {
+                    SecureField("Hotspot password", text: Binding(get: { hotspot.password }, set: { hotspot.edit($0) }))
+                        .onSubmit(savePassword)
+                    Button(hotspot.buttonTitle(ssid: manager.config.hotspotSSID), action: savePassword)
+                        .disabled(hotspot.password.isEmpty || hotspot.saving)
+                }
+                if let notice = hotspot.notice {
+                    Text(notice).font(.caption).foregroundStyle(.orange)
+                }
             }
-            if let notice = hotspot.notice {
-                Text(notice).font(.caption).foregroundStyle(.orange)
-            }
+            Toggle("Join a hotspot as soon as Wi-Fi drops (aggressive)", isOn: bind(\.aggressiveHotspotJoin))
+            Text("Off, Insomnia first gives macOS 20 seconds to rejoin the Wi-Fi network it dropped, so a blip at home does not wake your hotspot. When a hotspot Insomnia joined drops, the next one is joined after 5 seconds either way.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
                     Text("Location: \(locationPermission.statusDescription)")
@@ -316,8 +337,17 @@ struct SettingsView: View {
         } header: {
             Text("Network failover")
         } footer: {
-            Text("The password is kept in the login keychain, readable without a prompt only by the build of Insomnia that saved it; after a reinstall, enter it again. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspot.")
+            Text("When Wi-Fi drops during a session, Insomnia joins the hotspot above, or with the priority list on, the highest one on the list in range. Passwords are kept in the login keychain, readable without a prompt only by the build of Insomnia that saved them; after a reinstall, enter them again. Location permission lets macOS reveal Wi-Fi network names and find the configured hotspots.")
         }
+    }
+
+    /// Turning the list on starts it with the hotspot above, if there is
+    /// one and the list is empty (`Config.setHotspotPriority`).
+    private var hotspotPriority: Binding<Bool> {
+        Binding(
+            get: { manager.config.hotspotPriorityEnabled },
+            set: { on in update { $0.setHotspotPriority(on) } }
+        )
     }
 
     private var nudgeSeconds: Binding<Int> {
@@ -409,10 +439,8 @@ struct SettingsView: View {
     static func loadedPassword(_ load: () async throws -> String?) async -> (password: String, notice: String?) {
         do {
             return (try await load() ?? "", nil)
-        } catch let error as KeychainError {
-            return ("", error.problem.settingsNotice)
         } catch {
-            return ("", HotspotPasswordProblem.error(error.localizedDescription).settingsNotice)
+            return ("", HotspotPasswordProblem(error).settingsNotice)
         }
     }
 
