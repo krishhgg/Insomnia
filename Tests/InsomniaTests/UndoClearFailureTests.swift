@@ -50,6 +50,72 @@ final class UndoClearFailureTests: XCTestCase {
         XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
     }
 
+    /// The backstop clears the entry the app could not (issue #124): the
+    /// next menu opening reads the journal and the line goes. Before that,
+    /// with the entry still on disk, it stays.
+    func testLineGoesOnceTheBackstopClearsTheEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        m.recheckUnclearedEntry()
+        try assertShown(m, "sleep restored")
+        XCTAssertTrue(menuLines(m).contains("Sleep still held with no session"))
+
+        try h.store.saveState(.clean)
+        m.recheckUnclearedEntry()
+        XCTAssertNil(m.lastError)
+        XCTAssertFalse(menuLines(m).contains("Sleep still held with no session"), "\(menuLines(m))")
+    }
+
+    /// Any transaction reads the journal first, so it drops the line too.
+    func testATransactionAfterTheBackstopsClearDropsTheLine() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        try h.store.saveState(.clean)
+        await m.stopWaitingForOutput(SavedAudioOutput(deviceUID: "not-saved", name: nil, volume: 1, muted: false, saveID: nil))
+        XCTAssertNil(m.lastError)
+    }
+
+    /// A journal that does not read says nothing about the entry: the line
+    /// stays.
+    func testAnUnreadableJournalKeepsTheLine() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        try Data("{".utf8).write(to: h.home.paths.stateFile)
+        m.recheckUnclearedEntry()
+        try assertShown(m, "sleep restored")
+    }
+
+    private func menuLines(_ m: SessionManager) -> [String] {
+        StatusItemController.menuItems(manager: m, status: RecordingStatusSource()).map(\.title)
+    }
+
+    /// A newer error in the menu is not the cleared entry's line, so it
+    /// stays when the backstop clears the entry.
+    func testANewerErrorStaysWhenTheBackstopClearsTheEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+        m.fail("something newer")
+
+        try h.store.saveState(.clean)
+        m.recheckUnclearedEntry()
+        XCTAssertEqual(m.lastError, "something newer")
+    }
+
     /// The end's `lowpowermode 0` exits 0 and the clear fails.
     func testEndWhoseLowPowerClearFailsSaysSo() async throws {
         let m = h.makeManager()

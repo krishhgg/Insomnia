@@ -648,6 +648,8 @@ final class StatusItemController: NSObject {
         // Same for the foreign-sleep line: re-read the bit now, and let the
         // next opening drop the line if sleep is enabled again.
         Task { await manager.recheckForeignSleep() }
+        // A journal entry the backstop cleared takes its line with it.
+        manager.recheckUnclearedEntry()
         let menu = StatusMenu.menu(
             Self.menuItems(manager: manager, status: status),
             target: self,
