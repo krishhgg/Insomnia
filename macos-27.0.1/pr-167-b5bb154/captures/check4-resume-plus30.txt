@@ -1,0 +1,38 @@
+2026-11-07T22:47:54Z
+2026-11-07T22:47:23Z
+2026-11-07T22:47:53Z
+  PID STAT COMM
+ 3845 S    ~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+2026-11-07 22:47:53 +0000 
+Assertion status system-wide:
+   BackgroundTask                 0
+   ApplePushServiceTask           0
+   UserIsActive                   1
+   PreventUserIdleDisplaySleep    0
+   SoftwareUpdateTask             0
+   PreventSystemSleep             0
+   PreventSystemSleepSecurityIndicator 0
+   ExternalMedia                  0
+   InternalPreventDisplaySleep    1
+   PreventUserIdleSystemSleep     1
+   NetworkClientActive            0
+Listed by owning process:
+   pid 106(powerd): [0x0000000400018002] 00:21:20 PreventUserIdleSystemSleep named: "Powerd - Prevent sleep while display is on"  
+   pid 106(powerd): [0x0000000400098003] 00:21:20 UserIsActive named: "com.apple.powerd.ws.initialize"  
+   pid 106(powerd): [0x0000044800108115] 00:01:00 InternalPreventDisplaySleep named: "com.apple.powermanagement.delayDisplayOff"  
+	Timeout will fire in 240 secs Action=TimeoutActionTurnOff
+   pid 182(WindowServer): [0x0000000600098007] 00:03:00 UserIsActive named: "com.apple.iohideventsystem.queue.tickle.nxevent service:IOHIDSystem pid:2871 process:System Events"  
+Kernel Assertions: 0x4=USB
+   id=501  level=255 0x4=USB creat=07.11.26, 22:31 description=com.apple.usb.externaldevice.10900000 owner=Virtual USB Keyboard
+   id=502  level=255 0x4=USB creat=07.11.26, 22:32 description=com.apple.usb.externaldevice.10a00000 owner=Virtual USB Digitizer
+ SleepDisabled		0
+2026-11-07T22:47:18Z [info] backstop: session expired (endsAt=2026-11-07T22:46:52Z); restoring from journal
+2026-11-07T22:47:18Z [info] backstop: pmset -a disablesleep 0 ok
+2026-11-07T22:47:18Z [info] backstop: journal cleared
+2026-11-07T22:47:23Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:47:23Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T22:47:23Z [info] insomnia: session end (timer)
+2026-11-07T22:47:23Z [info] insomnia: notify: Session ended - Time is up. Sleep is back to normal.
+Lid: open · Wi-Fi: on (name hidden until Location is allowed), missing value, Settings…, Quit Insomnia, 1040, 30, 1040, 54, 1040, 65, 1040, 89, 394, 24, 394, 11, 394, 24, 394, 24
+
+exit=0

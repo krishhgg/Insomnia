@@ -1,0 +1,52 @@
+2026-11-07T22:36:28Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:36:28Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:36:53Z [info] insomnia: session started until 2026-11-07T22:41:48Z (300s requested)
+2026-11-07T22:41:22Z [info] insomnia: session end (quit)
+2026-11-07T22:41:22Z [info] insomnia: sleep restored
+2026-11-07T22:41:25Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:41:25Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:42:42Z [info] insomnia: session started until 2026-11-07T22:47:37Z (300s requested)
+2026-11-07T22:42:42Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:43:47Z [info] insomnia: session extended by 60s until 2026-11-07T22:48:37Z
+2026-11-07T22:43:47Z [info] insomnia: screen awake: hold moved to the session's new deadline
+2026-11-07T22:44:46Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:44:46Z [info] insomnia: session end (quit)
+2026-11-07T22:44:46Z [info] insomnia: sleep restored
+2026-11-07T22:44:48Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:44:48Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:44:58Z [info] insomnia: session started until 2026-11-07T22:46:52Z (120s requested)
+2026-11-07T22:44:58Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:47:18Z [info] backstop: session expired (endsAt=2026-11-07T22:46:52Z); restoring from journal
+2026-11-07T22:47:18Z [info] backstop: pmset -a disablesleep 0 ok
+2026-11-07T22:47:18Z [info] backstop: journal cleared
+2026-11-07T22:47:23Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:47:23Z [info] insomnia: session end (timer)
+2026-11-07T22:48:19Z [info] insomnia: session started until 2026-11-07T22:50:13Z (120s requested)
+2026-11-07T22:48:19Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:49:00Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:49:00Z [info] insomnia: session end (quit)
+2026-11-07T22:49:00Z [info] insomnia: sleep restored
+2026-11-07T22:49:03Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:49:03Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:49:12Z [info] insomnia: session started until 2026-11-07T22:51:07Z (120s requested)
+2026-11-07T22:49:12Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:49:17Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:49:38Z [info] insomnia: session end (quit)
+2026-11-07T22:49:38Z [info] insomnia: sleep restored
+2026-11-07T22:49:41Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:49:41Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:49:53Z [info] insomnia: session started until 2026-11-07T22:51:48Z (120s requested)
+2026-11-07T22:49:53Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:49:58Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:50:03Z [info] insomnia: reconcile: session valid until 2026-11-07T22:51:48Z
+2026-11-07T22:50:03Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:50:06Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:50:06Z [info] insomnia: session end (quit)
+2026-11-07T22:50:06Z [info] insomnia: sleep restored
+2026-11-07T22:50:10Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:50:10Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:50:19Z [info] insomnia: session started until 2026-11-07T23:00:14Z (600s requested)
+2026-11-07T22:50:19Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:50:22Z [info] insomnia: screen awake: released, idle display sleep and the screen lock are back
+2026-11-07T22:50:22Z [info] insomnia: session end (quit)
+2026-11-07T22:50:22Z [info] insomnia: sleep restored

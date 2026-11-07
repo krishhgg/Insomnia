@@ -1,0 +1,77 @@
+2026-11-07T22:50:09Z
+2026-11-07T22:50:06Z
+2026-11-07 22:50:06 +0000 
+Assertion status system-wide:
+   BackgroundTask                 0
+   ApplePushServiceTask           0
+   UserIsActive                   1
+   PreventUserIdleDisplaySleep    1
+   SoftwareUpdateTask             0
+   PreventSystemSleep             0
+   PreventSystemSleepSecurityIndicator 0
+   ExternalMedia                  0
+   InternalPreventDisplaySleep    1
+   PreventUserIdleSystemSleep     1
+   NetworkClientActive            0
+Listed by owning process:
+   pid 4549(Insomnia): [0x0000058600058142] 00:00:02 PreventUserIdleDisplaySleep named: "Insomnia session: keep the screen on and unlocked"  
+	Timeout will fire in 102 secs Action=TimeoutActionTurnOff
+   pid 106(powerd): [0x0000000400018002] 00:23:34 PreventUserIdleSystemSleep named: "Powerd - Prevent sleep while display is on"  
+   pid 106(powerd): [0x0000000400098003] 00:23:34 UserIsActive named: "com.apple.powerd.ws.initialize"  
+   pid 106(powerd): [0x0000044800108115] 00:00:10 InternalPreventDisplaySleep named: "com.apple.powermanagement.delayDisplayOff"  
+	Timeout will fire in 289 secs Action=TimeoutActionTurnOff
+   pid 182(WindowServer): [0x0000000600098007] 00:00:20 UserIsActive named: "com.apple.iohideventsystem.queue.tickle.nxevent service:IOHIDSystem pid:4519 process:click"  
+Kernel Assertions: 0x4=USB
+   id=501  level=255 0x4=USB creat=07.11.26, 22:31 description=com.apple.usb.externaldevice.10900000 owner=Virtual USB Keyboard
+   id=502  level=255 0x4=USB creat=07.11.26, 22:32 description=com.apple.usb.externaldevice.10a00000 owner=Virtual USB Digitizer
+ SleepDisabled		1
+{
+  "endsAt" : "2026-11-07T22:51:48Z",
+  "extensions" : [
+
+  ],
+  "startedAt" : "2026-11-07T22:49:48Z"
+}2026-11-07T22:49:58Z [info] insomnia: startup lid state unavailable
+2026-11-07T22:49:58Z [info] insomnia: startup battery n/a (no battery)
+2026-11-07T22:49:58Z [info] insomnia: startup thermal state nominal
+2026-11-07T22:49:58Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:49:58Z [info] insomnia: status item installed: window {{0, 0}, {16, 0}} button {{0, 0}, {32, 22}} host {{0, 0}, {32, 22}} fitting {32, 22} length 32.0
+2026-11-07T22:49:58Z [info] insomnia: status item installed: visible true alpha 1.0 occlusion 8192 screen Apple Virtual {{0, 0}, {1440, 900}} safe {0.0,0.0,0.0,0.0} button hidden false alpha 1.0 host hidden false alpha 1.0
+2026-11-07T22:49:58Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-07T22:49:59Z [info] insomnia: status item after 1s: window {{1180, 870}, {83, 30}} button {{0, 0}, {67, 22}} host {{0, 0}, {67, 22}} fitting {67, 22} length 67.0
+2026-11-07T22:49:59Z [info] insomnia: status item after 1s: visible true alpha 1.0 occlusion 8194 screen Apple Virtual {{0, 0}, {1440, 900}} safe {0.0,0.0,0.0,0.0} button hidden false alpha 1.0 host hidden false alpha 1.0
+2026-11-07T22:50:03Z [info] insomnia: reconcile: session valid until 2026-11-07T22:51:48Z
+2026-11-07T22:50:03Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:50:03Z [info] insomnia: lid observer started (lid open)
+2026-11-07T22:50:03Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:50:03Z [info] insomnia: notification authorization denied
+2026-11-07T22:50:03Z [info] insomnia: power monitor started (battery n/a (no battery), on battery, thermal nominal)
+2026-11-07T22:50:04Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-07T22:50:04Z [info] insomnia: network failover started (wifi unresolved)
+2026-11-07T22:50:04Z [info] insomnia: wifi path unsatisfied
+2026-11-07T22:50:09Z
+2026-11-07 22:50:09 +0000 
+Assertion status system-wide:
+   BackgroundTask                 0
+   ApplePushServiceTask           0
+   UserIsActive                   1
+   PreventUserIdleDisplaySleep    0
+   SoftwareUpdateTask             0
+   PreventSystemSleep             0
+   PreventSystemSleepSecurityIndicator 0
+   ExternalMedia                  0
+   InternalPreventDisplaySleep    1
+   PreventUserIdleSystemSleep     1
+   NetworkClientActive            0
+Listed by owning process:
+   pid 106(powerd): [0x0000000400018002] 00:23:37 PreventUserIdleSystemSleep named: "Powerd - Prevent sleep while display is on"  
+   pid 106(powerd): [0x0000000400098003] 00:23:37 UserIsActive named: "com.apple.powerd.ws.initialize"  
+   pid 106(powerd): [0x0000044800108115] 00:00:03 InternalPreventDisplaySleep named: "com.apple.powermanagement.delayDisplayOff"  
+	Timeout will fire in 297 secs Action=TimeoutActionTurnOff
+   pid 182(WindowServer): [0x0000000600098007] 00:00:23 UserIsActive named: "com.apple.iohideventsystem.queue.tickle.nxevent service:IOHIDSystem pid:4519 process:click"  
+Kernel Assertions: 0x4=USB
+   id=501  level=255 0x4=USB creat=07.11.26, 22:31 description=com.apple.usb.externaldevice.10900000 owner=Virtual USB Keyboard
+   id=502  level=255 0x4=USB creat=07.11.26, 22:32 description=com.apple.usb.externaldevice.10a00000 owner=Virtual USB Digitizer
+ SleepDisabled		0
+
+exit=0

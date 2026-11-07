@@ -1,0 +1,46 @@
+2026-11-07T22:43:50Z
+2026-11-07T22:43:50Z
+2026-11-07 22:43:50 +0000 
+Assertion status system-wide:
+   BackgroundTask                 0
+   ApplePushServiceTask           0
+   UserIsActive                   1
+   PreventUserIdleDisplaySleep    1
+   SoftwareUpdateTask             0
+   PreventSystemSleep             0
+   PreventSystemSleepSecurityIndicator 0
+   ExternalMedia                  0
+   PreventUserIdleSystemSleep     1
+   NetworkClientActive            0
+Listed by owning process:
+   pid 3437(Insomnia): [0x000003cd00058114] 00:00:03 PreventUserIdleDisplaySleep named: "Insomnia session: keep the screen on and unlocked"  
+	Timeout will fire in 288 secs Action=TimeoutActionTurnOff
+   pid 106(powerd): [0x0000000400018002] 00:17:18 PreventUserIdleSystemSleep named: "Powerd - Prevent sleep while display is on"  
+   pid 106(powerd): [0x0000000400098003] 00:17:18 UserIsActive named: "com.apple.powerd.ws.initialize"  
+   pid 182(WindowServer): [0x0000000600098007] 00:00:03 UserIsActive named: "com.apple.iohideventsystem.queue.tickle.nxevent service:IOHIDSystem pid:2871 process:System Events"  
+Kernel Assertions: 0x4=USB
+   id=501  level=255 0x4=USB creat=07.11.26, 22:31 description=com.apple.usb.externaldevice.10900000 owner=Virtual USB Keyboard
+   id=502  level=255 0x4=USB creat=07.11.26, 22:32 description=com.apple.usb.externaldevice.10a00000 owner=Virtual USB Digitizer
+{
+  "endsAt" : "2026-11-07T22:48:37Z",
+  "extensions" : [
+    60
+  ],
+  "startedAt" : "2026-11-07T22:42:37Z"
+}2026-11-07T22:42:42Z [info] insomnia: session started until 2026-11-07T22:47:37Z (300s requested)
+2026-11-07T22:42:42Z [info] insomnia: screen awake: display sleep held off for the session
+2026-11-07T22:42:42Z [info] insomnia: lid observer started (lid open)
+2026-11-07T22:42:42Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:42:42Z [info] insomnia: notification authorization denied
+2026-11-07T22:42:42Z [info] insomnia: power monitor started (battery n/a (no battery), on battery, thermal nominal)
+2026-11-07T22:42:42Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-07T22:42:42Z [info] insomnia: network failover started (wifi unresolved)
+2026-11-07T22:42:42Z [info] insomnia: wifi path unsatisfied
+2026-11-07T22:42:47Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T22:42:52Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T22:43:02Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T22:43:22Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T22:43:47Z [info] insomnia: session extended by 60s until 2026-11-07T22:48:37Z
+2026-11-07T22:43:47Z [info] insomnia: screen awake: hold moved to the session's new deadline
+
+exit=0

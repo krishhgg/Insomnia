@@ -1,0 +1,4 @@
+2026-11-07T22:50:59Z
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s1s1   228Gi    13Gi   2.7Gi    83%    484k   28M    2%   /
+VM remains running.
