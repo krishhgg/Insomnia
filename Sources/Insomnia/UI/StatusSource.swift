@@ -62,15 +62,15 @@ final class PlaceholderStatus: StatusSource {
 enum StatusLines {
     /// "Lid: closed · 4.1 W · Wi-Fi: iPhone". Unknown parts are omitted.
     static func machine(lidClosed: Bool, watts: Double?, wifiSSID: String?, batteryPercent: Int?, isCharging: Bool) -> String {
-        var parts: [String] = ["Lid: \(lidClosed ? "closed" : "open")"]
+        var parts: [String] = [lidClosed ? String(localized: "Lid: closed") : String(localized: "Lid: open")]
         if let w = watts {
             parts.append(String(format: "%.1f W", w))
         }
         if let p = batteryPercent {
-            parts.append(isCharging ? "\(p)% charging" : "\(p)%")
+            parts.append(isCharging ? "\(p)% " + String(localized: "charging") : "\(p)%")
         }
         if let ssid = wifiSSID, !ssid.isEmpty {
-            parts.append("Wi-Fi: \(ssid)")
+            parts.append(String(format: NSLocalizedString("Wi-Fi: %@", comment: "menu status line"), ssid))
         }
         return parts.joined(separator: " \u{00B7} ")
     }
@@ -79,13 +79,15 @@ enum StatusLines {
     static func actions(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?) -> String? {
         var parts: [String] = []
         if frozenCount > 0 {
-            parts.append(frozenCount == 1 ? "1 app frozen" : "\(frozenCount) apps frozen")
+            parts.append(frozenCount == 1
+                ? String(localized: "1 app frozen")
+                : String(format: NSLocalizedString("%lld apps frozen", comment: "menu status line, count"), frozenCount))
         }
         if dockerPaused {
-            parts.append("Docker paused")
+            parts.append(String(localized: "Docker paused"))
         }
         if let gap = lastGap, gap > 0 {
-            parts.append("last gap \(Int(gap.rounded()))s")
+            parts.append(String(format: NSLocalizedString("last gap %llds", comment: "menu status line, seconds"), Int(gap.rounded())))
         }
         return parts.isEmpty ? nil : parts.joined(separator: " \u{00B7} ")
     }
@@ -96,10 +98,15 @@ enum StatusLines {
         let names: String
         switch browsers.count {
         case 1: names = browsers[0]
-        case 2: names = "\(browsers[0]) and \(browsers[1])"
-        default: names = browsers.dropLast().joined(separator: ", ") + ", and " + browsers.last!
+        case 2: names = String(format: NSLocalizedString("%@ and %@", comment: "two browser names"), browsers[0], browsers[1])
+        default:
+            let head = browsers.dropLast().joined(separator: String(localized: ", "))
+            names = String(format: NSLocalizedString("%@, and %@", comment: "browser list, last name"), head, browsers.last!)
         }
-        return "\u{26A0} \(names) \(browsers.count == 1 ? "is" : "are") throttled"
+        let format = browsers.count == 1
+            ? NSLocalizedString("\u{26A0} %@ is throttled", comment: "one throttled browser")
+            : NSLocalizedString("\u{26A0} %@ are throttled", comment: "several throttled browsers")
+        return String(format: format, names)
     }
 }
 
@@ -117,11 +124,11 @@ enum SleepHeldLine {
     static func line(sessionActive: Bool, sleepHeld: Bool) -> Line? {
         switch (sessionActive, sleepHeld) {
         case (true, true):
-            Line(text: "Sleep held per journal \u{2014} not verified live", isWarning: false)
+            Line(text: String(localized: "Sleep held per journal \u{2014} not verified live"), isWarning: false)
         case (true, false):
-            Line(text: "Sleep is not held \u{2014} this session is not keeping the Mac awake", isWarning: true)
+            Line(text: String(localized: "Sleep is not held \u{2014} this session is not keeping the Mac awake"), isWarning: true)
         case (false, true):
-            Line(text: "Sleep still held with no session", isWarning: true)
+            Line(text: String(localized: "Sleep still held with no session"), isWarning: true)
         case (false, false):
             nil
         }

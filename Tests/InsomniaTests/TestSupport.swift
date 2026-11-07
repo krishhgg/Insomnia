@@ -501,6 +501,9 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     var throwOnRead = false
     var throwOnSet = false
     var throwOnSleep = false
+    /// Models `IOPMAssertionDeclareUserActivity` failing: the wake is counted
+    /// and reports failure, as the real one does on a non-zero result.
+    var wakeFails = false
     /// Called synchronously inside `setBrightness`, so a test can inspect
     /// disk at the moment the side effect happens.
     var onSet: (@Sendable (Float) -> Void)?
@@ -549,8 +552,10 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
         lock.withLock { _sleepRequests += 1 }
     }
 
-    func wake() {
+    @discardableResult
+    func wake() -> Bool {
         lock.withLock { _wakes += 1 }
+        return !wakeFails
     }
 }
 

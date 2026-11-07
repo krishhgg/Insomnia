@@ -15,8 +15,17 @@
 set -euo pipefail
 
 # Fixed tool paths: never taken from PATH. Tests patch these lines in a
-# private copy of the script.
-SWIFT=/usr/bin/swift
+# private copy of the script. INSOMNIA_SWIFT points the build at another
+# Swift (a swift.org toolchain under /Library/Developer/Toolchains, when the
+# Command Line Tools' Swift is older than Package.swift requires); the fixed
+# path stays the default.
+SWIFT="${INSOMNIA_SWIFT:-/usr/bin/swift}"
+# Absolute paths only: a bare name would make "$SWIFT" a PATH lookup and pick
+# whatever comes first, which is what these fixed paths exist to prevent.
+case "$SWIFT" in
+  /*) ;;
+  *) printf '%s\n' 'INSOMNIA_SWIFT must be an absolute path' >&2; exit 2 ;;
+esac
 CODESIGN=/usr/bin/codesign
 PLUTIL=/usr/bin/plutil
 RM=/bin/rm
@@ -114,6 +123,20 @@ fi
 BIN="$("$SWIFT" build -c release ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} --show-bin-path)/Insomnia"
 [[ -x "$BIN" ]] || { echo "binary not found at $BIN" >&2; exit 1; }
 
+# Localized strings live beside the icon so Bundle.main finds them: the
+# interface stays English and reads zh-Hans when the system prefers it. Every
+# table is linted before anything is assembled, since a malformed one silently
+# falls back to English and must not leave a half-built bundle behind.
+LPROJ=()
+for lproj in "$ROOT"/Resources/*.lproj; do
+  [[ -d "$lproj" ]] || continue
+  for strings in "$lproj"/*.strings; do
+    [[ -f "$strings" ]] || continue
+    "$PLUTIL" -lint "$strings" >/dev/null
+  done
+  LPROJ+=("$lproj")
+done
+
 # 2. Bundle ------------------------------------------------------------------
 APP="$OUTPUT/Insomnia.app"
 step "Assembling $APP"
@@ -122,6 +145,9 @@ step "Assembling $APP"
 "$CP" "$BIN" "$APP/Contents/MacOS/Insomnia"
 "$CP" "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 "$CP" "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+for lproj in ${LPROJ[@]+"${LPROJ[@]}"}; do
+  "$CP" -R "$lproj" "$APP/Contents/Resources/"
+done
 # backstop.sh goes into the bundle before it is signed, so the signature's
 # resource seal covers it. The LaunchAgent install.sh writes verifies the
 # bundle and only then runs this copy; an edited script fails that check.

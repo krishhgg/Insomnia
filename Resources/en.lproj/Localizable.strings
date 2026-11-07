@@ -1,0 +1,4 @@
+/* English. Empty on purpose: the source literals are the keys, so a missing
+   entry falls back to the key itself, which is the English text. This file's
+   presence is what tells macOS an English localization exists, so a Mac whose
+   language is English never falls back to the only other table, zh-Hans. */

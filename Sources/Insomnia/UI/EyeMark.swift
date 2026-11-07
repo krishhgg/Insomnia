@@ -34,7 +34,12 @@ struct EyeLashes: Shape {
 /// way, the upper set only starts to show from there, so no lash is ever
 /// seen while the lid edge passes its side of the lens. Animatable so the
 /// timing follows the lid's own progress rather than a plain crossfade.
-nonisolated struct EyeLashFade: ViewModifier, Animatable {
+/// SwiftUI isolates a `ViewModifier` to the main actor, while `Animatable`
+/// requires a nonisolated `animatableData`; `@preconcurrency` on that
+/// conformance defers the check to run time, where SwiftUI drives the
+/// animation from the main thread anyway. Swift 6.2 spells this
+/// `nonisolated struct`, which Swift 6.0 rejects.
+struct EyeLashFade: ViewModifier, @preconcurrency Animatable {
     var progress: CGFloat
     let side: EyeMarkGeometry.Side
 

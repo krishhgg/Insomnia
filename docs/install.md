@@ -5,7 +5,7 @@ step and what each one checks. A coding agent can follow
 [skills/install-insomnia](../skills/install-insomnia/SKILL.md), which uses the
 steps on this page.
 
-Requires **macOS 26 or later on an Apple Silicon Mac**.
+Requires **macOS 14 or later on an Apple Silicon Mac**.
 
 ## Channels
 

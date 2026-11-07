@@ -76,7 +76,10 @@ final class StatusItemController: NSObject {
         self.status = status
         self.showSettings = showSettings
         self.makeWidthWriter = makeWidthWriter
-        self.confirmRelaunch = confirmRelaunch ?? Self.askBeforeRelaunch
+        // A closure literal, not `Self.askBeforeRelaunch`: taking the method
+        // reference needs the initializer to be main actor-isolated, which it
+        // is not.
+        self.confirmRelaunch = confirmRelaunch ?? { name in Self.askBeforeRelaunch(name) }
         self.clock = clock
         Self.seedPreferredPositionIfNeeded()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -128,7 +131,7 @@ final class StatusItemController: NSObject {
         // SwiftUI handles the clicks; the cell must not paint a highlight.
         (button.cell as? NSButtonCell)?.highlightsBy = []
         hostingView = host
-        // The layout may already have reported through `onGeometryChange`
+        // The layout may already have reported through `onLayoutWidthChange`
         // while the host was measured above, before `hostingView` was set,
         // in which case `retargetWidth` treats the fitting width as a
         // repeat and never grows the frame: size the host here.

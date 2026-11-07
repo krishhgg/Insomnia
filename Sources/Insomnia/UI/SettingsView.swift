@@ -25,17 +25,26 @@ struct SettingsView: View {
     @State private var wouldFreeze: [String] = []
 
     var body: some View {
-        Form {
-            sessionSection
-            lidSection
-            agentSection
-            powerSection
-            networkSection
-            appSection
+        TabView {
+            pane("Session", systemImage: "timer") {
+                sessionSection
+            }
+            pane("Lid-close actions", systemImage: "laptopcomputer") {
+                lidSection
+                agentSection
+            }
+            pane("Battery and thermal", systemImage: "battery.50") {
+                powerSection
+            }
+            pane("Network failover", systemImage: "wifi") {
+                networkSection
+            }
+            pane("App", systemImage: "gearshape") {
+                appSection
+            }
         }
-        .formStyle(.grouped)
-        .frame(width: 520)
-        .frame(minHeight: 560, idealHeight: 720)
+        .frame(width: 620)
+        .frame(minHeight: 480, idealHeight: 620)
         .onAppear {
             loadPassword()
             refreshWouldFreeze()
@@ -54,6 +63,22 @@ struct SettingsView: View {
         .onChange(of: manager.config) { refreshWouldFreeze() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in refreshWouldFreeze() }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in refreshWouldFreeze() }
+    }
+
+    /// One preferences pane: its own grouped form, so a long pane scrolls
+    /// inside the window instead of stretching it, and the window keeps one
+    /// size as panes switch. The tab names each pane, so the panes that
+    /// share its name drop their section header.
+    private func pane<Content: View>(
+        _ title: LocalizedStringKey,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Form {
+            content()
+        }
+        .formStyle(.grouped)
+        .tabItem { Label(title, systemImage: systemImage) }
     }
 
     // MARK: Bindings
@@ -98,7 +123,7 @@ struct SettingsView: View {
     // MARK: Sections
 
     private var sessionSection: some View {
-        Section("Session") {
+        Section {
             ForEach(manager.config.presets, id: \.self) { p in
                 HStack {
                     Text(chipLabel(for: p))
@@ -160,7 +185,7 @@ struct SettingsView: View {
 
     /// Under the mute toggle and in the README. Apple Platform Security,
     /// "Hardware microphone disconnect".
-    static let microphoneNote = "On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic."
+    static let microphoneNote = String(localized: "On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic.")
 
     private var lidSection: some View {
         Section {
@@ -202,8 +227,6 @@ struct SettingsView: View {
             Toggle("Low Power Mode while the lid is closed", isOn: bind(\.lowPowerOnLidClose))
                 // A floor input: apply it now if the lid is already closed.
                 .onChange(of: manager.config.lowPowerOnLidClose) { manager.services?.reevaluateFloors() }
-        } header: {
-            Text("Lid-close actions")
         } footer: {
             Text("Apps on the list above are stopped with SIGSTOP while the lid is closed and resumed when it opens. With \"Freeze every other app\" on (off by default), every other Dock app is stopped too, except agent apps, Apple apps, Docker Desktop and built-in protected apps (editors, terminals, browsers, AI apps, password managers, local databases, Tailscale, local model servers, and meeting, recording and dictation apps such as Zoom, Teams, Webex, Wispr Flow, Granola, Otter, OBS and Loom). Agent apps are never frozen. The display brightness and keyboard backlight are saved, set to zero and restored when the lid opens. If Insomnia is not running when you open the lid, press the brightness-up key.")
         }
@@ -241,7 +264,7 @@ struct SettingsView: View {
     }
 
     private var powerSection: some View {
-        Section("Battery and thermal") {
+        Section {
             Stepper(value: lowPowerFloor, in: 0...100, step: Config.floorStep) {
                 LabeledContent("Low Power Mode below", value: "\(manager.config.lowPowerFloor)%")
             }
@@ -484,7 +507,7 @@ struct SettingsView: View {
     }
 
     private var appSection: some View {
-        Section("App") {
+        Section {
             Toggle("Launch at login", isOn: launchAtLogin)
             loginItemNote
             LabeledContent("Config") {

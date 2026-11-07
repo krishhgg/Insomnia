@@ -14,16 +14,16 @@ struct DurationInput: Equatable, Sendable {
 
         var placeholder: String {
             switch self {
-            case .days: return "Days"
-            case .hours: return "Hours"
-            case .minutes: return "Minutes"
+            case .days: return String(localized: "Days")
+            case .hours: return String(localized: "Hours")
+            case .minutes: return String(localized: "Minutes")
             }
         }
 
         /// Tooltip on the "?" badge.
         var help: String {
             switch self {
-            case .days: return "Up to \(DurationInput.maxDays) days"
+            case .days: return String(localized: "Up to \(DurationInput.maxDays) days")
             case .hours: return "0\u{2013}\(DurationInput.maxHours)"
             case .minutes: return "0\u{2013}\(DurationInput.maxMinutes)"
             }

@@ -321,6 +321,12 @@ final class PackagingTests: XCTestCase {
         for name in ["Info.plist", "AppIcon.icns"] {
             try fm.copyItem(at: Self.repoRoot.appendingPathComponent("Resources/\(name)"), to: checkout.appendingPathComponent("Resources/\(name)"))
         }
+        // The localization tables the script bundles, copied as they are in
+        // the repository, so a test can assert on the real ones.
+        for lproj in try fm.contentsOfDirectory(at: Self.repoRoot.appendingPathComponent("Resources"), includingPropertiesForKeys: nil)
+        where lproj.pathExtension == "lproj" {
+            try fm.copyItem(at: lproj, to: checkout.appendingPathComponent("Resources/\(lproj.lastPathComponent)"))
+        }
         try fm.copyItem(at: Self.repoRoot.appendingPathComponent("scripts/backstop.sh"), to: checkout.appendingPathComponent("scripts/backstop.sh"))
         try fm.copyItem(atPath: "/usr/bin/true", toPath: binroot.appendingPathComponent("Insomnia").path)
 
@@ -368,6 +374,72 @@ final class PackagingTests: XCTestCase {
         try lines.joined(separator: "\n").write(to: script, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         return (script, calls)
+    }
+
+    /// Every `Resources/*.lproj` lands in the bundle, tables included, and a
+    /// table that does not parse stops the build instead of shipping an app
+    /// that silently falls back to English.
+    func testBuildAppBundlesTheLocalizationsAndRefusesAMalformedTable() throws {
+        let (script, _) = try patchedBuildApp(recordingCodesign: false)
+        let out = scratch.appendingPathComponent("out", isDirectory: true)
+
+        let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertEqual(r.status, 0, r.output)
+        let bundle = out.appendingPathComponent("Insomnia.app")
+        for name in ["en.lproj", "zh-Hans.lproj"] {
+            let table = bundle.appendingPathComponent("Contents/Resources/\(name)/Localizable.strings")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: table.path), "\(name) is bundled")
+        }
+        let chinese = try String(contentsOf: bundle.appendingPathComponent("Contents/Resources/zh-Hans.lproj/Localizable.strings"), encoding: .utf8)
+        XCTAssertTrue(chinese.contains("\"Days\" = \"天\";"), "the translated table arrives as written")
+        let english = try String(contentsOf: bundle.appendingPathComponent("Contents/Resources/en.lproj/Localizable.strings"), encoding: .utf8)
+        XCTAssertFalse(english.contains("="), "the English table is comments only: its keys are the English text")
+
+        // A table that does not parse fails the build, and no bundle is left.
+        let checkout = script.deletingLastPathComponent().deletingLastPathComponent()
+        try "this is not a strings file".write(to: checkout.appendingPathComponent("Resources/zh-Hans.lproj/Localizable.strings"), atomically: true, encoding: .utf8)
+        let second = scratch.appendingPathComponent("out2", isDirectory: true)
+
+        let failed = try run("/bin/bash", [script.path, "--output", second.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path])
+
+        XCTAssertNotEqual(failed.status, 0, "a malformed table fails the build")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.appendingPathComponent("Insomnia.app").path), "no bundle is assembled from it")
+    }
+
+    /// `INSOMNIA_SWIFT` runs another toolchain in place of the fixed default,
+    /// which is how a Mac whose Command Line Tools' Swift is older than
+    /// Package.swift needs can still build the bundle.
+    func testBuildAppBuildsWithTheSwiftOverrideWhenOneIsSet() throws {
+        let (script, calls) = try patchedBuildApp(recordingCodesign: true)
+        let binroot = scratch.appendingPathComponent("binroot", isDirectory: true)
+        // The shared fixture pins SWIFT to a fake path, which removes the
+        // environment lookup this test is about: put it back around the same
+        // fake, as the script ships it.
+        var lines = try String(contentsOf: script, encoding: .utf8).components(separatedBy: "\n")
+        let hits = lines.indices.filter { lines[$0].hasPrefix("SWIFT=") }
+        guard hits.count == 1 else { return XCTFail("build-app.sh must have exactly one SWIFT= line") }
+        let pinned = lines[hits[0]]
+        let fakeDefault = String(pinned.dropFirst("SWIFT='".count).dropLast())
+        lines[hits[0]] = "SWIFT=\"${INSOMNIA_SWIFT:-\(fakeDefault)}\""
+        try lines.joined(separator: "\n").write(to: script, atomically: true, encoding: .utf8)
+
+        let override = scratch.appendingPathComponent("override-swift")
+        try TestScripts.write("""
+        #!/bin/bash
+        printf 'override %s\\n' "$*" >> "\(calls.path)"
+        for a in "$@"; do [[ "$a" == --show-bin-path ]] && { echo "\(binroot.path)"; exit 0; }; done
+        exit 0
+        """, to: override)
+
+        let out = scratch.appendingPathComponent("out", isDirectory: true)
+        let r = try run("/bin/bash", [script.path, "--output", out.path], environment: ["PATH": "/usr/bin:/bin", "HOME": scratch.path, "INSOMNIA_SWIFT": override.path])
+
+        XCTAssertEqual(r.status, 0, r.output)
+        let recorded = try String(contentsOf: calls, encoding: .utf8)
+        XCTAssertTrue(recorded.contains("override build"), "the override toolchain built the app: \(recorded)")
+        XCTAssertFalse(recorded.contains("swift build"), "the pinned default was not used: \(recorded)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: out.appendingPathComponent("Insomnia.app/Contents/MacOS/Insomnia").path))
     }
 
     /// Ad-hoc by default: the output is a complete bundle (binary,
