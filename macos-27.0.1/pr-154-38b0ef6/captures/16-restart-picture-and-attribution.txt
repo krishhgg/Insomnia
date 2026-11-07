@@ -1,0 +1,25 @@
+#2:
+                 UUID: 082EF843-1587-4E5D-A1D5-7F8F47692D9F
+                 Name: sh
+       Developer Name: (null)
+                 Type: legacy agent (0x10008)
+                Flags: [ legacy ] (0x1)
+          Disposition: [enabled, allowed, notified] (0xb)
+           Identifier: 8.com.insomnia.backstop
+                  URL: ~/Library/LaunchAgents/com.insomnia.backstop.plist
+      Executable Path: /bin/sh
+           Generation: 38739
+             Last Use: 2026-11-07 22:23:20Z
+    Parent Identifier: Unknown Developer
+Sat Nov  7 22:27:44 UTC 2026
+	state = not running
+	program = /bin/sh
+	runs = 1
+	last exit code = 0
+		state = active
+		state = active
+	jetsamproperties category = daemon
+	run interval = 60 seconds
+	job state = exited
+	properties = runatload | inferred program | system service | managed LWCR | has LWCR | tle system
+app-not-running

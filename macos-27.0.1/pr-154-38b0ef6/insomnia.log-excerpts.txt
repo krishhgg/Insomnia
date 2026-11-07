@@ -1,0 +1,24 @@
+2026-11-07T22:24:12Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:24:12Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:24:49Z [info] insomnia: session end (quit)
+2026-11-07T22:24:49Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:24:49Z [info] insomnia: notification authorization denied
+2026-11-07T22:24:59Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:24:59Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:25:23Z [info] insomnia: session started until 2026-11-07T22:35:18Z (600s requested)
+2026-11-07T22:25:23Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:25:23Z [info] insomnia: notification authorization denied
+2026-11-07T22:25:23Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:25:23Z [info] insomnia: session command start 600 (1221-3971425971): done
+2026-11-07T22:25:36Z [info] insomnia: session end (user)
+2026-11-07T22:25:36Z [info] insomnia: session command end (1243-1793653074): done
+2026-11-07T22:25:41Z [info] insomnia: session started until 2026-11-07T22:35:36Z (600s requested)
+2026-11-07T22:25:41Z [info] insomnia: session command start 600 (1249-2641648410): done
+2026-11-07T22:26:09Z [info] insomnia: session end (user)
+2026-11-07T22:26:09Z [info] insomnia: session command end (1336-1292451316): done
+2026-11-07T22:26:23Z [info] insomnia: session started until 2026-11-07T22:28:18Z (120s requested)
+2026-11-07T22:26:23Z [info] insomnia: session command start 120 (1348-3135044078): done
+2026-11-07T22:28:45Z [info] backstop: session expired (endsAt=2026-11-07T22:28:18Z); restoring from journal
+2026-11-07T22:28:45Z [info] backstop: pmset -a disablesleep 0 ok
+2026-11-07T22:28:45Z [info] backstop: journal cleared
+2026-11-07T22:30:17Z [error] backstop agent: ~/Applications/Insomnia.app does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: ~/Applications/Insomnia.app: a sealed resource is missing or invalid

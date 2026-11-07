@@ -1,0 +1,192 @@
+ed64a4f94a89285fe0b31c98219b3e5be601dfa8e922f39ab94a2cce6453a86e  build.zip
+
+==> Checking the prebuilt bundle ~/pr154-test/unpacked/Insomnia.app
+WARNING: the origin of Insomnia 0.1.0 is not verified. Its signature shows the bundle is intact, not who made it.
+--allow-unverified-origin: installing it anyway. Its backstop.sh will run as you at login and every 60 s.
+Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install).
+Releases are not notarized, so macOS blocks the first launch of a downloaded one until you allow it in System Settings > Privacy & Security.
+
+==> Writing /etc/sudoers.d/insomnia (requires your password once)
+sudoers rule verified
+
+==> Staging Insomnia.app
+signed Identifier=com.kgarg.insomnia
+TeamIdentifier=not set
+LaunchAgent will require: cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+
+==> Creating ~/Library/Application Support/Insomnia, ~/Library/Logs/Insomnia and ~/Library/LaunchAgents
+
+==> Taking the recovery lock
+
+==> Ending any stale session and checking the recovery journal
+
+==> Installing LaunchAgent com.insomnia.backstop
+LaunchAgent com.insomnia.backstop loaded (launchctl print confirms); ~/Library/LaunchAgents/com.insomnia.backstop.plist published
+replaced the previous ~/Applications/Insomnia.app
+
+==> Installed
+Next steps:
+  1. Launch:            open ~/Applications/Insomnia.app
+  2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
+  3. Config lives at:   ~/Library/Application Support/Insomnia/config.json
+  4. Logs:              ~/Library/Logs/Insomnia/insomnia.log
+  5. Uninstall:         ~/pr154-test/scripts/uninstall.sh
+Executable=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+Identifier=com.kgarg.insomnia
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20400 size=7307 flags=0x2(adhoc) hashes=222+3 location=embedded
+VersionPlatform=1
+VersionMin=1703936
+VersionSDK=1704960
+Hash type=sha256 size=32
+CandidateCDHash sha256=602acf9aa689105e02a2c211e4dd98c876b3097f
+CandidateCDHashFull sha256=602acf9aa689105e02a2c211e4dd98c876b3097fe8a4a57d6bc24285722f8d10
+Hash choices=sha256
+CMSDigest=602acf9aa689105e02a2c211e4dd98c876b3097fe8a4a57d6bc24285722f8d10
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=1507328
+Executable Segment flags=0x1
+Page size=16384
+CDHash=602acf9aa689105e02a2c211e4dd98c876b3097f
+Signature=adhoc
+Info.plist entries=20
+TeamIdentifier=not set
+Sealed Resources version=2 rules=13 files=2
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
+{
+  "CFBundleDevelopmentRegion" => "en"
+  "CFBundleDisplayName" => "Insomnia"
+  "CFBundleExecutable" => "Insomnia"
+  "CFBundleIconFile" => "AppIcon"
+  "CFBundleIdentifier" => "com.kgarg.insomnia"
+  "CFBundleInfoDictionaryVersion" => "6.0"
+  "CFBundleName" => "Insomnia"
+  "CFBundlePackageType" => "APPL"
+  "CFBundleShortVersionString" => "0.1.0"
+  "CFBundleVersion" => "1"
+  "InsomniaBackstopCommand" => "--backstop"
+  "InsomniaResumeFrozenVersion" => 1
+  "InsomniaSessionCommandVersion" => 1
+  "LSMinimumSystemVersion" => "26.0"
+  "LSUIElement" => true
+  "NSHighResolutionCapable" => true
+  "NSHumanReadableCopyright" => "[copyright metadata omitted for privacy]"
+  "NSLocationUsageDescription" => "Insomnia needs your location permission so macOS lets it see Wi-Fi network names and rejoin your hotspot."
+  "NSLocationWhenInUseUsageDescription" => "Insomnia needs your location permission so macOS lets it see Wi-Fi network names and rejoin your hotspot."
+  "NSPrincipalClass" => "NSApplication"
+}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.insomnia.backstop</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2&gt;&amp;1)" &amp;&amp; exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" &gt;&gt; "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1</string>
+		<string>sh</string>
+		<string>cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"</string>
+		<string>~/Applications/Insomnia.app</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+</dict>
+</plist>
+gui/501/com.insomnia.backstop = {
+	active count = 1
+	path = ~/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-796.plist
+	type = LaunchAgent
+	state = running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1
+		sh
+		cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+		~/Applications/Insomnia.app
+	}
+
+	inherited environment = {
+		<inherited socket redacted>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.insomnia.backstop
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 1067
+	immediate reason = speculative
+	forks = 1
+	execs = 2
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	resource coalition = {
+		ID = 6284
+		type = resource
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	jetsam coalition = {
+		ID = 6285
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program | system service | tle system
+}
+ SleepDisabled		0
+{
+  "appNapOverrides" : [
+
+  ],
+  "dockerFrozen" : false,
+  "frozenProcesses" : [
+
+  ],
+  "lowPowerSetByUs" : false,
+  "savedAudioOutputs" : [
+
+  ],
+  "sleepDisabledByUs" : false
+}

@@ -1,0 +1,112 @@
+Sat Nov  7 22:30:29 UTC 2026
+ed64a4f94a89285fe0b31c98219b3e5be601dfa8e922f39ab94a2cce6453a86e  build.zip
+
+==> Checking the prebuilt bundle ~/pr154-test/unpacked/Insomnia.app
+WARNING: the origin of Insomnia 0.1.0 is not verified. Its signature shows the bundle is intact, not who made it.
+--allow-unverified-origin: installing it anyway. Its backstop.sh will run as you at login and every 60 s.
+Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install).
+Releases are not notarized, so macOS blocks the first launch of a downloaded one until you allow it in System Settings > Privacy & Security.
+
+==> Writing /etc/sudoers.d/insomnia (requires your password once)
+sudoers rule verified
+
+==> Staging Insomnia.app
+signed Identifier=com.kgarg.insomnia
+TeamIdentifier=not set
+LaunchAgent will require: cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+
+==> Creating ~/Library/Application Support/Insomnia, ~/Library/Logs/Insomnia and ~/Library/LaunchAgents
+
+==> Taking the recovery lock
+
+==> Ending any stale session and checking the recovery journal
+
+==> Installing LaunchAgent com.insomnia.backstop
+LaunchAgent com.insomnia.backstop loaded (launchctl print confirms); ~/Library/LaunchAgents/com.insomnia.backstop.plist published
+replaced the previous ~/Applications/Insomnia.app
+
+==> Installed
+Next steps:
+  1. Launch:            open ~/Applications/Insomnia.app
+  2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
+  3. Config lives at:   ~/Library/Application Support/Insomnia/config.json
+  4. Logs:              ~/Library/Logs/Insomnia/insomnia.log
+  5. Uninstall:         ~/pr154-test/scripts/uninstall.sh
+Executable=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+Identifier=com.kgarg.insomnia
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20400 size=7307 flags=0x2(adhoc) hashes=222+3 location=embedded
+Signature=adhoc
+Info.plist entries=20
+TeamIdentifier=not set
+Sealed Resources version=2 rules=13 files=2
+Internal requirements count=0 size=12
+gui/501/com.insomnia.backstop = {
+	active count = 0
+	path = ~/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-1292.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1
+		sh
+		cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+		~/Applications/Insomnia.app
+	}
+
+	inherited environment = {
+		<inherited socket redacted>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.insomnia.backstop
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 0
+
+	resource coalition = {
+		ID = 1020
+		type = resource
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	jetsam coalition = {
+		ID = 1021
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+	job state = exited
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program | system service | tle system
+}
+app-not-running
+ SleepDisabled		0
+{"savedAudioOutputs":[],"appNapOverrides":[],"sleepDisabledByUs":false,"dockerFrozen":false,"lowPowerSetByUs":false,"frozenProcesses":[]}session-absent
+2026-11-07T22:30:17Z [error] backstop agent: ~/Applications/Insomnia.app does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: ~/Applications/Insomnia.app: a sealed resource is missing or invalid

@@ -1,0 +1,82 @@
+Sat Nov  7 22:29:59 UTC 2026
+app-not-running
+ SleepDisabled		0
+{"savedAudioOutputs":[],"appNapOverrides":[],"sleepDisabledByUs":false,"dockerFrozen":false,"lowPowerSetByUs":false,"frozenProcesses":[]}session-absent
+gui/501/com.insomnia.backstop = {
+	active count = 0
+	path = ~/Library/LaunchAgents/com.insomnia.backstop.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1
+		sh
+		cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+		~/Applications/Insomnia.app
+	}
+
+	inherited environment = {
+		<inherited socket redacted>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.insomnia.backstop
+	}
+
+	LWCR = {
+		"reqs" => {
+			"signing-identifier" => "com.apple.sh"
+			"validation-category" => 1
+		}
+		"vers" => 1
+		"comp" => 1
+		"ccat" => 0
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 4
+	last exit code = 0
+
+	resource coalition = {
+		ID = 571
+		type = resource
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	jetsam coalition = {
+		ID = 572
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+	job state = exited
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program | system service | managed LWCR | has LWCR | tle system
+}
+2026-11-07T22:28:45Z [info] backstop: session expired (endsAt=2026-11-07T22:28:18Z); restoring from journal
+2026-11-07T22:28:45Z [info] backstop: pmset -a disablesleep 0 ok
+2026-11-07T22:28:45Z [info] backstop: journal cleared

@@ -1,0 +1,99 @@
+Sat Nov  7 22:24:08 UTC 2026
+System Integrity Protection status: disabled.
+gui/501/com.insomnia.backstop = {
+	active count = 0
+	path = ~/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-796.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1
+		sh
+		cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+		~/Applications/Insomnia.app
+	}
+
+	inherited environment = {
+		<inherited socket redacted>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.insomnia.backstop
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 0
+
+	resource coalition = {
+		ID = 6284
+		type = resource
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	jetsam coalition = {
+		ID = 6285
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+	job state = exited
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program | system service | tle system
+}
+app-not-running
+{
+  "appNapOverrides" : [
+
+  ],
+  "dockerFrozen" : false,
+  "frozenProcesses" : [
+
+  ],
+  "lowPowerSetByUs" : false,
+  "savedAudioOutputs" : [
+
+  ],
+  "sleepDisabledByUs" : false
+}session-absent
+2026-11-07T07:39:21Z [info] insomnia: startup lid state unavailable
+2026-11-07T07:39:21Z [info] insomnia: startup battery n/a (no battery)
+2026-11-07T07:39:21Z [info] insomnia: startup thermal state nominal
+2026-11-07T07:39:21Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T07:39:21Z [info] insomnia: Lid simulation build: scripts/simulate-lid.sh is honoured during sessions
+2026-11-07T07:39:21Z [info] insomnia: status item installed: window {{0, 0}, {16, 0}} button {{0, 0}, {32, 22}} host {{0, 0}, {32, 22}} fitting {32, 22} length 32.0
+2026-11-07T07:39:21Z [info] insomnia: status item installed: visible true alpha 1.0 occlusion 8192 screen Apple Virtual {{0, 0}, {1440, 900}} safe {0.0,0.0,0.0,0.0} button hidden false alpha 1.0 host hidden false alpha 1.0
+2026-11-07T07:39:21Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-07T07:39:21Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T07:39:22Z [info] insomnia: status item after 1s: window {{1215, 870}, {48, 30}} button {{0, 0}, {32, 22}} host {{0, 0}, {32, 22}} fitting {32, 22} length 32.0
+2026-11-07T07:39:22Z [info] insomnia: status item after 1s: visible true alpha 1.0 occlusion 8194 screen Apple Virtual {{0, 0}, {1440, 900}} safe {0.0,0.0,0.0,0.0} button hidden false alpha 1.0 host hidden false alpha 1.0
+2026-11-07T07:39:27Z [info] insomnia: session end (quit)
+2026-11-07T07:39:27Z [info] insomnia: notify: Session restored - Insomnia quit. Sleep is back to normal.
+2026-11-07T07:39:27Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T07:39:27Z [info] insomnia: notification authorization denied
+Cirrus Labs, Inc., Running in background, launchctl, Not running in background, pfctl, Not running in background, sh, Not running in background, Xcode_27, Not running in background, 654, 570, 602, 401, 468, 264
+prior-test-config-moved-aside

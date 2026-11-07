@@ -1,0 +1,144 @@
+Sat Nov  7 22:31:17 UTC 2026
+Executable=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+Identifier=com.kgarg.insomnia
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20400 size=7307 flags=0x2(adhoc) hashes=222+3 location=embedded
+VersionPlatform=1
+VersionMin=1703936
+VersionSDK=1704960
+Hash type=sha256 size=32
+CandidateCDHash sha256=602acf9aa689105e02a2c211e4dd98c876b3097f
+CandidateCDHashFull sha256=602acf9aa689105e02a2c211e4dd98c876b3097fe8a4a57d6bc24285722f8d10
+Hash choices=sha256
+CMSDigest=602acf9aa689105e02a2c211e4dd98c876b3097fe8a4a57d6bc24285722f8d10
+CMSDigestType=2
+Executable Segment base=0
+Executable Segment limit=1507328
+Executable Segment flags=0x1
+Page size=16384
+CDHash=602acf9aa689105e02a2c211e4dd98c876b3097f
+Signature=adhoc
+Info.plist entries=20
+TeamIdentifier=not set
+Sealed Resources version=2 rules=13 files=2
+Internal requirements count=0 size=12
+Total signatures=1
+Chosen signature=1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.insomnia.backstop</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2&gt;&amp;1)" &amp;&amp; exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" &gt;&gt; "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1</string>
+		<string>sh</string>
+		<string>cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"</string>
+		<string>~/Applications/Insomnia.app</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>60</integer>
+</dict>
+</plist>
+gui/501/com.insomnia.backstop = {
+	active count = 0
+	path = ~/Library/LaunchAgents/.com.insomnia.backstop.staging/com.insomnia.backstop.candidate-1292.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1
+		sh
+		cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+		~/Applications/Insomnia.app
+	}
+
+	inherited environment = {
+		<inherited socket redacted>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.insomnia.backstop
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 0
+
+	resource coalition = {
+		ID = 1020
+		type = resource
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	jetsam coalition = {
+		ID = 1021
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+	job state = exited
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program | system service | tle system
+}
+app-not-running
+ SleepDisabled		0
+clean-journal=true; session-absent=true
+
+Relevant insomnia.log excerpt
+2026-11-07T22:24:12Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:24:12Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:24:49Z [info] insomnia: session end (quit)
+2026-11-07T22:24:49Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:24:49Z [info] insomnia: notification authorization denied
+2026-11-07T22:24:59Z [info] insomnia: launched, version 0.1.0 (1)
+2026-11-07T22:24:59Z [info] insomnia: reconcile: no session, nothing to restore
+2026-11-07T22:25:23Z [info] insomnia: session started until 2026-11-07T22:35:18Z (600s requested)
+2026-11-07T22:25:23Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:25:23Z [info] insomnia: notification authorization denied
+2026-11-07T22:25:23Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T22:25:23Z [info] insomnia: session command start 600 (1221-3971425971): done
+2026-11-07T22:25:36Z [info] insomnia: session end (user)
+2026-11-07T22:25:36Z [info] insomnia: session command end (1243-1793653074): done
+2026-11-07T22:25:41Z [info] insomnia: session started until 2026-11-07T22:35:36Z (600s requested)
+2026-11-07T22:25:41Z [info] insomnia: session command start 600 (1249-2641648410): done
+2026-11-07T22:26:09Z [info] insomnia: session end (user)
+2026-11-07T22:26:09Z [info] insomnia: session command end (1336-1292451316): done
+2026-11-07T22:26:23Z [info] insomnia: session started until 2026-11-07T22:28:18Z (120s requested)
+2026-11-07T22:26:23Z [info] insomnia: session command start 120 (1348-3135044078): done
+2026-11-07T22:28:45Z [info] backstop: session expired (endsAt=2026-11-07T22:28:18Z); restoring from journal
+2026-11-07T22:28:45Z [info] backstop: pmset -a disablesleep 0 ok
+2026-11-07T22:28:45Z [info] backstop: journal cleared
+2026-11-07T22:30:17Z [error] backstop agent: ~/Applications/Insomnia.app does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: ~/Applications/Insomnia.app: a sealed resource is missing or invalid
+
+Test temporary paths, expected none

@@ -1,0 +1,102 @@
+Sat Nov  7 22:27:15 UTC 2026
+ProductName:		macOS
+ProductVersion:		27.0.1
+BuildVersion:		26A434
+System Integrity Protection status: disabled.
+kern.bootsessionuuid: F0D6F15A-C1C9-4094-A42F-252A68557136
+app-not-running
+ SleepDisabled		1
+{
+  "appNapOverrides" : [
+
+  ],
+  "dockerFrozen" : false,
+  "frozenProcesses" : [
+
+  ],
+  "lowPowerSetByUs" : false,
+  "savedAudioOutputs" : [
+
+  ],
+  "sleepDisabledByUs" : true
+}{
+  "endsAt" : "2026-11-07T22:28:18Z",
+  "extensions" : [
+
+  ],
+  "startedAt" : "2026-11-07T22:26:18Z"
+}gui/501/com.insomnia.backstop = {
+	active count = 0
+	path = ~/Library/LaunchAgents/com.insomnia.backstop.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /bin/sh
+	arguments = {
+		/bin/sh
+		-c
+		r="$(/usr/bin/codesign --verify --strict "-R=$1" "$2" 2>&1)" && exec /bin/bash "$2/Contents/Resources/backstop.sh"; mkdir -p "$HOME/Library/Logs/Insomnia"; printf "%s [error] backstop agent: %s does not satisfy the pinned code requirement; backstop.sh not run. Reinstall Insomnia (scripts/install.sh). codesign: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" "$(printf %s "$r" | tr "\n" " ")" >> "$HOME/Library/Logs/Insomnia/insomnia.log"; exit 1
+		sh
+		cdhash H"602acf9aa689105e02a2c211e4dd98c876b3097f"
+		~/Applications/Insomnia.app
+	}
+
+	inherited environment = {
+		<inherited socket redacted>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.insomnia.backstop
+	}
+
+	LWCR = {
+		"reqs" => {
+			"signing-identifier" => "com.apple.sh"
+			"validation-category" => 1
+		}
+		"vers" => 1
+		"comp" => 1
+		"ccat" => 0
+	}
+
+	domain = gui/501 [100002]
+	asid = 100002
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 0
+
+	resource coalition = {
+		ID = 571
+		type = resource
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	jetsam coalition = {
+		ID = 572
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.insomnia.backstop
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	run interval = 60 seconds
+	sanitizer flags = 0x0
+
+	properties = runatload | inferred program | system service | managed LWCR | has LWCR | tle system
+}
+Cirrus Labs, Inc., Running in background, launchctl, Not running in background, pfctl, Not running in background, sh, Not running in background, Xcode_27, Not running in background, 654, 570, 602, 401, 468, 264
