@@ -363,4 +363,88 @@ final class SessionScreenAwakeTests: XCTestCase {
         XCTAssertTrue(m.screenAwakeHeld)
         XCTAssertEqual(relaunched.created, [ScreenAwake.assertionName])
     }
+
+    /// The Settings toggle takes the hold while a relaunch resumes the
+    /// session, and the resume then stops at a `sudo pmset` that ignores
+    /// SIGTERM. The session goes, and the hold goes with it.
+    func testAHoldTakenDuringAResumeThatStopsAtALiveCommandIsReleased() async throws {
+        let first = make()
+        try h.store.saveConfig(first.config)
+        await first.start(duration: 3600)
+        let relaunched = FakeDisplayAssertions()
+        let m = h.makeManager(displayAssertions: relaunched)
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
+        h.guardFake.stillRunning = ["disablesleep 1"]
+
+        let reconcile = Task { await m.reconcile() }
+        await gate.waitUntilStarted()
+        m.syncScreenAwake()
+        XCTAssertTrue(m.screenAwakeHeld, "the toggle holds while the resumed session is active")
+        await gate.open()
+        await reconcile.value
+
+        XCTAssertNil(m.session)
+        XCTAssertFalse(m.screenAwakeHeld, "the hold outlived the session it was taken for")
+        XCTAssertEqual(relaunched.released, [41])
+
+        h.guardFake.stillRunning = []
+        h.guardFake.exitStuckCommands()
+        let deadline = Date().addingTimeInterval(5)
+        while m.pendingEnd != nil, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(m.pendingEnd, "the end owed for the stopped resume never ran")
+    }
+
+    /// macOS refuses the hold at the start: the menu says the display can
+    /// still sleep, and the next sync that holds takes the line down.
+    func testARefusedHoldIsShownInTheMenuAndRetried() async {
+        let m = make()
+        fake.failCreate = true
+
+        await m.start(duration: 3600)
+
+        XCTAssertNotNil(m.session)
+        XCTAssertFalse(m.screenAwakeHeld)
+        XCTAssertTrue(m.lastError?.contains("could not hold the display on") == true, m.lastError ?? "")
+
+        fake.failCreate = false
+        m.syncScreenAwake()
+
+        XCTAssertTrue(m.screenAwakeHeld)
+        XCTAssertNil(m.lastError, "the menu line goes once the hold is taken")
+    }
+
+    /// An extension whose timeout move macOS refuses says so in the menu.
+    /// The hold stays at the old deadline, and the next sync moves it.
+    func testARefusedMoveOnAnExtensionIsShownInTheMenu() async {
+        let m = make()
+        await m.start(duration: 3600)
+        fake.failRenew = true
+
+        await m.extend(by: 1800)
+
+        XCTAssertTrue(m.screenAwakeHeld)
+        XCTAssertTrue(m.lastError?.contains("could not hold the display on") == true, m.lastError ?? "")
+
+        fake.failRenew = false
+        m.syncScreenAwake()
+
+        XCTAssertEqual(fake.renewed, [41: [5400]])
+        XCTAssertNil(m.lastError, "the menu line goes once the timeout moves")
+    }
+
+    /// The session ends while the hold line is up: the release takes the
+    /// line down with it.
+    func testAnEndTakesDownTheRefusedHoldLine() async {
+        let m = make()
+        fake.failCreate = true
+        await m.start(duration: 3600)
+        XCTAssertNotNil(m.lastError)
+
+        await m.end(reason: .user)
+
+        XCTAssertNil(m.lastError)
+    }
 }

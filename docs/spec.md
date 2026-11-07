@@ -132,8 +132,11 @@ recovery; newly written journals use `frozenProcesses`.
   request releases it before the recovery lock or the journal can refuse
   the end, so a refused end never keeps the screen unlocked past the
   deadline. A release macOS refuses keeps the hold and says so in the
-  menu; quitting Insomnia releases it. The assertion also times out at the
-  session's deadline (`TimeoutActionTurnOff`), and an extension moves the
+  menu; quitting Insomnia releases it. A hold or a timeout move macOS
+  refuses says so in the menu too, and turning the toggle off and on
+  tries again. A resume at launch that stops at a `sudo pmset` still
+  running drops the session and any hold the toggle took meanwhile. The
+  assertion also times out at the session's deadline (`TimeoutActionTurnOff`), and an extension moves the
   timeout, so an app that hangs can't keep the screen unlocked past the
   deadline while the backstop restores sleep. No
   root, no journal entry: the assertion belongs to the process, so macOS

@@ -677,22 +677,32 @@ final class SessionManager {
     /// and releases it otherwise. The hold times out at the session's
     /// deadline, so a hung process can't keep the screen unlocked past it,
     /// and each new deadline moves the timeout. Settings calls it when the
-    /// toggle changes. A release macOS refuses stays held and goes to the
-    /// menu; quitting Insomnia releases it, since the assertion belongs to
-    /// the process. Once the hold matches again, that menu line goes if it
-    /// is still the line shown; a newer failure of anything else stays.
+    /// toggle changes. A hold or a move of its timeout that macOS refuses
+    /// goes to the menu, and so does a refused release, which stays held;
+    /// quitting Insomnia releases it, since the assertion belongs to the
+    /// process. Once the hold matches again, that menu line goes if it is
+    /// still the line shown; a newer failure of anything else stays.
     func syncScreenAwake() {
         if isActive, config.keepScreenAwake, !endRequestedSinceStart, let endsAt = session?.endsAt {
-            if screenAwake.hold(until: endsAt, now: clock()), lastError == Self.screenAwakeReleaseFailure {
-                lastError = nil
+            if screenAwake.hold(until: endsAt, now: clock()) {
+                clearScreenAwakeFailure()
+            } else {
+                fail(Self.screenAwakeHoldFailure)
             }
         } else if screenAwake.release() {
-            if lastError == Self.screenAwakeReleaseFailure { lastError = nil }
+            clearScreenAwakeFailure()
         } else {
             fail(Self.screenAwakeReleaseFailure)
         }
     }
 
+    private func clearScreenAwakeFailure() {
+        if lastError == Self.screenAwakeHoldFailure || lastError == Self.screenAwakeReleaseFailure {
+            lastError = nil
+        }
+    }
+
+    private static let screenAwakeHoldFailure = "could not hold the display on until the session ends, so the display can sleep and lock the screen; turn \"Keep the screen on and unlocked\" off and on in Settings to try again"
     private static let screenAwakeReleaseFailure = "could not release the display hold, so the display stays on and the screen does not lock on its own; quit Insomnia to release it"
 
     // MARK: Lifecycle queue
@@ -2683,8 +2693,11 @@ final class SessionManager {
                 lastError = nil
             } catch let still as CommandStillRunningError {
                 // Not surfaced: the session file and journal stay for the end
-                // that runs once the command has exited.
+                // that runs once the command has exited. A display hold that
+                // the Settings toggle took during the awaits above goes with
+                // the session.
                 session = nil
+                syncScreenAwake()
                 stopTransaction(for: still, thenEnd: .recoveryUnavailable)
                 return
             } catch {
