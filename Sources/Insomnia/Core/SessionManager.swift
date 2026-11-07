@@ -10,6 +10,7 @@ enum EndReason: String, Sendable {
     /// while on battery: the end floor could not be applied.
     case batteryUnreadable
     case thermalCritical
+    case thermalSeriousClosedLid
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
     /// agent, journal, or hold sleep for it, so it ended the session instead
@@ -3199,6 +3200,7 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
+        case .thermalSeriousClosedLid: "The Mac became hot with the lid closed. Sleep is back to normal. Let it cool on a ventilated surface."
         case .backstop: outputsWaiting
             ? "A previous session left changes behind. Sleep is back to normal."
             : "A previous session left changes behind; everything has been undone."

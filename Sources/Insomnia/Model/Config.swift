@@ -60,6 +60,9 @@ struct Config: Codable, Equatable, Sendable {
     /// `setLowPowerFloor` and `normalizeFloors`.
     var endFloor: Int = 10
     var thermalRules: Bool = true
+    /// End a closed-lid session at serious thermal pressure instead of
+    /// waiting for critical. Independent of the open-lid thermal rules.
+    var endClosedLidWhenHot: Bool = true
 
     // Network failover
     var hotspotSSID: String = ""
@@ -165,6 +168,7 @@ struct Config: Codable, Equatable, Sendable {
         lowPowerFloor = try c.decodeIfPresent(Int.self, forKey: .lowPowerFloor) ?? d.lowPowerFloor
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
+        endClosedLidWhenHot = try c.decodeIfPresent(Bool.self, forKey: .endClosedLidWhenHot) ?? d.endClosedLidWhenHot
         hotspotSSID = try c.decodeIfPresent(String.self, forKey: .hotspotSSID) ?? d.hotspotSSID
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets

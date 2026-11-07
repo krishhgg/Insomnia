@@ -252,6 +252,10 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("Thermal rules (Low Power Mode when hot, end when critical)", isOn: bind(\.thermalRules))
+            Toggle("End closed-lid sessions when hot", isOn: bind(\.endClosedLidWhenHot))
+            Text("Ends at serious thermal pressure, before critical. Keep the Mac on a ventilated surface; these rules cannot make running in a bag safe.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

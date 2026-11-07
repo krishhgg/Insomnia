@@ -22,7 +22,8 @@ enum FloorRules {
     /// - battery below `endFloor` while not charging: end session. 0 never
     ///   matches, so 0 turns the battery end off; Config keeps a non-zero
     ///   `endFloor` below `lowPowerFloor`.
-    /// - thermal `critical` (if `thermalRules`): end session
+    /// - thermal `critical` (if either applicable thermal rule): end session
+    /// - lid closed and thermal `serious` (if `endClosedLidWhenHot`): end
     /// - battery present but unreadable on two consecutive reads while not
     ///   charging, with an end floor set: end session. The floor cannot be
     ///   applied to a level nobody can read, and the Mac is on a battery
@@ -45,8 +46,12 @@ enum FloorRules {
         if let p = percent, onBattery, p < config.endFloor {
             return [.endSession(.batteryFloor)]
         }
-        if config.thermalRules, thermal == .critical {
+        let closedLidThermalRule = lidClosed && config.endClosedLidWhenHot
+        if config.thermalRules || closedLidThermalRule, thermal == .critical {
             return [.endSession(.thermalCritical)]
+        }
+        if closedLidThermalRule, thermal == .serious {
+            return [.endSession(.thermalSeriousClosedLid)]
         }
         if case let .unreadable(misses) = battery, onBattery, misses >= 2, config.endFloor > 0 {
             return [.endSession(.batteryUnreadable)]

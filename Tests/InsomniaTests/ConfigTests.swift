@@ -34,6 +34,7 @@ final class ConfigTests: XCTestCase {
         XCTAssertFalse(c.freezeAllApps, "freeze-all is opt in")
         XCTAssertTrue(c.lowPowerOnLidClose)
         XCTAssertTrue(c.thermalRules)
+        XCTAssertTrue(c.endClosedLidWhenHot)
         XCTAssertFalse(c.disableAppNapForAgents, "writing other apps' preferences is opt-in")
         XCTAssertEqual(c.hotspotSSID, "")
         XCTAssertEqual(c.tmuxTargets, [])
@@ -57,6 +58,14 @@ final class ConfigTests: XCTestCase {
     }
 
     // MARK: Battery floors
+
+    func testClosedLidThermalRuleDefaultsOnForOlderConfigsAndHonorsOptOut() throws {
+        let old = try Store.makeDecoder().decode(Config.self, from: Data(#"{"thermalRules":false}"#.utf8))
+        XCTAssertTrue(old.endClosedLidWhenHot)
+        let off = try Store.makeDecoder().decode(Config.self, from: Data(#"{"endClosedLidWhenHot":false}"#.utf8))
+        XCTAssertFalse(off.endClosedLidWhenHot)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: Store.makeEncoder().encode(off)), off)
+    }
 
     func testDefaultFloorsAreOrdered() {
         XCTAssertTrue(Config().floorsAreOrdered)
