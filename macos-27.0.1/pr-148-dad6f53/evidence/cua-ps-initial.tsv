@@ -1,0 +1,13 @@
+PID	PPID	STAT	USER	COMM	ARGS
+87478	1	S	<user>	/Applications/Cu	/Applications/Cua Spaces.app/Contents/MacOS/CuaSpacesMac
+87483	1	Ss	<user>	/System/Library/	/System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService
+87485	1	S	<user>	CuaSpacesMac	CuaSpacesMac --driver-helper run
+87488	87485	S	<user>	/Applications/Cu	/Applications/Cua Spaces.app/Contents/Helpers/cua-driver serve --embedded --parent-liveness-stdio --no-permissions-gate --socket ~/.cua/run/cua-driver.sock --host-bundle-id com.trycua.spaces.macos --permission-mode standard
+87490	1	Ss	<user>	/System/Library/	/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU
+87495	1	Ss	<user>	/System/Library/	/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent
+87498	1	Ss	<user>	/System/Library/	/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking
+87502	1	S	<user>	/Applications/Cu	/Applications/Cua Spaces.app/Contents/MacOS/cua daemon start --foreground --loopback <local-endpoint>
+87522	1	Ss	<user>	/System/Library/	/System/Library/Frameworks/AudioToolbox.framework/XPCServices/com.apple.audio.SandboxHelper.xpc/Contents/MacOS/com.apple.audio.SandboxHelper
+87524	1	Ss	<user>	/System/Library/	/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
+87582	1	Ss	<user>	/System/Library/	/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService
+87583	1	Ss	<user>	/System/Library/	/System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/XPCServices/SetStoreUpdateService.xpc/Contents/MacOS/SetStoreUpdateService

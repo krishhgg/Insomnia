@@ -1,0 +1,79 @@
+[
+  {
+    "case": "c1",
+    "samples": 25,
+    "cua_pids": [
+      87478,
+      87483,
+      87490,
+      87495,
+      87498,
+      87502,
+      87522,
+      87524,
+      87582,
+      87583
+    ],
+    "standin_pid": 88006,
+    "stopped_sample_counts": {
+      "88006": 25
+    },
+    "first_sample_seconds": 2.024,
+    "last_sample_seconds": 50.018,
+    "resume_lines": [
+      "2026-11-07T07:32:24Z [info] insomnia: resumed 1 frozen pid(s); 0 gone, 0 failed, 0 unverifiable, 0 unobserved"
+    ]
+  },
+  {
+    "case": "c2",
+    "samples": 25,
+    "cua_pids": [
+      87478,
+      87483,
+      87490,
+      87495,
+      87498,
+      87502,
+      87522,
+      87524,
+      87582,
+      87583
+    ],
+    "standin_pid": 88006,
+    "stopped_sample_counts": {
+      "87478": 25,
+      "88006": 25
+    },
+    "first_sample_seconds": 2.017,
+    "last_sample_seconds": 50.016,
+    "resume_lines": [
+      "2026-11-07T07:36:16Z [info] insomnia: resumed 2 frozen pid(s); 0 gone, 0 failed, 0 unverifiable, 0 unobserved"
+    ]
+  },
+  {
+    "case": "c3",
+    "samples": 25,
+    "cua_pids": [
+      87478,
+      87483,
+      87490,
+      87495,
+      87498,
+      87502,
+      87522,
+      87524,
+      87582,
+      87583
+    ],
+    "standin_pid": 88006,
+    "stopped_sample_counts": {
+      "87478": 25,
+      "88006": 25
+    },
+    "first_sample_seconds": 2.019,
+    "last_sample_seconds": 50.025,
+    "resume_lines": [
+      "2026-11-07T07:38:41Z [info] insomnia: resumed 2 frozen pid(s); 0 gone, 0 failed, 0 unverifiable, 0 unobserved"
+    ]
+  }
+]

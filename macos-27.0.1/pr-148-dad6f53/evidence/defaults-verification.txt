@@ -1,0 +1,5 @@
+The final app-written config was compared as parsed JSON with the defaults written before testing. The dictionaries were equal.
+freezeAllApps=false
+freezeList=[com.tinyspeck.slackmacgap, net.whatsapp.WhatsApp, com.hnc.Discord]
+defaultPreset=14400
+No session was running. SleepDisabled=0.

@@ -1,0 +1,7 @@
+VM work folder removed
+Cua app removed
+Cua data removed
+Session absent
+ SleepDisabled		0
+CDHash=10e7c10d4a8d46bda875b8555bb173406ffa368f
+  PID STAT COMM

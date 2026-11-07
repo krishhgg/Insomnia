@@ -1,0 +1,6 @@
+2026-11-07T07:39:29Z
+Identifier=com.kgarg.insomnia
+CDHash=10e7c10d4a8d46bda875b8555bb173406ffa368f
+Session file absent
+ SleepDisabled		0
+  PID STAT COMM

@@ -1,0 +1,14 @@
+{
+  "appNapOverrides" : [
+
+  ],
+  "dockerFrozen" : false,
+  "frozenProcesses" : [
+
+  ],
+  "lowPowerSetByUs" : false,
+  "savedAudioOutputs" : [
+
+  ],
+  "sleepDisabledByUs" : true
+}

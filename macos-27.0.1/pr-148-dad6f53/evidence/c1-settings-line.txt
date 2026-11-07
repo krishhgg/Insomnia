@@ -1,0 +1,2 @@
+menu item Settings… of menu 1 of menu bar item 1 of menu bar 2 of application process Insomnia
+Would freeze now: Standin Other	490 387 187 15

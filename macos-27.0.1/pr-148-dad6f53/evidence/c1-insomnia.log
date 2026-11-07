@@ -1,0 +1,32 @@
+2026-11-07T07:31:10Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-07T07:31:15Z [info] insomnia: session started until 2026-11-07T08:31:10Z (3600s requested)
+2026-11-07T07:31:15Z [info] insomnia: lid observer started (lid open)
+2026-11-07T07:31:15Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T07:31:15Z [info] insomnia: notification authorization denied
+2026-11-07T07:31:15Z [info] insomnia: power monitor started (battery n/a (no battery), on battery, thermal nominal)
+2026-11-07T07:31:15Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-07T07:31:15Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-07T07:31:15Z [info] insomnia: network failover started (wifi unresolved)
+2026-11-07T07:31:15Z [info] insomnia: wifi path unsatisfied
+2026-11-07T07:31:20Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:31:24Z [info] insomnia: lid SIMULATED closed (file trigger)
+2026-11-07T07:31:24Z [error] insomnia: display darken on lid close skipped: display 1 cannot change brightness
+2026-11-07T07:31:24Z [info] insomnia: no built-in keyboard backlight; skipped
+2026-11-07T07:31:24Z [info] insomnia: display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open
+2026-11-07T07:31:24Z [info] insomnia: muted AVIODevice (was volume 1.0, muted false)
+2026-11-07T07:31:24Z [info] insomnia: freeze-all: automatic candidates: Standin Other
+2026-11-07T07:31:24Z [info] insomnia: froze Standin Other (1 pid(s), 0 skipped)
+2026-11-07T07:31:24Z [error] insomnia: could not read low power mode; not enabling it: `pmset -g custom` failed with status 0: no lowpowermode or powermode line under Battery Power
+2026-11-07T07:31:25Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:31:35Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:31:55Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:32:24Z [info] insomnia: lid SIMULATED open (file trigger)
+2026-11-07T07:32:24Z [info] insomnia: resumed 1 frozen pid(s); 0 gone, 0 failed, 0 unverifiable, 0 unobserved
+2026-11-07T07:32:24Z [info] insomnia: audio restored on Apple Virtual Sound Device (volume 1.0, muted false)
+2026-11-07T07:32:25Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:33:25Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:33:55Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:34:25Z [info] insomnia: hotspot join skipped: no hotspotSSID configured
+2026-11-07T07:34:34Z [info] insomnia: session end (quit)
+2026-11-07T07:34:34Z [info] insomnia: sleep restored
+2026-11-07T07:34:34Z [info] insomnia: notify: Session ended - Insomnia quit. Sleep is back to normal.

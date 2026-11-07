@@ -1,0 +1,3 @@
+2b47c77d5041f4839ebe51e25fcbf768bd2edb10adc96dc108e6a0d521c35e3e  cua-spaces-0.22.0-darwin-universal.dmg
+66f0f817d26f6be4a0d7be9af78516d66da9d95d651d80dba84c1d47b15bd347  Insomnia-dad6f537-lidsim.zip
+420f10a679c20e744be3624b791e8c739dbb558b377a1bfd161a62c282220e7e  Insomnia-b8e7e20d-lidsim.zip

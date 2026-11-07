@@ -1,0 +1,34 @@
+ZIP SHA-256 66f0f817d26f6be4a0d7be9af78516d66da9d95d651d80dba84c1d47b15bd347
+
+==> Checking the prebuilt bundle ~/cua148-work/builds/head/unzip/Insomnia.app
+WARNING: the origin of Insomnia 0.1.0 is not verified. Its signature shows the bundle is intact, not who made it.
+--allow-unverified-origin: installing it anyway. Its backstop.sh will run as you at login and every 60 s.
+Continue only if you checked the zip yourself with SHA256SUMS and 'gh attestation verify' (README, Install).
+Releases are not notarized, so macOS blocks the first launch of a downloaded one until you allow it in System Settings > Privacy & Security.
+
+==> Writing /etc/sudoers.d/insomnia (requires your password once)
+sudoers rule verified
+
+==> Staging Insomnia.app
+signed Identifier=com.kgarg.insomnia
+TeamIdentifier=not set
+LaunchAgent will require: cdhash H"e5f3a2706bfc324fa773c698ad2604b379069d9c"
+
+==> Creating ~/Library/Application Support/Insomnia, ~/Library/Logs/Insomnia and ~/Library/LaunchAgents
+
+==> Taking the recovery lock
+
+==> Ending any stale session and checking the recovery journal
+
+==> Installing LaunchAgent com.insomnia.backstop
+LaunchAgent com.insomnia.backstop loaded (launchctl print confirms); ~/Library/LaunchAgents/com.insomnia.backstop.plist published
+replaced the previous ~/Applications/Insomnia.app
+
+==> Installed
+Next steps:
+  1. Launch:            open ~/Applications/Insomnia.app
+  2. Optional:          System Settings > Wi-Fi > Ask to join hotspots: Automatically
+  3. Config lives at:   ~/Library/Application Support/Insomnia/config.json
+  4. Logs:              ~/Library/Logs/Insomnia/insomnia.log
+  5. Uninstall:         ~/cua148-work/builds/head/src/scripts/uninstall.sh
+Installed CDHash 

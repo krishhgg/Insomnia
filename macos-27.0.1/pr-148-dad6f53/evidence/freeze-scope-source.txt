@@ -1,0 +1,23 @@
+Head dad6f5376f168e2ac8ffc8c6791e74091560aeaa
+        "com.trycua.spaces.macos",          // Cua Spaces (installed)
+    ]).union(meetingApps)
+
+    static func automaticCandidates(config: Config, apps: [RunningApp], selfBundleId: String = Paths.bundleIdentifier) -> [RunningApp] {
+        guard config.freezeAllApps else { return [] }
+        let explicit = Set(config.freezeList)
+        var seen: Set<String> = []
+        var out: [RunningApp] = []
+        for app in apps where app.activationPolicy == .regular {
+            guard let id = app.bundleId, !seen.contains(id), !explicit.contains(id) else { continue }
+            guard !isDenied(id, config: config, selfBundleId: selfBundleId), !isBuiltInProtected(id) else { continue }
+            seen.insert(id)
+            out.append(app)
+        }
+        return out.sorted {
+            switch $0.name.localizedCaseInsensitiveCompare($1.name) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame: return ($0.bundleId ?? "") < ($1.bundleId ?? "")
+            }
+        }
+    }

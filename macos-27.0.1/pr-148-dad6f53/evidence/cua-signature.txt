@@ -1,0 +1,97 @@
+Executable=/Applications/Cua Spaces.app/Contents/MacOS/CuaSpacesMac
+Identifier=com.trycua.spaces.macos
+Format=app bundle with Mach-O universal (x86_64 arm64)
+CodeDirectory v=20500 size=30787 flags=0x10000(runtime) hashes=951+7 location=embedded
+Signature size=9045
+Authority=Developer ID Application: Cua AI, Inc. (YCK386LBJ7)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=7. Nov 2026 at 02:19:03
+Notarization Ticket=stapled
+Info.plist entries=25
+TeamIdentifier=YCK386LBJ7
+Runtime Version=26.5.0
+Sealed Resources version=2 rules=13 files=314
+Internal requirements count=1 size=184
+Total signatures=1
+Chosen signature=1
+--prepared:/Applications/Cua Spaces.app/Contents/MacOS/cua-vz
+--validated:/Applications/Cua Spaces.app/Contents/MacOS/cua-vz
+--prepared:/Applications/Cua Spaces.app/Contents/MacOS/cua-netgw
+--validated:/Applications/Cua Spaces.app/Contents/MacOS/cua-netgw
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/.
+--prepared:/Applications/Cua Spaces.app/Contents/Helpers/cua-cursor-theme
+--validated:/Applications/Cua Spaces.app/Contents/Helpers/cua-cursor-theme
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Updater.app
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Updater.app
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Downloader.xpc
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Downloader.xpc
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Installer.xpc
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Installer.xpc
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/.
+--prepared:/Applications/Cua Spaces.app/Contents/MacOS/cua
+--validated:/Applications/Cua Spaces.app/Contents/MacOS/cua
+--prepared:/Applications/Cua Spaces.app/Contents/Helpers/cua-driver
+--validated:/Applications/Cua Spaces.app/Contents/Helpers/cua-driver
+--prepared:/Applications/Cua Spaces.app/Contents/Helpers/cua-spacesd
+--validated:/Applications/Cua Spaces.app/Contents/Helpers/cua-spacesd
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/libcua_sdk.dylib
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/libcua_sdk.dylib
+/Applications/Cua Spaces.app: resource fork, Finder information, or similar detritus not allowed
+file with invalid attached data: Disallowed xattr com.apple.FinderInfo found on /Applications/Cua Spaces.app
+/Applications/Cua Spaces.app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: Cua AI, Inc. (YCK386LBJ7)
+
+Executable=/Applications/Cua Spaces.app/Contents/MacOS/CuaSpacesMac
+Identifier=com.trycua.spaces.macos
+Format=app bundle with Mach-O universal (x86_64 arm64)
+CodeDirectory v=20500 size=30787 flags=0x10000(runtime) hashes=951+7 location=embedded
+Hash type=sha256 size=32
+CandidateCDHash sha256=7807b6a67fd4e369e075e9354f5569a795a10619
+CandidateCDHashFull sha256=7807b6a67fd4e369e075e9354f5569a795a10619c36a11167d37618c77c38865
+Hash choices=sha256
+CMSDigest=7807b6a67fd4e369e075e9354f5569a795a10619c36a11167d37618c77c38865
+CMSDigestType=2
+CDHash=7807b6a67fd4e369e075e9354f5569a795a10619
+Signature size=9045
+Authority=Developer ID Application: Cua AI, Inc. (YCK386LBJ7)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+Timestamp=7. Nov 2026 at 02:19:03
+Notarization Ticket=stapled
+Info.plist entries=25
+TeamIdentifier=YCK386LBJ7
+Runtime Version=26.5.0
+Sealed Resources version=2 rules=13 files=314
+Internal requirements count=1 size=184
+Total signatures=1
+Chosen signature=1
+--prepared:/Applications/Cua Spaces.app/Contents/MacOS/cua-vz
+--validated:/Applications/Cua Spaces.app/Contents/MacOS/cua-vz
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/.
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Updater.app
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/Updater.app
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Downloader.xpc
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Installer.xpc
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Downloader.xpc
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Installer.xpc
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/Sparkle.framework/Versions/Current/.
+--prepared:/Applications/Cua Spaces.app/Contents/Helpers/cua-cursor-theme
+--validated:/Applications/Cua Spaces.app/Contents/Helpers/cua-cursor-theme
+--prepared:/Applications/Cua Spaces.app/Contents/MacOS/cua-netgw
+--validated:/Applications/Cua Spaces.app/Contents/MacOS/cua-netgw
+--prepared:/Applications/Cua Spaces.app/Contents/Helpers/cua-driver
+--validated:/Applications/Cua Spaces.app/Contents/Helpers/cua-driver
+--prepared:/Applications/Cua Spaces.app/Contents/Helpers/cua-spacesd
+--validated:/Applications/Cua Spaces.app/Contents/Helpers/cua-spacesd
+--prepared:/Applications/Cua Spaces.app/Contents/Frameworks/libcua_sdk.dylib
+--validated:/Applications/Cua Spaces.app/Contents/Frameworks/libcua_sdk.dylib
+--prepared:/Applications/Cua Spaces.app/Contents/MacOS/cua
+--validated:/Applications/Cua Spaces.app/Contents/MacOS/cua
+/Applications/Cua Spaces.app: valid on disk
+/Applications/Cua Spaces.app: satisfies its Designated Requirement

@@ -1,0 +1,44 @@
+49) "Cua Spaces" ASN:0x0-0xb33b33: (in front) 
+    bundleID="com.trycua.spaces.macos"
+    bundle path="/Applications/Cua Spaces.app"
+    executable path="/Applications/Cua Spaces.app/Contents/MacOS/CuaSpacesMac"
+    pid = 87478 token=[sess=100002 pid=87478 uid:501,501,501 g:20,20 pV:666074] type="Foreground" flavor=2 Version="0.22.0.144" fileType="APPL" creator="????" Arch=ARM64 
+    coalition: 5814  { 87478 87483 87490 87495 87498 87502 87522 87524 87582 87583 }
+    launch time =  79 seconds ago, 2026/11/07 07:24:04 ( 1 minutes, 18.9726 seconds ago )
+    checkin time = 79 seconds ago, 2026/11/07 07:24:04 ( 1 minutes, 18.7329 seconds ago )
+    launch to checkin time: 0.239696 seconds
+
+50) "cua-driver" ASN:0x0-0xb34b34: 
+    bundleID=[ NULL ] 
+    bundle path="/Applications/Cua Spaces.app/Contents/Helpers/cua-driver"
+    executable path="/Applications/Cua Spaces.app/Contents/Helpers/cua-driver"
+    pid = 87488 token=[sess=100002 pid=87488 uid:501,501,501 g:20,20 pV:666097] type="UIElement" flavor=3 Version=[ NULL ]  fileType="????" creator="????" Arch=ARM64 
+    checkin time = 78 seconds ago, 2026/11/07 07:24:05 ( 1 minutes, 18.1137 seconds ago )
+
+51) "Cua Spaces Networking" ASN:0x0-0xb35b35: 
+    bundleID="com.apple.WebKit.Networking"
+    bundle path="/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc"
+    executable path="/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking"
+    pid = 87498 token=[sess=100002 pid=87498 uid:501,501,501 g:20,20 pV:666121] !cgsConnection !signalled type="UIElement" flavor=[ NULL ]  Version="22625.1.29.11.28" fileType="XPC!" creator="????" Arch=ARM64 sandboxed 
+    checkin time = 78 seconds ago, 2026/11/07 07:24:05 ( 1 minutes, 17.9303 seconds ago )
+
+52) "Cua Spaces Graphics and Media" ASN:0x0-0xb36b36: 
+    bundleID="com.apple.WebKit.GPU"
+    bundle path="/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc"
+    executable path="/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"
+    pid = 87490 token=[sess=100002 pid=87490 uid:501,501,501 g:20,20 pV:666102] !cgsConnection !signalled type="UIElement" flavor=[ NULL ]  Version="22625.1.29.11.28" fileType="XPC!" creator="????" Arch=ARM64 sandboxed 
+    checkin time = 78 seconds ago, 2026/11/07 07:24:05 ( 1 minutes, 17.8575 seconds ago )
+
+53) "Cua Spaces Web Content" ASN:0x0-0xb37b37: 
+    bundleID="com.apple.WebKit.WebContent"
+    bundle path=[ NULL ] 
+    executable path="com.apple.WebKit.WebContent"
+    pid = 87495 token=[sess=100002 pid=87495 uid:501,501,501 g:20,20 pV:666114] !cgsConnection !signalled type="UIElement" flavor=[ NULL ]  Version="22625.1.29.11.28" fileType="XPC!" creator="????" Arch=ARM64 
+    checkin time = 78 seconds ago, 2026/11/07 07:24:06 ( 1 minutes, 17.6506 seconds ago )
+
+56) "ThemeWidgetControlViewService (Cua Spaces)" ASN:0x0-0xb3cb3c: 
+    bundleID="com.apple.appkit.xpc.ThemeWidgetControlViewService"
+    bundle path="/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc"
+    executable path="/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/ThemeWidgetControlViewService.xpc/Contents/MacOS/ThemeWidgetControlViewService"
+    pid = 87582 token=[sess=100002 pid=87582 uid:501,501,501 g:20,20 pV:666309] type="BackgroundOnly" flavor=2 Version="1" fileType="XPC!" creator="????" Arch=ARM64 
+    checkin time = 71 seconds ago, 2026/11/07 07:24:12 ( 1 minutes, 11.1392 seconds ago )
