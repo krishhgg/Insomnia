@@ -1856,8 +1856,12 @@ final class SessionManager {
             do {
                 let now = try audio.read(deviceUID: entry.deviceUID)
                 if now.muted != false {
-                    try audio.apply(volume: entry.volume, muted: entry.muted, deviceUID: entry.deviceUID)
-                    Log.info("audio restored on \(device) (volume \(volumeText(entry.volume)), muted \(entry.muted))")
+                    // A device with no volume control gets no volume write,
+                    // whatever the entry says: a build without `noVolume`
+                    // that rewrote the journal left its placeholder 0.
+                    let volume = now.volume == nil ? nil : entry.volume
+                    try audio.apply(volume: volume, muted: entry.muted, deviceUID: entry.deviceUID)
+                    Log.info("audio restored on \(device) (volume \(volumeText(volume)), muted \(entry.muted))")
                 } else {
                     Log.info("audio: \(device) was unmuted after the lid close; left at volume \(volumeText(now.volume)), the saved volume \(volumeText(entry.volume)) is dropped")
                 }

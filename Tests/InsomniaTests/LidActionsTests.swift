@@ -1740,6 +1740,30 @@ final class LidActionsTests: XCTestCase {
         XCTAssertNil(m.lastError)
     }
 
+    /// An older build rewrote the journal after the close. It doesn't know
+    /// `noVolume`, so the entry came back as volume 0 with no flag. The
+    /// device still has no volume, so the open sets only its mute.
+    func testAnEntryAnOlderBuildRewroteStillRestoresAnOutputWithoutVolume() async throws {
+        let (m, actions) = await make()
+        h.audio.connect("LG-HDMI", name: "LG UltraGear", volume: nil)
+        await m.start(duration: 3600)
+        await actions.onClose()
+        var st = try XCTUnwrap(try h.store.loadState())
+        st.savedAudioOutputs = st.savedAudioOutputs.map {
+            SavedAudioOutput(deviceUID: $0.deviceUID, name: $0.name, volume: 0, muted: $0.muted, saveID: $0.saveID)
+        }
+        try h.store.saveState(st)
+        let raw = try String(contentsOf: h.home.paths.stateFile, encoding: .utf8)
+        XCTAssertFalse(raw.contains("noVolume"), raw)
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.audio.device("LG-HDMI")?.muted, false)
+        XCTAssertNil(h.audio.device("LG-HDMI")?.volume ?? nil, "no volume was written")
+        XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
+        XCTAssertNil(m.lastError)
+    }
+
     /// A mute that cannot be set at lid open (the device still waking, or
     /// held by another app) fails the restore: the entry stays for a retry
     /// instead of being cleared with the device still muted.
