@@ -680,26 +680,38 @@ final class SessionManager {
     /// toggle changes. A hold or a move of its timeout that macOS refuses
     /// goes to the menu, and so does a refused release, which stays held;
     /// quitting Insomnia releases it, since the assertion belongs to the
-    /// process. Once the hold matches again, that menu line goes if it is
-    /// still the line shown; a newer failure of anything else stays.
+    /// process. A retry that fails the same way leaves a newer line about
+    /// anything else in place. Once the hold matches again, that menu line
+    /// goes if it is still the line shown; a newer failure stays.
     func syncScreenAwake() {
         if isActive, config.keepScreenAwake, !endRequestedSinceStart, let endsAt = session?.endsAt {
             if screenAwake.hold(until: endsAt, now: clock()) {
                 clearScreenAwakeFailure()
             } else {
-                fail(Self.screenAwakeHoldFailure)
+                reportScreenAwakeFailure(Self.screenAwakeHoldFailure)
             }
         } else if screenAwake.release() {
             clearScreenAwakeFailure()
         } else {
-            fail(Self.screenAwakeReleaseFailure)
+            reportScreenAwakeFailure(Self.screenAwakeReleaseFailure)
         }
     }
 
+    /// The screen awake failure last put in the menu, until a hold or a
+    /// release works again.
+    @ObservationIgnored private var screenAwakeFailure: String?
+
+    /// Shows `message` unless it is the failure already reported and the
+    /// menu now shows something else, which came after it.
+    private func reportScreenAwakeFailure(_ message: String) {
+        if screenAwakeFailure == message, lastError != nil { return }
+        screenAwakeFailure = message
+        fail(message)
+    }
+
     private func clearScreenAwakeFailure() {
-        if lastError == Self.screenAwakeHoldFailure || lastError == Self.screenAwakeReleaseFailure {
-            lastError = nil
-        }
+        if let shown = screenAwakeFailure, lastError == shown { lastError = nil }
+        screenAwakeFailure = nil
     }
 
     private static let screenAwakeHoldFailure = "could not hold the display on until the session ends, so the display can sleep and lock the screen; turn \"Keep the screen on and unlocked\" off and on in Settings to try again"
@@ -1413,6 +1425,10 @@ final class SessionManager {
         stopTimers()
         countdownPaused = false
         session = nil
+        // The display hold goes with the session, before the restore below
+        // waits on any command. A reconcile or a failed start ends here
+        // without `end()`, which releases it first otherwise.
+        syncScreenAwake()
         // Every lid action is undone from the journal below, or by the
         // retry of this end, and Low Power Mode restored from it: a lid
         // event refused earlier, a settle pass waiting to run again and

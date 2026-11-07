@@ -435,6 +435,64 @@ final class SessionScreenAwakeTests: XCTestCase {
         XCTAssertNil(m.lastError, "the menu line goes once the timeout moves")
     }
 
+    /// The Settings toggle takes the hold while a relaunch resumes the
+    /// session, and the resume then fails to arm the agent and ends. The
+    /// hold goes before the end waits on the restore's `sudo pmset`.
+    func testAResumeThatEndsReleasesTheHoldBeforeTheRestore() async throws {
+        let first = make()
+        try h.store.saveConfig(first.config)
+        await first.start(duration: 3600)
+        let relaunched = FakeDisplayAssertions()
+        let m = h.makeManager(displayAssertions: relaunched)
+        let arm = AsyncGate()
+        let restore = AsyncGate()
+        h.backstop.armGate = arm
+        h.backstop.failArm = true
+        h.guardFake.restoreGate = restore
+
+        let reconcile = Task { await m.reconcile() }
+        await arm.waitUntilStarted()
+        m.syncScreenAwake()
+        XCTAssertTrue(m.screenAwakeHeld)
+        await arm.open()
+        await restore.waitUntilStarted()
+
+        XCTAssertNil(m.session)
+        XCTAssertFalse(m.screenAwakeHeld, "the hold outlived the session while the restore waited")
+        XCTAssertEqual(relaunched.released, [41])
+
+        await restore.open()
+        await reconcile.value
+    }
+
+    /// A hold that fails again doesn't put its line back over a newer one,
+    /// and a release afterwards leaves that newer line in place.
+    func testARepeatedHoldFailureKeepsANewerMenuLine() async {
+        let m = make()
+        fake.failCreate = true
+        await m.start(duration: 3600)
+        m.fail("something else failed later")
+
+        m.syncScreenAwake()
+        XCTAssertEqual(m.lastError, "something else failed later")
+
+        m.config.keepScreenAwake = false
+        m.syncScreenAwake()
+        XCTAssertEqual(m.lastError, "something else failed later")
+    }
+
+    /// Once something else clears the menu, a hold that still fails shows
+    /// its line again.
+    func testAHoldThatStillFailsAfterAnExtensionIsShownAgain() async {
+        let m = make()
+        fake.failCreate = true
+        await m.start(duration: 3600)
+
+        await m.extend(by: 1800)
+
+        XCTAssertTrue(m.lastError?.contains("could not hold the display on") == true, m.lastError ?? "")
+    }
+
     /// The session ends while the hold line is up: the release takes the
     /// line down with it.
     func testAnEndTakesDownTheRefusedHoldLine() async {

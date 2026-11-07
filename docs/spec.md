@@ -134,8 +134,9 @@ recovery; newly written journals use `frozenProcesses`.
   deadline. A release macOS refuses keeps the hold and says so in the
   menu; quitting Insomnia releases it. A hold or a timeout move macOS
   refuses says so in the menu too, and turning the toggle off and on
-  tries again. A resume at launch that stops at a `sudo pmset` still
-  running drops the session and any hold the toggle took meanwhile. The
+  tries again. A resume at launch that fails, or stops at a `sudo pmset`
+  still running, drops the session and any hold the toggle took
+  meanwhile, before the restore waits on a command. The
   assertion also times out at the session's deadline (`TimeoutActionTurnOff`), and an extension moves the
   timeout, so an app that hangs can't keep the screen unlocked past the
   deadline while the backstop restores sleep. No
