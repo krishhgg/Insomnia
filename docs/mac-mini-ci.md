@@ -11,8 +11,8 @@ is not a required check. To make it one, add `Swift test (Mac mini, macOS 27
 VM)` to the main ruleset and to `CI_CHECKS` in
 `.github/scripts/merge-gate.sh`. The job already writes the "Tested merge"
 note that `merge-gate.sh check` reads for each entry there. Wait for a week
-of clean runs first. Once it is required, no pull request can merge while
-the mini is off.
+of clean runs first. Once it is required, no pull request from a branch in
+this repository can merge while the mini is off.
 
 The job runs for pushes to `main`, manual runs, and pull requests from
 branches in this repository. A pull request from a fork skips it. To test a
@@ -25,9 +25,10 @@ succeed.
 
 `.github/scripts/mini-runner.sh` runs on the mini in a loop:
 
-1. It asks GitHub for a just-in-time runner. That runner takes one job and
-   then unregisters itself. The request uses a token from the mini's login
-   keychain; the token never enters a VM.
+1. It checks that fork run approval covers every outside contributor (see
+   below), then asks GitHub for a just-in-time runner. That runner takes one
+   job and then unregisters itself. The requests use a token from the mini's
+   login keychain; the token never enters a VM.
 2. It clones the base VM, `insomnia-ci-base`, and boots the clone on
    Softnet. A clone is a copy-on-write copy, so it takes seconds and little
    disk.
@@ -56,11 +57,14 @@ add a workflow of its own that asks for this runner. GitHub gives such a job
 a read-only token and no secrets. Three fences cover the rest:
 
 - **Approval.** Settings > Actions > General > "Approval for running fork
-  pull request workflows from contributors" is set to "Require approval for
-  all external contributors". No workflow runs for a fork's pull request
-  until the owner approves it. Before approving, check that the pull
-  request doesn't change anything under `.github/`. The weaker settings let
-  some forks run without approval, and those runs could reach the mini.
+  pull request workflows from contributors" must be "Require approval for
+  all external contributors". Then no workflow runs for a fork's pull
+  request from anyone outside the repository's collaborators until the
+  owner approves it. The two weaker settings let some of them run without
+  approval. `mini-runner.sh` reads the setting before it offers each
+  runner, and offers none while the setting is weaker or can't be read.
+  Before approving a run, check that the pull request doesn't change
+  anything under `.github/`.
 - **Softnet**, on the mini. With `tart run --net-softnet`, Softnet's
   documented default lets the VM reach the internet and its gateway address
   on the mini, and nothing else: no tailnet, no home network, no other VM.
@@ -99,8 +103,9 @@ mini's administrator password.
    and needs about 90 GB free.
 4. Make a fine-grained token on GitHub: repository access "Only select
    repositories" with this repository, permission "Administration: Read and
-   write" (registering a runner needs it), and an expiry. Put it in the
-   keychain; the command asks for it:
+   write" (registering a runner needs it, and the loop reads the fork run
+   approval setting with it), and an expiry. Put it in the keychain; the
+   command asks for it:
 
    ```sh
    security add-generic-password -s insomnia-mini-runner -a github -w
@@ -109,7 +114,8 @@ mini's administrator password.
 5. On GitHub, set fork run approval to "Require approval for all external
    contributors" (Settings > Actions > General). Check it with
    `gh api repos/OWNER/REPO/actions/permissions/fork-pr-contributor-approval --jq .approval_policy`,
-   which should print `all_external_contributors`.
+   which should print `all_external_contributors`. Until it does, the loop
+   offers no runner and logs why.
 6. Start the loop from a LaunchAgent, so it restarts after a crash or a
    login. Save this as `~/Library/LaunchAgents/org.insomnia.mini-runner.plist`,
    with the path of your checkout of this repository on `main`:
