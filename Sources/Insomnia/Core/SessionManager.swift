@@ -674,16 +674,21 @@ final class SessionManager {
 
     /// Holds the display awake while a session is active with
     /// `Config.keepScreenAwake` on and no end requested since it started,
-    /// and releases it otherwise. Settings calls it when the toggle changes.
-    /// A release macOS refuses stays held and goes to the menu; quitting
-    /// Insomnia releases it, since the assertion belongs to the process.
-    /// Once the hold matches again, that menu line goes if it is still the
-    /// line shown; a newer failure of anything else stays.
+    /// and releases it otherwise. The hold times out at the session's
+    /// deadline, so a hung process can't keep the screen unlocked past it,
+    /// and each new deadline moves the timeout. Settings calls it when the
+    /// toggle changes. A release macOS refuses stays held and goes to the
+    /// menu; quitting Insomnia releases it, since the assertion belongs to
+    /// the process. Once the hold matches again, that menu line goes if it
+    /// is still the line shown; a newer failure of anything else stays.
     func syncScreenAwake() {
-        let hold = isActive && config.keepScreenAwake && !endRequestedSinceStart
-        if screenAwake.set(hold) {
+        if isActive, config.keepScreenAwake, !endRequestedSinceStart, let endsAt = session?.endsAt {
+            if screenAwake.hold(until: endsAt, now: clock()), lastError == Self.screenAwakeReleaseFailure {
+                lastError = nil
+            }
+        } else if screenAwake.release() {
             if lastError == Self.screenAwakeReleaseFailure { lastError = nil }
-        } else if !hold {
+        } else {
             fail(Self.screenAwakeReleaseFailure)
         }
     }
@@ -1334,6 +1339,7 @@ final class SessionManager {
         lastError = nil
         Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
         await armDeadline(updated.endsAt)
+        syncScreenAwake()
     }
 
     /// Full session end: delete the session file first (so a crash here leaves

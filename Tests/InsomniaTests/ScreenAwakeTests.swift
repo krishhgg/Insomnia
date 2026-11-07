@@ -2,29 +2,44 @@ import IOKit.pwr_mgt
 import XCTest
 @testable import Insomnia
 
-/// Records every create and release; `failCreate` makes the next creates
-/// throw and `failRelease` makes the next releases report a refusal.
+/// Records every create, renew and release; `failCreate` makes the next
+/// creates throw, `failRenew` the next renews and `failRelease` the next
+/// releases report a refusal.
 final class FakeDisplayAssertions: DisplayAssertionHolding, @unchecked Sendable {
     private let lock = NSLock()
     private var _created: [String] = []
+    private var _timeouts: [TimeInterval] = []
+    private var _renewed: [IOPMAssertionID: [TimeInterval]] = [:]
     private var _released: [IOPMAssertionID] = []
     private var _next: IOPMAssertionID = 40
     var failCreate = false
+    var failRenew = false
     var failRelease = false
 
     var created: [String] { lock.withLock { _created } }
+    /// The timeout of each create, in order.
+    var timeouts: [TimeInterval] { lock.withLock { _timeouts } }
+    /// The timeouts each id was renewed to, in order.
+    var renewed: [IOPMAssertionID: [TimeInterval]] { lock.withLock { _renewed } }
     var released: [IOPMAssertionID] { lock.withLock { _released } }
     private var _refused: [IOPMAssertionID] = []
     /// Releases that were refused, in order.
     var refused: [IOPMAssertionID] { lock.withLock { _refused } }
 
-    func create(name: String) throws -> IOPMAssertionID {
+    func create(name: String, timeout: TimeInterval) throws -> IOPMAssertionID {
         if failCreate { throw ScreenAwakeError(status: kIOReturnNotPermitted) }
         return lock.withLock {
             _created.append(name)
+            _timeouts.append(timeout)
             _next += 1
             return _next
         }
+    }
+
+    func renew(_ id: IOPMAssertionID, timeout: TimeInterval) -> Bool {
+        if failRenew { return false }
+        lock.withLock { _renewed[id, default: []].append(timeout) }
+        return true
     }
 
     func release(_ id: IOPMAssertionID) -> Bool {
@@ -41,18 +56,21 @@ final class FakeDisplayAssertions: DisplayAssertionHolding, @unchecked Sendable 
 
 @MainActor
 final class ScreenAwakeTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private var deadline: Date { now.addingTimeInterval(3600) }
+
     func testHoldsOnceAndReleasesThatAssertion() {
         let fake = FakeDisplayAssertions()
         let awake = ScreenAwake(assertions: fake)
 
-        awake.set(true)
-        awake.set(true)
+        awake.hold(until: deadline, now: now)
+        awake.hold(until: deadline, now: now)
 
         XCTAssertTrue(awake.isHeld)
         XCTAssertEqual(fake.created, [ScreenAwake.assertionName], "a repeated on holds one assertion")
 
-        awake.set(false)
-        awake.set(false)
+        awake.release()
+        awake.release()
 
         XCTAssertFalse(awake.isHeld)
         XCTAssertEqual(fake.released, [41], "the release names the assertion created, once")
@@ -62,7 +80,7 @@ final class ScreenAwakeTests: XCTestCase {
         let fake = FakeDisplayAssertions()
         let awake = ScreenAwake(assertions: fake)
 
-        awake.set(false)
+        awake.release()
 
         XCTAssertEqual(fake.created, [])
         XCTAssertEqual(fake.released, [])
@@ -75,10 +93,10 @@ final class ScreenAwakeTests: XCTestCase {
         defer { home.destroy() }
         let fake = FakeDisplayAssertions()
         let awake = ScreenAwake(assertions: fake)
-        awake.set(true)
+        awake.hold(until: deadline, now: now)
         fake.failRelease = true
 
-        XCTAssertFalse(awake.set(false))
+        XCTAssertFalse(awake.release())
 
         XCTAssertTrue(awake.isHeld, "a refused release still holds the display")
         XCTAssertEqual(fake.refused, [41])
@@ -86,7 +104,7 @@ final class ScreenAwakeTests: XCTestCase {
         XCTAssertFalse(log.contains("released, idle display sleep"), "success logged for a refused release: \(log)")
 
         fake.failRelease = false
-        XCTAssertTrue(awake.set(false))
+        XCTAssertTrue(awake.release())
 
         XCTAssertFalse(awake.isHeld)
         XCTAssertEqual(fake.released, [41], "the retry releases the id that was refused")
@@ -101,19 +119,69 @@ final class ScreenAwakeTests: XCTestCase {
         fake.failCreate = true
         let awake = ScreenAwake(assertions: fake)
 
-        awake.set(true)
+        awake.hold(until: deadline, now: now)
 
         XCTAssertFalse(awake.isHeld)
         let log = (try? String(contentsOf: home.paths.logFile, encoding: .utf8)) ?? ""
         XCTAssertTrue(log.contains("the display can still sleep and lock the screen"), log)
 
-        awake.set(false)
+        awake.release()
         XCTAssertEqual(fake.released, [], "nothing held, nothing released")
 
         fake.failCreate = false
-        awake.set(true)
+        awake.hold(until: deadline, now: now)
         XCTAssertTrue(awake.isHeld)
         XCTAssertEqual(fake.created, [ScreenAwake.assertionName])
+    }
+
+    /// The hold times out at the deadline it was given, and moves with it.
+    /// Holding to the same deadline again changes nothing.
+    func testTheHoldTimesOutAtTheDeadlineAndMovesWithIt() {
+        let fake = FakeDisplayAssertions()
+        let awake = ScreenAwake(assertions: fake)
+
+        awake.hold(until: deadline, now: now)
+        XCTAssertEqual(fake.timeouts, [3600])
+        awake.hold(until: deadline, now: now.addingTimeInterval(60))
+        XCTAssertEqual(fake.renewed, [:], "the same deadline renews nothing")
+
+        let later = deadline.addingTimeInterval(1800)
+        XCTAssertTrue(awake.hold(until: later, now: now.addingTimeInterval(600)))
+
+        XCTAssertEqual(fake.created.count, 1, "an extension keeps the one assertion")
+        XCTAssertEqual(fake.renewed, [41: [4800]])
+        XCTAssertEqual(awake.heldUntil, later)
+    }
+
+    /// A refused renew keeps the old timeout, says so, and is tried again.
+    func testAFailedRenewKeepsTheOldDeadlineForTheNextTry() {
+        let home = TempHome()
+        defer { home.destroy() }
+        let fake = FakeDisplayAssertions()
+        let awake = ScreenAwake(assertions: fake)
+        awake.hold(until: deadline, now: now)
+        let later = deadline.addingTimeInterval(1800)
+        fake.failRenew = true
+
+        XCTAssertFalse(awake.hold(until: later, now: now))
+
+        XCTAssertEqual(awake.heldUntil, deadline)
+        let log = (try? String(contentsOf: home.paths.logFile, encoding: .utf8)) ?? ""
+        XCTAssertTrue(log.contains("could not move the hold's timeout"), log)
+
+        fake.failRenew = false
+        XCTAssertTrue(awake.hold(until: later, now: now))
+        XCTAssertEqual(fake.renewed, [41: [5400]])
+        XCTAssertEqual(awake.heldUntil, later)
+    }
+
+    /// IOKit takes whole seconds, and 0 would mean no timeout.
+    func testTheTimeoutIsWholeSecondsRoundedUpAndAtLeastOne() {
+        XCTAssertEqual(IOPMDisplayAssertions.seconds(3599.2), 3600)
+        XCTAssertEqual(IOPMDisplayAssertions.seconds(3600), 3600)
+        XCTAssertEqual(IOPMDisplayAssertions.seconds(0.2), 1)
+        XCTAssertEqual(IOPMDisplayAssertions.seconds(0), 1)
+        XCTAssertEqual(IOPMDisplayAssertions.seconds(-30), 1, "a deadline already past")
     }
 }
 
@@ -147,6 +215,7 @@ final class SessionScreenAwakeTests: XCTestCase {
         await m.start(duration: 3600)
         XCTAssertTrue(m.screenAwakeHeld)
         XCTAssertEqual(fake.created, [ScreenAwake.assertionName])
+        XCTAssertEqual(fake.timeouts, [3600], "macOS turns the hold off at the deadline if the app no longer ends it")
 
         let outcome = await m.end(reason: .user)
 
@@ -250,6 +319,21 @@ final class SessionScreenAwakeTests: XCTestCase {
 
         XCTAssertFalse(m.screenAwakeHeld)
         XCTAssertEqual(m.lastError, "something else failed later")
+    }
+
+    /// An extension moves the hold's timeout to the new deadline, so the
+    /// display stays on for the time added.
+    func testAnExtensionMovesTheTimeoutToTheNewDeadline() async {
+        let m = make()
+        await m.start(duration: 3600)
+        h.clock.now = h.clock.now.addingTimeInterval(600)
+
+        await m.extend(by: 1800)
+
+        XCTAssertEqual(m.session?.endsAt, h.clock.now.addingTimeInterval(4800))
+        XCTAssertTrue(m.screenAwakeHeld)
+        XCTAssertEqual(fake.created.count, 1)
+        XCTAssertEqual(fake.renewed, [41: [4800]])
     }
 
     /// An end request does not leave the toggle dead for the next session.
