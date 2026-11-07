@@ -62,6 +62,9 @@ struct Config: Codable, Equatable, Sendable {
     var thermalRules: Bool = true
 
     // Network failover
+    /// Small HTTPS heartbeat during a session, including on metered hotspots.
+    /// Opt-in because it generates traffic while otherwise idle.
+    var keepNetworkActive: Bool = false
     var hotspotSSID: String = ""
     /// Seconds of outage after which tmux panes are nudged.
     var nudgeThreshold: TimeInterval = 90
@@ -124,6 +127,8 @@ struct Config: Codable, Equatable, Sendable {
         "com.googlecode.iterm2",          // iTerm2
         "com.mitchellh.ghostty",          // Ghostty
         "dev.warp.Warp-Stable",           // Warp
+        "com.superlogical.rex",           // Rex (including Beta)
+        "com.superlogical.rex.server",    // Rex Server / embedded Tailscale
         "com.google.Chrome",              // Google Chrome
         "org.chromium.Chromium",          // Chromium
         "company.thebrowser.Browser",     // Arc
@@ -166,6 +171,7 @@ struct Config: Codable, Equatable, Sendable {
         endFloor = try c.decodeIfPresent(Int.self, forKey: .endFloor) ?? d.endFloor
         thermalRules = try c.decodeIfPresent(Bool.self, forKey: .thermalRules) ?? d.thermalRules
         hotspotSSID = try c.decodeIfPresent(String.self, forKey: .hotspotSSID) ?? d.hotspotSSID
+        keepNetworkActive = try c.decodeIfPresent(Bool.self, forKey: .keepNetworkActive) ?? d.keepNetworkActive
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter

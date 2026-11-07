@@ -4,6 +4,9 @@ The [README](../README.md#optional-extras) has a summary of each.
 
 ## iPhone hotspot handoff
 
+Failover follows the default network route. A working Ethernet connection or
+USB tether suppresses Wi-Fi hotspot joins even when Wi-Fi itself is offline.
+
 Set **System Settings → Wi-Fi → Ask to join hotspots → Automatically**, then
 enter the hotspot SSID and password in Insomnia Settings. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
@@ -41,6 +44,45 @@ Settings to open **Privacy & Security → Location Services**. Mac apps have no
 when-in-use grant, so System Settings records it as Location Services access
 for Insomnia. Insomnia uses it only to read Wi-Fi network names through
 CoreWLAN and never requests your location.
+
+### Keeping an idle hotspot active
+
+Enable **Keep network active during sessions** in Settings > Network failover
+(`keepNetworkActive` in config.json, default false), then start a new session.
+Insomnia sends an uncached HTTPS HEAD to
+`https://cp.cloudflare.com/generate_204` immediately and every 30 seconds.
+Requests also run on metered or constrained connections and use mobile data.
+Each has a 10-second total timeout; requests never overlap. Session end cancels
+the timer and request. An activity token keeps Insomnia's own timers responsive
+while its interface is hidden, without keeping the display awake.
+
+This traffic may help an idle hotspot stay active. It does not maintain T3's
+or Rex's individual NAT mappings, prove their tunnels healthy, or fix cellular
+coverage. A failed request logs a transition and leaves the connection alone;
+T3/cloudflared and Rex manage their own reconnects.
+
+Rex and Rex Server are protected from the automatic freeze scope. The separate
+agent-list App Nap setting is opt-in and writes journaled preferences for every
+listed app during a session; see [recovery.md](recovery.md). Keeping the network
+active does not itself enable that setting.
+
+### Checking stability and cost
+
+During ordinary hotspot use, note approximate session start/end times, how long
+the lid was closed, and any T3 or Rex disconnects. Check those connections
+separately, then compare incidents with the available Insomnia and tunnel logs.
+Logs rotate, so save the relevant time window soon after a failure. A week
+without an incident is useful feedback, but does not establish that the
+heartbeat caused the improvement.
+
+To measure overhead, compare equal-length sessions with the option on and off,
+starting a new session after each change. Keep the network, workload, power
+source, and lid state comparable. Record laptop and phone battery levels and
+mobile-data counters before and after; use process/network instruments for
+Insomnia-specific CPU and bytes. HEAD has no response body, but DNS, TLS, HTTP
+headers, and retransmissions still use data. Each probe currently creates a
+fresh URLSession, and the activity token can affect power use. Overhead has not
+yet been measured; overall hotspot usage includes all other apps as well.
 
 ## tmux nudge
 

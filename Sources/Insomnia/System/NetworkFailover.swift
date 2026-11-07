@@ -745,7 +745,7 @@ final class FakeKeychainStore: KeychainStoring, @unchecked Sendable {
 
 // MARK: - Driver
 
-/// NWPathMonitor on Wi-Fi, one retry timer that exists only during an
+/// NWPathMonitor on the default route, one retry timer that exists only during an
 /// outage, CoreWLAN for the join, handoffs.log, tmux nudge and a
 /// notification on recovery. Active only while a session is active.
 @MainActor
@@ -827,7 +827,9 @@ final class NetworkFailover {
         await resolveInterface()
         // stop() may have run while networksetup was being awaited.
         guard !Task.isCancelled, self.epoch == epoch else { return }
-        let m = NWPathMonitor(requiredInterfaceType: .wifi)
+        // A USB-tethered phone or Ethernet is also a working connection.
+        // Watching only Wi-Fi could move a healthy wired route to a hotspot.
+        let m = NWPathMonitor()
         let id = ObjectIdentifier(m)
         m.pathUpdateHandler = { [weak self] path in
             let satisfied = path.status == .satisfied

@@ -56,6 +56,27 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
     }
 
+    func testNetworkHeartbeatIsOptInAndRoundTrips() throws {
+        XCTAssertFalse(Config().keepNetworkActive)
+        XCTAssertFalse(try Store.makeDecoder().decode(Config.self, from: Data("{}".utf8)).keepNetworkActive)
+        let enabled = try Store.makeDecoder().decode(Config.self, from: Data(#"{"keepNetworkActive":true}"#.utf8))
+        XCTAssertTrue(enabled.keepNetworkActive)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: Store.makeEncoder().encode(enabled)), enabled)
+    }
+
+    func testRemoteTerminalsAreProtectedForNewAndExistingConfigs() {
+        var old = Config()
+        old.agentList = []
+        old.freezeAllApps = true
+        let rexIds = ["com.superlogical.rex", "com.superlogical.rex.server"]
+        for id in rexIds {
+            XCTAssertTrue(Config.defaultAgentList.contains(id))
+            XCTAssertTrue(FreezePlanner.isBuiltInProtected(id), "old configs also leave Rex running")
+        }
+        let apps = rexIds.map { RunningApp(pid: 123, bundleId: $0, name: "Rex") }
+        XCTAssertTrue(FreezePlanner.automaticCandidates(config: old, apps: apps).isEmpty)
+    }
+
     // MARK: Battery floors
 
     func testDefaultFloorsAreOrdered() {

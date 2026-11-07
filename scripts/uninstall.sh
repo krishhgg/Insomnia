@@ -125,6 +125,8 @@ DEFAULT_AGENTS=(
   com.googlecode.iterm2           # iTerm2
   com.mitchellh.ghostty           # Ghostty
   dev.warp.Warp-Stable            # Warp
+  com.superlogical.rex            # Rex (including Beta)
+  com.superlogical.rex.server     # Rex Server / embedded Tailscale
   com.google.Chrome               # Google Chrome
   org.chromium.Chromium           # Chromium
   company.thebrowser.Browser      # Arc

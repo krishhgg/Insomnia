@@ -71,6 +71,11 @@ cd Insomnia
 open "$HOME/Applications/Insomnia.app"
 ```
 
+For an upgrade that already has Insomnia's four-command pmset grant, use
+`./scripts/install.sh --reuse-sudoers`. It verifies the existing grant and
+updates the app and recovery agent without changing sudoers or asking for
+administrator access. A missing grant stops the upgrade.
+
 <details>
 <summary><strong>What the installer changes on your Mac</strong></summary>
 
@@ -179,12 +184,24 @@ alone. [docs/recovery.md](docs/recovery.md) explains each case.
 <details>
 <summary><strong>iPhone hotspot handoff and tmux</strong></summary>
 
-If the Wi-Fi drops during a session, Insomnia can join your iPhone's hotspot.
+If the default network route drops during a session, Insomnia can join your
+iPhone's hotspot. A working Ethernet connection or USB tether counts as online.
 Set System Settings > Wi-Fi > Ask to join hotspots to Automatically, then enter
 the hotspot's name and password in Insomnia's Settings. The password stays in
 your login Keychain. Insomnia asks for Location Services access, because
 macOS requires it to read Wi-Fi network names. It never reads your location.
 After you reinstall Insomnia, enter the password again.
+
+For an idle hotspot, Settings > Network failover also offers **Keep network
+active during sessions**. From the next session it sends a small HTTPS request
+to Cloudflare every 30 seconds, including over metered cellular connections.
+It is off by default and uses mobile data. It may help the hotspot stay active;
+it does not keep T3's or Rex's individual connections alive or repair them.
+
+Rex and Rex Server are protected from automatic freezing, including with an
+older saved config. Add them to the agent list for the separate, optional
+App Nap preference protection. That setting applies to every app on the list
+during a session and restores the recorded preferences when the session ends.
 
 After 90 seconds without a network, Insomnia can also type `continue` into a
 tmux pane running a coding agent. It only types into panes you list in
