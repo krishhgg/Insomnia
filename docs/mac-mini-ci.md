@@ -62,7 +62,9 @@ a read-only token and no secrets. Three fences cover the rest:
   request from anyone outside the repository's collaborators until the
   owner approves it. The two weaker settings let some of them run without
   approval. `mini-runner.sh` reads the setting before it offers each
-  runner, and offers none while the setting is weaker or can't be read.
+  runner, and offers none while the setting is weaker or can't be read. It
+  doesn't read it again while a runner waits for a job, so stop the loop
+  before you weaken the setting.
   Before approving a run, check that the pull request doesn't change
   anything under `.github/`.
 - **Softnet**, on the mini. With `tart run --net-softnet`, Softnet's
@@ -159,8 +161,9 @@ logged in, since a LaunchAgent runs only in a login session.
 - **New image or runner version.** Stop the loop, `tart delete
   insomnia-ci-base`, update the pins in `mini-base.sh` if needed, run it,
   and start the loop.
-- **Token expiry.** When the token expires, the loop logs "GitHub gave no
-  runner config" once a minute. Make a new token and replace it with the
+- **Token expiry.** When the token expires, the loop logs "could not read
+  the fork run approval setting" once a minute, since that is its first
+  request. Make a new token and replace it with the
   `security add-generic-password` command plus `-U`.
 - **Two VMs at most.** macOS runs at most two VMs at a time, and the waiting
   runner's VM is one of them. Stop the loop to run two lab VMs.

@@ -62,14 +62,18 @@ github_curl() {
 # A fork's pull request can edit the workflows to ask for this runner, so
 # GitHub's approval of fork runs is what keeps outside code off the mini.
 # Each pass checks that it covers every outside contributor before it
-# offers a runner, and offers none if it can't tell.
+# offers a runner, and offers none if it can't tell. A runner already
+# waiting isn't checked again, so stop the loop before weakening it.
 approval_ok() {
-  local policy
-  if ! policy=$(github_curl GET actions/permissions/fork-pr-contributor-approval -f |
-    plutil -extract approval_policy raw -o - -); then
+  local response policy
+  response=$(github_curl GET actions/permissions/fork-pr-contributor-approval -f) || {
     log "could not read the fork run approval setting"
     return 1
-  fi
+  }
+  policy=$(printf '%s' "$response" | plutil -extract approval_policy raw -o - -) || {
+    log "could not read the fork run approval setting in GitHub's answer"
+    return 1
+  }
   if [ "$policy" != all_external_contributors ]; then
     log "fork run approval is $policy, not all_external_contributors; no runner offered (docs/mac-mini-ci.md)"
     return 1
