@@ -96,7 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             manager: manager,
             status: status,
             showSettings: { [weak settings] in settings?.show() },
-            secrets: secrets
+            secrets: secrets,
+            playSessionSound: { SessionSounds.shared.play($0) }
         )
         displaySleep = DisplaySleepObserver { [manager] asleep in manager.displaysAsleepChanged(asleep) }
         timeChange = TimeChangeObserver { [manager] in manager.refreshCountdown() }

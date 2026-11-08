@@ -124,7 +124,23 @@ file and explains how upgrades replace them.
    the status, Settings and Quit. While a session runs it also has the
    ring you hold to end it. Popover style has no right-click menu, since
    the popover shows the same things.
-6. **From a script or an agent.** The app's binary drives the running app:
+6. **One click.** Turn on "Start a session with one click" in Settings >
+   General, under the Menu bar picker. Then, in Pills, Compact and Popover,
+   a click on the eye with no session running starts the default session
+   length. Option-click opens the usual controls to pick another length,
+   and in Popover a right-click or Control-click does too. A click during a
+   session works as it does with the switch off, and never ends the
+   session. If the start is refused, the pills, the panel or the popover
+   opens with the reason. Minimal already adds the default length on every
+   click, so Settings greys the switch out there. It is off by default.
+7. **Sounds.** "Play a sound when you start or end a session" in Settings >
+   General plays a short tone when you start or end a session from the
+   menu bar. It is off by default, and while it is off Insomnia makes no
+   sound and loads none. A session that ends without you asking (the
+   timer, the recovery agent, Quit, a battery or heat rule, recovery after
+   a crash) makes no sound. Nothing plays while the displays sleep or the
+   lid is closed, and `--session` commands make no sound.
+8. **From a script or an agent.** The app's binary drives the running app:
 
    ```bash
    INSOMNIA=~/Applications/Insomnia.app/Contents/MacOS/Insomnia

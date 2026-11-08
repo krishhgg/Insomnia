@@ -6,6 +6,82 @@ import XCTest
 
 final class UIStatusTests: XCTestCase {
     @MainActor
+    func testPrimaryClickStartsFourHoursWithoutOpeningInputAndIgnoresPendingClicks() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.oneClickStart = true
+        let gate = AsyncGate()
+        lab.h.backstop.armGate = gate
+        lab.controller.iconTapped(modifiers: [])
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertFalse(lab.model.slotsPresent)
+        XCTAssertEqual(lab.model.pendingCountdown, "4:00:00")
+        await gate.waitUntilStarted()
+        lab.controller.iconTapped(modifiers: [])
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertFalse(lab.model.slotsPresent)
+        await gate.open()
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase != .running, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(lab.model.phase, .running)
+        let session = try XCTUnwrap(lab.manager.session)
+        XCTAssertEqual(session.endsAt.timeIntervalSince(session.startedAt), 4 * 3600)
+        XCTAssertFalse(lab.controller.pendingTickArmed)
+        XCTAssertFalse(lab.model.slotsPresent)
+        // A click never ends a session: during one it opens the pills to
+        // add time, as with the switch off.
+        lab.controller.iconTapped(modifiers: [])
+        XCTAssertEqual(lab.model.phase, .entering(.extend))
+        await settleQueuedRequests()
+        XCTAssertEqual(lab.manager.session, session)
+        lab.controller.collapse(returnFocus: false)
+        await lab.manager.end(reason: .user)
+        XCTAssertFalse(lab.manager.isActive)
+    }
+
+    @MainActor
+    func testQuickStartUsesTheConfiguredDefault() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.oneClickStart = true
+        lab.manager.config.defaultPreset = 1800
+        lab.controller.iconTapped(modifiers: [])
+        let deadline = Date().addingTimeInterval(2)
+        while !lab.manager.isActive, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let session = try XCTUnwrap(lab.manager.session)
+        XCTAssertEqual(session.endsAt.timeIntervalSince(session.startedAt), 1800)
+        await lab.manager.end(reason: .user)
+    }
+
+    /// A refused quick start reopens the pills with the requested length
+    /// and the refusal label, as a refused Enter does, so the reason shows
+    /// without another click.
+    @MainActor
+    func testRefusedQuickStartReopensThePillsWithTheReason() async {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.oneClickStart = true
+        lab.h.backstop.failArm = true
+        lab.controller.iconTapped(modifiers: [])
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase == .starting, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(lab.manager.isActive)
+        XCTAssertEqual(lab.model.phase, .entering(.start))
+        XCTAssertEqual(lab.model.input.total, 4 * 3600)
+        XCTAssertNotNil(lab.manager.lastError)
+        XCTAssertEqual(lab.model.startError, MenuBarModel.startFailedText)
+        XCTAssertTrue(lab.model.slotsPresent)
+        XCTAssertFalse(lab.controller.pendingTickArmed)
+        lab.controller.collapse(returnFocus: false)
+    }
+
+    @MainActor
     func testStatusHostUsesIntrinsicSizingAndHasAnIdleFittingSize() {
         let harness = Harness()
         defer { harness.home.destroy() }
