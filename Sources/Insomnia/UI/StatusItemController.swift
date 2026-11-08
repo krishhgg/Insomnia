@@ -1979,12 +1979,14 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                 batteryPercent: status.batteryPercent,
                 isCharging: status.isCharging,
                 timeRemaining: power.timeRemaining,
+                thermal: status.thermalState,
                 failover: failover
             ),
             actions: StatusLines.actionRows(
                 frozenCount: status.frozenCount,
                 dockerPaused: status.dockerPaused,
-                lastGap: status.lastGap
+                lastGap: status.lastGap,
+                lowPower: manager.effectiveState.lowPowerSetByUs
             ),
             throttledBrowsers: status.throttledBrowsers,
             relaunchProblems: status.relaunchProblems,

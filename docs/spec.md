@@ -761,8 +761,9 @@ Nothing but `nominal` and the session end bounds the hold: a Mac that stays at
 `fair`, under a long build say, keeps the mode, and the display sample held,
 until the session ends. That is deliberate. A Mac at `fair` after `serious` is
 still carrying the heat, and a release on a timer would bring the cycling back
-at a slower pace. The menu shows the mode and the thermal state meanwhile, and
-turning the thermal rules off in Settings releases it at once.
+at a slower pace. The right-click menu and the popover show the mode and the
+thermal state meanwhile, and turning the thermal rules off in Settings
+releases it at once.
 
 Settings can turn the hold off ("Keep Low Power Mode on until the Mac fully
 cools", `thermalHoldUntilNominal`, on by default and for a config.json without
@@ -1657,12 +1658,14 @@ downwards, never sideways. Top to bottom:
    power flows, as Stats and `pmset -g batt` do. Under half a watt while
    charging, as at the charge limit, the draw and the time are left out:
    "80% · On power adapter"; plugged in but draining, "62% · On power
-   adapter · 5.6 W"), whether hotspot failover is set up
+   adapter · 5.6 W"), the thermal state when it is above nominal
+   ("Thermal: serious"), whether hotspot failover is set up
    (`HotspotFailoverRow`, left out while a hotspot password warning
    shows), Wi-Fi (the
    network name, or "On" when Location is not allowed, with the reason as
-   a tooltip), and only when they apply, frozen apps, paused Docker and
-   the last network gap.
+   a tooltip), and only when they apply, Low Power Mode that Insomnia
+   switched on ("Low Power Mode set by Insomnia"), frozen apps, paused
+   Docker and the last network gap.
 5. **Warnings.** One row each with an orange triangle: a session that is
    not holding sleep (including one whose sleep check, section 1, could not
    set SleepDisabled again) or sleep still held with no session

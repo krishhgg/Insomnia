@@ -466,6 +466,33 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
     }
 
+    /// Popover style has no right-click menu, so the popover's rows carry
+    /// the same two facts: the thermal state under the power row, and
+    /// Insomnia's Low Power Mode first among what the session holds.
+    @MainActor
+    func testPopoverShowsInsomniasLowPowerModeAndTheThermalState() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let source = RecordingStatusSource()
+        source.batteryPercent = 64
+        source.frozenCount = 2
+        var titles: [String] { StatusItemController.statusItems(manager: m, status: source).map(\.title) }
+        XCTAssertFalse(titles.contains { $0.hasPrefix("Thermal") })
+        XCTAssertFalse(titles.contains("Low Power Mode set by Insomnia"))
+
+        source.thermalState = .serious
+        await m.setLowPower(true)
+        let thermal = titles.firstIndex(of: "Thermal: serious")
+        XCTAssertEqual(thermal.map { titles[$0 - 1] }, "64%", "the thermal row follows the power row")
+        let lowPower = titles.firstIndex(of: "Low Power Mode set by Insomnia")
+        XCTAssertEqual(lowPower.map { titles[$0 + 1] }, "2 apps frozen", "Low Power Mode leads the held rows")
+
+        await m.end(reason: .user)
+        XCTAssertFalse(titles.contains("Low Power Mode set by Insomnia"))
+    }
+
     /// The menu puts the warning sign in front of the shared text, which
     /// has none: the popover draws a triangle instead.
     func testThrottleWarning() {
@@ -1992,6 +2019,32 @@ final class UIStatusTests: XCTestCase {
         ])
         XCTAssertEqual(StatusLines.actionRows(frozenCount: 1, dockerPaused: false, lastGap: 12.4).map(\.title), ["1 app frozen", "Last network gap 12s"])
         XCTAssertEqual(StatusLines.actionRows(frozenCount: 0, dockerPaused: true, lastGap: 0).map(\.title), ["Docker paused"])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 0, dockerPaused: false, lastGap: nil, lowPower: true), [
+            StatusMenu.Item(title: "Low Power Mode set by Insomnia", kind: .info, symbol: "gauge.with.dots.needle.33percent"),
+        ])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 1, dockerPaused: true, lastGap: nil, lowPower: true).map(\.title), ["Low Power Mode set by Insomnia", "1 app frozen", "Docker paused"])
+    }
+
+    /// Above nominal the thermal state gets a row after the power row, as
+    /// it follows the charge on the menu line; nominal gets none.
+    func testThermalRowAppearsAboveNominal() {
+        let wifi = WiFiStatusName.Display(text: "iPhone", help: nil)
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: true, watts: 6.04, wifi: wifi, batteryPercent: 64, isCharging: false, thermal: .serious).map(\.title),
+            ["Lid closed", "64% \u{00B7} 6.0 W", "Thermal: serious", "iPhone"]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false, thermal: .fair),
+            [
+                StatusMenu.Item(title: "Lid open", kind: .info, symbol: "laptopcomputer"),
+                StatusMenu.Item(title: "Thermal: fair", kind: .info, symbol: "thermometer.medium"),
+            ]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false, thermal: .critical).last,
+            StatusMenu.Item(title: "Thermal: critical", kind: .info, symbol: "thermometer.high")
+        )
+        XCTAssertEqual(StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false, thermal: .nominal).map(\.title), ["Lid open"])
     }
 
     func testThrottleWarningInThePopover() {

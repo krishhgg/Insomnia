@@ -119,12 +119,13 @@ enum StatusLines {
         return parts.isEmpty ? nil : parts.joined(separator: " \u{00B7} ")
     }
 
-    /// Lid, power, hotspot failover and Wi-Fi rows, in that order. The lid
-    /// is always known; the power row is left out when neither the draw
-    /// nor the charge is known, the failover row when the caller has none
-    /// (`HotspotFailoverRow`), and the Wi-Fi row when there is no network
-    /// to name.
-    static func machine(lidClosed: Bool, watts: Double?, wifi: WiFiStatusName.Display?, batteryPercent: Int?, isCharging: Bool, timeRemaining: BatteryTimeRemaining? = nil, failover: StatusMenu.Item? = nil) -> [StatusMenu.Item] {
+    /// Lid, power, thermal state, hotspot failover and Wi-Fi rows, in that
+    /// order. The lid is always known; the power row is left out when
+    /// neither the draw nor the charge is known, the thermal row at
+    /// nominal, as on the menu line, the failover row when the caller has
+    /// none (`HotspotFailoverRow`), and the Wi-Fi row when there is no
+    /// network to name.
+    static func machine(lidClosed: Bool, watts: Double?, wifi: WiFiStatusName.Display?, batteryPercent: Int?, isCharging: Bool, timeRemaining: BatteryTimeRemaining? = nil, thermal: ProcessInfo.ThermalState = .nominal, failover: StatusMenu.Item? = nil) -> [StatusMenu.Item] {
         var rows = [StatusMenu.Item(title: lidClosed ? "Lid closed" : "Lid open", kind: .info, symbol: "laptopcomputer")]
         // Plugged in at the charge limit the battery reports charging but
         // draws nothing: "80% · Charging 0.0 W" says the wrong thing. Under
@@ -140,6 +141,9 @@ enum StatusLines {
         if let title = powerTitle(watts: watts, batteryPercent: batteryPercent, isCharging: charging, idleOnAdapter: idleOnAdapter, drainingOnAdapter: drainingOnAdapter, timeRemaining: timeRemaining) {
             let symbol = idleOnAdapter || drainingOnAdapter ? "powerplug" : charging ? "battery.100percent.bolt" : (batteryPercent == nil ? "bolt" : "battery.75percent")
             rows.append(StatusMenu.Item(title: title, kind: .info, symbol: symbol))
+        }
+        if thermal != .nominal {
+            rows.append(StatusMenu.Item(title: "Thermal: \(PowerMonitor.name(thermal))", kind: .info, symbol: thermal == .fair ? "thermometer.medium" : "thermometer.high"))
         }
         if let failover {
             rows.append(failover)
@@ -186,11 +190,15 @@ enum StatusLines {
         "\(minutes / 60):" + String(format: "%02d", minutes % 60)
     }
 
-    /// Frozen apps, paused Docker and the last network gap, each only when
-    /// it applies; empty when nothing is held. The popover's rows for what
-    /// `actions` puts on one menu line.
-    static func actionRows(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?) -> [StatusMenu.Item] {
+    /// Low Power Mode that Insomnia switched on, frozen apps, paused Docker
+    /// and the last network gap, each only when it applies; empty when
+    /// nothing is held. The popover's rows for what `actions` puts on one
+    /// menu line. `lowPower` is the journal's `lowPowerSetByUs`, as there.
+    static func actionRows(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?, lowPower: Bool = false) -> [StatusMenu.Item] {
         var rows: [StatusMenu.Item] = []
+        if lowPower {
+            rows.append(StatusMenu.Item(title: "Low Power Mode set by Insomnia", kind: .info, symbol: "gauge.with.dots.needle.33percent"))
+        }
         if frozenCount > 0 {
             rows.append(StatusMenu.Item(title: frozenCount == 1 ? "1 app frozen" : "\(frozenCount) apps frozen", kind: .info, symbol: "snowflake"))
         }
