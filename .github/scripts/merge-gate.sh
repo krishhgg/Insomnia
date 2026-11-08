@@ -10,10 +10,10 @@
 #                        reviewed the head and found nothing. Read from the
 #                        state the bot keeps in its review summary comment,
 #                        which names the reviewed commit and whether the
-#                        review found anything, and only if the bot made the
-#                        comment's newest edit (GitHub records who made it,
-#                        and a collaborator can edit anyone's comment) and
-#                        the comment holds one state.
+#                        review found anything. Only if the comment holds one
+#                        state and nobody but the bot made the newest edit to
+#                        any comment the bot wrote (GitHub records who made
+#                        it, and a collaborator can edit anyone's comment).
 #   merge-gate/accepted  The owner added the "accepted" label: they want the
 #                        change in Insomnia. The newest add or removal of the
 #                        label must be the owner adding it.
@@ -224,18 +224,25 @@ count_lines() {
   fi
 }
 
-# "<states> <editor> <reviewed sha> <status> <found> <security sha>
-# <security open>" from the Codex bot's newest review summary: a comment the
-# bot wrote that starts with its summary marker. <states> counts the review
-# states the comment holds, and the rest are read from the first: the
-# login that made the newest edit ("-" if none did), the commit the code
+# "<states> <reviewed sha> <status> <found> <security sha> <security open>"
+# from the Codex bot's newest review summary: a comment the bot wrote that
+# starts with its summary marker. <states> counts the review states the
+# comment holds, and the rest are read from the first: the commit the code
 # review covers, its status and whether it found anything, then the commit
 # the security review covers and whether it left findings open ("none" for
 # a missing value). "none" if the bot has no summary, and "tie" if its
 # newest summaries share a time but differ, since nothing then says which
 # came last.
+#
+# "edited <login>" comes first if someone else made the newest edit to any
+# comment the bot wrote, summary or not, so that removing the marker from
+# the bot's newest summary can't bring back an older one. "?" stands for an
+# edit GitHub names no account for, as after the account was deleted. A
+# deleted comment leaves nothing to read, so deleting the bot's newest
+# summary would bring back an older one; that takes write access, which only
+# the owner has, and the bot keeps one summary per pull request.
 codex_bot_review() {
-  local rows newest results
+  local rows edited summaries newest results
   # shellcheck disable=SC2016 # GraphQL and jq variables
   rows=$(gh api graphql --paginate -F owner="$OWNER" -F name="${REPO#*/}" -F number="$1" -f query='
     query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
@@ -251,20 +258,30 @@ codex_bot_review() {
       .data.repository.pullRequest.comments.nodes[]
       | select(.author.login == "'"$CODEX_BOT"'")
       | (.body // "") as $b
-      | select($b | startswith("<!-- codex-pull-request-review-summary -->"))
       | ((try ($b | capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j | fromjson) catch null) // {}) as $s
       | [(.lastEditedAt // .createdAt),
-       ([$b | match("codex-review-state:"; "g")] | length),
-       (.editor.login // "-"),
-       ($s.code_review.commit_sha | v), ($s.code_review.status | v), ($s.code_review.has_any_findings | v),
-       ($s.security_review.commit_sha | v), ($s.security_review.has_unresolved_findings | v)]
+         (if .lastEditedAt == null then "-" else (.editor.login // "?") end),
+         (if $b | startswith("<!-- codex-pull-request-review-summary -->") then "summary" else "other" end),
+         ([$b | match("codex-review-state:"; "g")] | length),
+         ($s.code_review.commit_sha | v), ($s.code_review.status | v), ($s.code_review.has_any_findings | v),
+         ($s.security_review.commit_sha | v), ($s.security_review.has_unresolved_findings | v)]
       | map(tostring | gsub("[\t\r\n ]"; "_")) | @tsv') || return 1
   if [ -z "$rows" ]; then
     echo none
     return 0
   fi
-  newest=$(printf '%s\n' "$rows" | cut -f 1 | sort | tail -n 1)
-  results=$(printf '%s\n' "$rows" | awk -F '\t' -v t="$newest" '$1 == t' | cut -f 2- | sort -u)
+  edited=$(printf '%s\n' "$rows" | awk -F '\t' -v bot="$CODEX_BOT" '$2 != "-" && $2 != bot { print $2; exit }')
+  if [ -n "$edited" ]; then
+    echo "edited $edited"
+    return 0
+  fi
+  summaries=$(printf '%s\n' "$rows" | awk -F '\t' '$3 == "summary"')
+  if [ -z "$summaries" ]; then
+    echo none
+    return 0
+  fi
+  newest=$(printf '%s\n' "$summaries" | cut -f 1 | sort | tail -n 1)
+  results=$(printf '%s\n' "$summaries" | awk -F '\t' -v t="$newest" '$1 == t' | cut -f 4- | sort -u)
   if [ "$(count_lines "$results")" -gt 1 ]; then
     echo tie
     return 0
@@ -349,13 +366,17 @@ decide_gates() {
   # has_any_findings true after a finding's conversation is resolved, so
   # a finding counts until a later review of the head finds nothing.
   review=$(codex_bot_review "$pr") || return 1
-  read -r states editor reviewed status found security_reviewed security_open <<<"$review"
-  if [ "$states" = none ]; then
+  read -r states reviewed status found security_reviewed security_open <<<"$review"
+  if [ "$states" = edited ]; then
+    editor=$reviewed
+    if [ "$editor" = '?' ]; then
+      editor='an account GitHub no longer names'
+    fi
+    decide codex-bot failure "$editor made the newest edit to a Codex bot comment; only the bot's own edits count"
+  elif [ "$states" = none ]; then
     decide codex-bot pending "waiting for the Codex bot's first review; comment @codex review"
   elif [ "$states" = tie ]; then
     decide codex-bot pending "the Codex bot's two newest summaries share a time and disagree; waiting for its next edit"
-  elif [ "$editor" != - ] && [ "$editor" != "$CODEX_BOT" ]; then
-    decide codex-bot failure "$editor made the newest edit to the Codex bot's summary; only the bot's own edit counts"
   elif [ "$states" = 0 ]; then
     decide codex-bot pending "the Codex bot's summary holds no review state; comment @codex review"
   elif [ "$states" != 1 ]; then

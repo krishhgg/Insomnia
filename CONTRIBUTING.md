@@ -99,10 +99,10 @@ all. Before you build a new feature or change a default, open an issue so
 that is settled first.
 
 `config` exists because some files can switch off a check: a pull request
-from a fork runs the workflow files on its own branch, and review agents
-follow the AGENTS.md files on the branch they review. So the gate passes a
-change without the owner's OK only when every file it touches is one of
-these kinds:
+from a fork runs the workflow files on its own branch, and an AGENTS.md
+file on the branch can steer a review agent. So the gate passes a change
+without the owner's OK only when every file it touches is one of these
+kinds:
 
 - Swift files under `Sources/`, and `.swift`, `.h` or `.c` files under
   `Tests/`

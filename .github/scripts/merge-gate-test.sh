@@ -596,7 +596,25 @@ test_someone_elses_edit_of_the_summary_fails() {
   comments graphql-comments false \
     "$(comment 10:00:00 11:00:00 chatgpt-codex-connector "$OWNER" "$(summary_body "$HEAD_SHA" false)")"
   run 0 evaluate 5
-  gate codex-bot failure "krishhgg made the newest edit to the Codex bot's summary"
+  gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
+}
+
+test_removing_the_marker_from_the_newest_summary_fails() {
+  # The bot's older summary says the head is clean and its newer one found
+  # issues. Without its marker the newer one is no summary, so the edit
+  # itself has to fail the gate.
+  comments graphql-comments false \
+    "$(comment 09:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")" \
+    "$(comment 10:00:00 11:00:00 chatgpt-codex-connector "$OWNER" "Codex found issues.")"
+  run 0 evaluate 5
+  gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
+}
+
+test_an_edit_github_names_no_account_for_fails() {
+  comments graphql-comments false \
+    "$(comment 10:00:00 11:00:00 chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")"
+  run 0 evaluate 5
+  gate codex-bot failure "an account GitHub no longer names made the newest edit"
 }
 
 test_the_codex_bot_editing_its_summary_counts() {
