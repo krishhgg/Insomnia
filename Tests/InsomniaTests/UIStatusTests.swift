@@ -1,8 +1,86 @@
 import AppKit
+import SwiftUI
+import IOKit.ps
 import XCTest
 @testable import Insomnia
 
 final class UIStatusTests: XCTestCase {
+    @MainActor
+    func testPrimaryClickStartsFourHoursWithoutOpeningInputAndIgnoresPendingClicks() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.oneClickStart = true
+        let gate = AsyncGate()
+        lab.h.backstop.armGate = gate
+        lab.controller.iconTapped(modifiers: [])
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertFalse(lab.model.slotsPresent)
+        XCTAssertEqual(lab.model.pendingCountdown, "4:00:00")
+        await gate.waitUntilStarted()
+        lab.controller.iconTapped(modifiers: [])
+        XCTAssertEqual(lab.model.phase, .starting)
+        XCTAssertFalse(lab.model.slotsPresent)
+        await gate.open()
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase != .running, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(lab.model.phase, .running)
+        let session = try XCTUnwrap(lab.manager.session)
+        XCTAssertEqual(session.endsAt.timeIntervalSince(session.startedAt), 4 * 3600)
+        XCTAssertFalse(lab.controller.pendingTickArmed)
+        XCTAssertFalse(lab.model.slotsPresent)
+        // A click never ends a session: during one it opens the pills to
+        // add time, as with the switch off.
+        lab.controller.iconTapped(modifiers: [])
+        XCTAssertEqual(lab.model.phase, .entering(.extend))
+        await settleQueuedRequests()
+        XCTAssertEqual(lab.manager.session, session)
+        lab.controller.collapse(returnFocus: false)
+        await lab.manager.end(reason: .user)
+        XCTAssertFalse(lab.manager.isActive)
+    }
+
+    @MainActor
+    func testQuickStartUsesTheConfiguredDefault() async throws {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.oneClickStart = true
+        lab.manager.config.defaultPreset = 1800
+        lab.controller.iconTapped(modifiers: [])
+        let deadline = Date().addingTimeInterval(2)
+        while !lab.manager.isActive, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let session = try XCTUnwrap(lab.manager.session)
+        XCTAssertEqual(session.endsAt.timeIntervalSince(session.startedAt), 1800)
+        await lab.manager.end(reason: .user)
+    }
+
+    /// A refused quick start reopens the pills with the requested length
+    /// and the refusal label, as a refused Enter does, so the reason shows
+    /// without another click.
+    @MainActor
+    func testRefusedQuickStartReopensThePillsWithTheReason() async {
+        let lab = Lab()
+        defer { lab.tearDown() }
+        lab.manager.config.oneClickStart = true
+        lab.h.backstop.failArm = true
+        lab.controller.iconTapped(modifiers: [])
+        let deadline = Date().addingTimeInterval(2)
+        while lab.model.phase == .starting, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(lab.manager.isActive)
+        XCTAssertEqual(lab.model.phase, .entering(.start))
+        XCTAssertEqual(lab.model.input.total, 4 * 3600)
+        XCTAssertNotNil(lab.manager.lastError)
+        XCTAssertEqual(lab.model.startError, MenuBarModel.startFailedText)
+        XCTAssertTrue(lab.model.slotsPresent)
+        XCTAssertFalse(lab.controller.pendingTickArmed)
+        lab.controller.collapse(returnFocus: false)
+    }
+
     @MainActor
     func testStatusHostUsesIntrinsicSizingAndHasAnIdleFittingSize() {
         let harness = Harness()
@@ -174,6 +252,52 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(after, fresh, "the changed frame must already read the new digits, not roll to them")
     }
 
+    /// The same for the countdown in the Compact panel, which shows the
+    /// running controls of the menu bar in a panel of its own.
+    @MainActor
+    func testTheCompactPanelCountdownChangesItsDigitsInOneStep() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.menuBarMode = .compact
+        await manager.start(duration: 4 * 3600)
+        let model = MenuBarModel()
+        model.phase = .running
+        let compact = CompactMenuModel()
+        compact.setPresented(true)
+
+        func makeHost() -> NSHostingView<CompactMenuView> {
+            let host = NSHostingView(rootView: CompactMenuView(
+                model: compact, menuBar: model, manager: manager,
+                onSubmit: {}, onEnd: {}, onDismiss: {}
+            ))
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            return host
+        }
+        func snapshot(_ host: NSHostingView<CompactMenuView>) -> Data {
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+                XCTFail("the countdown did not rasterise")
+                return Data()
+            }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            return rep.representation(using: .png, properties: [:]) ?? Data()
+        }
+
+        let host = makeHost()
+        let before = snapshot(host)
+        h.clock.advance(1)
+        manager.refreshCountdown()
+        XCTAssertEqual(manager.countdownText, "3:59:59")
+        let after = snapshot(host)
+        let fresh = snapshot(makeHost())
+
+        XCTAssertNotEqual(before, after, "the digits must change")
+        XCTAssertEqual(after, fresh, "the changed frame must already read the new digits, not roll to them")
+    }
+
     /// The blink was over in a handful of frames and barely read. It has to
     /// be slower than the baseline spring so the lid lift and the lash
     /// hand-over are seen, and slower than the Reduce Motion crossfade too.
@@ -284,17 +408,26 @@ final class UIStatusTests: XCTestCase {
 
     func testMachineLine() {
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: true, watts: 4.12, wifiSSID: "iPhone", batteryPercent: nil, isCharging: false),
-            "Lid: closed \u{00B7} 4.1 W \u{00B7} Wi-Fi: iPhone"
+            StatusLines.machine(lidClosed: true, watts: 4.12, batteryPercent: nil, isCharging: false),
+            "Lid: closed \u{00B7} 4.1 W"
         )
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: nil, batteryPercent: nil, isCharging: false),
+            StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: nil, isCharging: false),
             "Lid: open"
         )
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: "", batteryPercent: 82, isCharging: true),
+            StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: 82, isCharging: true),
             "Lid: open \u{00B7} 82% charging"
         )
+    }
+
+    func testNetworkLinePreservesStatusAndOmitsUnknownNames() {
+        XCTAssertEqual(StatusLines.network(wifiSSID: "iPhone"), "Wi-Fi: iPhone")
+        let hiddenName = WiFiStatusName.display(ssid: nil, locationAuthorized: false)
+        XCTAssertEqual(StatusLines.network(wifiSSID: hiddenName), "Wi-Fi: on (name hidden until Location is allowed)")
+        XCTAssertNil(StatusLines.network(wifiSSID: nil))
+        XCTAssertNil(StatusLines.network(wifiSSID: ""))
+        XCTAssertNil(StatusLines.network(wifiSSID: " \n "))
     }
 
     func testActionsLine() {
@@ -304,18 +437,26 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(StatusLines.actions(frozenCount: 0, dockerPaused: true, lastGap: 0), "Docker paused")
     }
 
+    /// The menu puts the warning sign in front of the shared text, which
+    /// has none: the popover draws a triangle instead.
     func testThrottleWarning() {
-        XCTAssertNil(StatusLines.throttleWarning([]))
-        XCTAssertEqual(StatusLines.throttleWarning(["Chrome"]), "\u{26A0} Chrome is throttled")
-        XCTAssertEqual(StatusLines.throttleWarning(["Chrome", "Arc"]), "\u{26A0} Chrome and Arc are throttled")
-        XCTAssertEqual(StatusLines.throttleWarning(["Chrome", "Arc", "Chromium"]), "\u{26A0} Chrome, Arc, and Chromium are throttled")
+        func line(_ names: [String]) -> String? {
+            let browsers = names.map { ThrottledBrowser(bundleId: "test.\($0)", name: $0) }
+            return StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: browsers, error: nil)
+                .first { $0.kind == .warning }?.title
+        }
+        XCTAssertNil(line([]))
+        XCTAssertEqual(line(["Chrome"]), "\u{26A0} Chrome is throttled")
+        XCTAssertEqual(line(["Chrome", "Arc"]), "\u{26A0} Chrome and Arc are throttled")
+        XCTAssertEqual(line(["Chrome", "Arc", "Chromium"]), "\u{26A0} Chrome, Arc, and Chromium are throttled")
     }
 
-    func testMenuListsStatusThenSettingsAndQuit() {
+    func testRunningMenuListsStatusThenEndSessionSettingsAndQuit() {
         let items = StatusMenu.items(
             sessionActive: true,
             sleepHeld: true,
             machine: "Lid: closed \u{00B7} 82%",
+            network: "Wi-Fi: iPhone",
             actions: "3 apps frozen",
             throttledBrowsers: [Self.chrome],
             error: nil
@@ -323,13 +464,95 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items, [
             StatusMenu.Item(title: "Sleep held per journal \u{2014} not verified live", kind: .info),
             StatusMenu.Item(title: "Lid: closed \u{00B7} 82%", kind: .info),
+            StatusMenu.Item(title: "Wi-Fi: iPhone", kind: .info),
             StatusMenu.Item(title: "3 apps frozen", kind: .info),
             StatusMenu.Item(title: "\u{26A0} Chrome is throttled", kind: .warning),
             StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
             StatusMenu.Item(title: "", kind: .separator),
+            StatusMenu.Item(title: StatusMenu.endSessionTitle, kind: .endSession),
             StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
             StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
         ])
+    }
+
+    @MainActor
+    func testScreenshotStatusUsesSeparateNativeMenuRows() throws {
+        let items = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: StatusLines.machine(lidClosed: false, watts: 0, batteryPercent: 100, isCharging: true),
+            network: StatusLines.network(wifiSSID: WiFiStatusName.display(ssid: nil, locationAuthorized: false)),
+            actions: nil,
+            throttledBrowsers: [ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome")],
+            error: nil
+        )
+        XCTAssertEqual(items, [
+            StatusMenu.Item(title: "Lid: open \u{00B7} 0.0 W \u{00B7} 100% charging", kind: .info),
+            StatusMenu.Item(title: "Wi-Fi: on (name hidden until Location is allowed)", kind: .info),
+            StatusMenu.Item(title: "\u{26A0} Google Chrome is throttled", kind: .warning),
+            StatusMenu.Item(title: "Relaunch Google Chrome unthrottled", kind: .relaunchBrowser(ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))),
+            StatusMenu.Item(title: "", kind: .separator),
+            StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
+            StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
+        ])
+
+        let menu = StatusMenu.menu(
+            items,
+            target: nil,
+            endSession: NSSelectorFromString("endSession"),
+            settings: NSSelectorFromString("settings"),
+            quit: NSSelectorFromString("quit"),
+            relaunchBrowser: NSSelectorFromString("relaunch:"),
+            stopWaitingForOutput: NSSelectorFromString("stopWaiting:")
+        )
+        XCTAssertEqual(menu.items.map { $0.accessibilityLabel() ?? $0.title }, items.map(\.title))
+        XCTAssertFalse(menu.autoenablesItems)
+        for entry in menu.items.prefix(2) {
+            XCTAssertFalse(entry.isEnabled)
+            XCTAssertNil(entry.action)
+            let row = try XCTUnwrap(entry.view as? StatusMenuLabel)
+            XCTAssertEqual(row.label.stringValue, entry.accessibilityLabel())
+            XCTAssertFalse(row.label.stringValue.contains("\n"))
+        }
+        XCTAssertEqual(menu.items[3].representedObject as? ThrottledBrowser, ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))
+        XCTAssertTrue(menu.items[3].isEnabled)
+        XCTAssertTrue(menu.items[4].isSeparatorItem)
+        XCTAssertEqual(menu.items[5].keyEquivalent, ",")
+        XCTAssertEqual(menu.items[6].keyEquivalent, "q")
+
+        let combined = StatusMenu.menu(
+            [StatusMenu.Item(title: items[0].title + " \u{00B7} " + items[1].title, kind: .info)] + Array(items.dropFirst(2)),
+            target: nil,
+            endSession: NSSelectorFromString("endSession"),
+            settings: NSSelectorFromString("settings"),
+            quit: NSSelectorFromString("quit"),
+            relaunchBrowser: NSSelectorFromString("relaunch:"),
+            stopWaitingForOutput: NSSelectorFromString("stopWaiting:")
+        )
+        menu.update()
+        combined.update()
+        XCTAssertLessThan(menu.size.width, combined.size.width, "Separate status rows reduce the native menu's width")
+    }
+
+    func testMenuOmitsAbsentOrEmptyNetworkRows() {
+        let networks: [String?] = [nil, "", " \n "]
+        for network in networks {
+            let items = StatusMenu.items(
+                sessionActive: false,
+                sleepHeld: false,
+                machine: "Lid: open",
+                network: network,
+                actions: nil,
+                throttledBrowsers: [],
+                error: nil
+            )
+            XCTAssertEqual(items, [
+                StatusMenu.Item(title: "Lid: open", kind: .info),
+                StatusMenu.Item(title: "", kind: .separator),
+                StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
+                StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
+            ])
+        }
     }
 
     func testIdleMenuIsJustSettingsAndQuitWithNoLeadingSeparator() {
@@ -337,6 +560,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: false,
             sleepHeld: false,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [],
             error: ""
@@ -353,6 +577,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: false,
             sleepHeld: false,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [],
             error: "sudo: a password is required"
@@ -376,7 +601,7 @@ final class UIStatusTests: XCTestCase {
         )
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .endSession, .settings, .quit]
         )
         XCTAssertEqual(items[3], StatusMenu.Item(
             title: "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings",
@@ -392,11 +617,16 @@ final class UIStatusTests: XCTestCase {
     /// Settings notice except for a missing item, where the empty field is
     /// the notice.
     func testHotspotPasswordProblemCopy() {
-        XCTAssertEqual(HotspotPasswordProblem.missing.menuLine, "\u{26A0} Hotspot password not saved: enter it in Settings")
+        XCTAssertEqual(HotspotPasswordProblem.missing.menuLine, "Hotspot password not saved: enter it in Settings")
+        // The menu adds the sign the popover draws as a triangle.
+        XCTAssertEqual(
+            StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], hotspotWarning: HotspotPasswordProblem.missing.menuLine, error: nil).first?.title,
+            "\u{26A0} Hotspot password not saved: enter it in Settings"
+        )
         XCTAssertNil(HotspotPasswordProblem.missing.settingsNotice)
         XCTAssertTrue(HotspotPasswordProblem.unreadable.settingsNotice?.contains("Enter it again and save") ?? false)
         XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.hasSuffix("Enter it again in Settings."))
-        XCTAssertEqual(HotspotPasswordProblem.error("keychain: boom").menuLine, "\u{26A0} Hotspot password unreadable: keychain: boom")
+        XCTAssertEqual(HotspotPasswordProblem.error("keychain: boom").menuLine, "Hotspot password unreadable: keychain: boom")
         XCTAssertEqual(HotspotPasswordProblem.error("keychain: boom").settingsNotice, "The saved password can't be read: keychain: boom")
         XCTAssertEqual(KeychainError(status: errSecAuthFailed).problem, .unreadable)
         XCTAssertEqual(KeychainError(status: errSecInteractionNotAllowed).problem, .unreadable)
@@ -461,6 +691,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: true,
             sleepHeld: true,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [Self.chrome, Self.arc],
             error: nil
@@ -469,7 +700,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser(Self.arc) }.count, 1)
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .endSession, .settings, .quit]
         )
     }
 
@@ -642,6 +873,16 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(lab.model.slotsPresent)
     }
 
+    @MainActor
+    private func waitUntil(_ timeout: TimeInterval = 2, _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
     /// Opening puts the three slots in the layout before any pill shows
     /// (one relayout, one write); closing folds the pills with their
     /// stagger over an unchanged width and the slots leave once the last
@@ -677,11 +918,15 @@ final class UIStatusTests: XCTestCase {
         XCTAssertTrue(controller.model.slotsPresent, "the bar must not snap under a pill that is still visible")
         XCTAssertEqual(controller.widthTarget, pillsWidth)
         XCTAssertEqual(lab.probe.applied.count, written, "no width write before the slots leave")
-        try? await Task.sleep(for: .milliseconds(Int(Motion.retractSettleDuration * 1000) + 100))
-        XCTAssertFalse(controller.model.slotsPresent)
+        // The slots leave on a timer, and the native width lands a settle
+        // after the layout's report (StatusItemWidthMotion): wait for each,
+        // with a bound, since a loaded runner stretches both delays.
+        let left = await waitUntil { !controller.model.slotsPresent }
+        XCTAssertTrue(left, "the slots leave once the last pill has settled")
         XCTAssertFalse(controller.model.pillsCollapsing, "the fold ends with the slots")
         XCTAssertEqual(controller.model.phase, .idle)
-        try? await Task.sleep(for: .milliseconds(100))
+        let landed = await waitUntil { lab.probe.applied.count > written }
+        XCTAssertTrue(landed, "the width is written after the slots leave")
         XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .idle), "the width moves on the layout's report")
         XCTAssertEqual(lab.probe.applied.count, written + 1, "one write, after the slots left")
         XCTAssertEqual(lab.probe.applied.last, controller.widthTarget)
@@ -844,9 +1089,13 @@ final class UIStatusTests: XCTestCase {
             StatusRootView.countdownText(pending: controller.model.pendingCountdown, live: lab.manager.countdownText, phase: controller.model.phase),
             controller.model.pendingCountdown
         )
-        try? await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .starting), "the width snaps once, after the slots left")
+        // Removing the slots retargets the eye; its reserved native width
+        // remains until that return animation finishes, then releases once.
+        let widthSettle = Motion.itemResizeDuration + Motion.collapseSettleMargin
+        try? await Task.sleep(for: .seconds(widthSettle + 0.1))
+        XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .starting), "the width retargets once, after the slots left")
         XCTAssertEqual(lab.probe.applied.count, written + 1)
+        XCTAssertEqual(lab.probe.applied.last, controller.widthTarget, "the native reservation releases after the eye arrives")
         XCTAssertEqual(lab.probe.writesWhileFolding, 0, lab.probe.foldingWrites.joined(separator: "; "))
 
         await gate.open()
@@ -1034,7 +1283,16 @@ final class UIStatusTests: XCTestCase {
         await lab.settleClose()
         XCTAssertFalse(controller.model.slotsPresent)
         XCTAssertNil(controller.model.startError, "cleared with the slots")
+        // The layout reports after the slots leave, then the eye's return
+        // animation releases its native reservation. Observe that write;
+        // the fold's fixed wait alone cannot prove both callbacks ran.
+        let widthBy = Date().addingTimeInterval(5)
+        while (lab.probe.applied.count == written || lab.probe.applied.last != controller.widthTarget), Date() < widthBy {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(lab.probe.applied.count, written + 1, "one write, after the slots left")
+        XCTAssertEqual(lab.probe.applied.last, controller.widthTarget, "the native reservation reached the reported width")
+        XCTAssertEqual(lab.probe.slotsAtWrite.last, false, "the write happened after the slots left")
         XCTAssertEqual(lab.probe.writesWhileFolding, 0, lab.probe.foldingWrites.joined(separator: "; "))
         let confirmBy = Date().addingTimeInterval(2)
         while controller.model.phase != .running, Date() < confirmBy {
@@ -1199,18 +1457,175 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(manager.countdownText, "1:59:59")
     }
 
+    // MARK: Countdown style
+
+    /// The end time is a fixed text for the whole session, so nothing needs to
+    /// redraw the status item each second.
+    @MainActor
+    func testEndTimeStyleArmsNoCountdownTimerAndShowsTheEndTime() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 4 * 3600)
+        let endsAt = h.clock.now.addingTimeInterval(4 * 3600)
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, SessionMath.formatEndTime(endsAt, now: h.clock.now))
+        XCTAssertFalse(manager.countdownText.isEmpty)
+    }
+
+    @MainActor
+    func testRemainingStyleStillArmsTheCountdownTimer() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 4 * 3600)
+        XCTAssertTrue(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+    }
+
+    /// Settings calls `countdownStyleChanged()` on a change, and a running
+    /// session shows the new style at once; the tick goes or comes back with it.
+    @MainActor
+    func testChangingTheStyleReachesARunningSessionAtOnce() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 4 * 3600)
+        XCTAssertTrue(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+
+        manager.config.countdownStyle = .endTime
+        manager.countdownStyleChanged()
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, SessionMath.formatEndTime(h.clock.now.addingTimeInterval(4 * 3600), now: h.clock.now))
+
+        manager.config.countdownStyle = .remaining
+        manager.countdownStyleChanged()
+        XCTAssertTrue(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+    }
+
+    /// A closed lid has the tick stopped; a style change must not restart it.
+    @MainActor
+    func testChangingTheStyleDoesNotRestartAPausedCountdown() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 4 * 3600)
+        manager.pauseCountdown()
+
+        manager.config.countdownStyle = .remaining
+        manager.countdownStyleChanged()
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+    }
+
+    @MainActor
+    func testLidOpenArmsNoCountdownTimerWithTheEndTime() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 4 * 3600)
+        let endTime = manager.countdownText
+
+        manager.pauseCountdown()
+        h.clock.advance(60)
+        manager.resumeCountdown()
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, endTime)
+    }
+
+    @MainActor
+    func testEndTimeFollowsAnExtension() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 3600)
+        let before = manager.countdownText
+        await manager.extend(by: 5 * 3600)
+        XCTAssertNotEqual(manager.countdownText, before)
+        XCTAssertEqual(manager.countdownText, SessionMath.formatEndTime(h.clock.now.addingTimeInterval(6 * 3600), now: h.clock.now))
+    }
+
+    /// The projection stands in for the live text until the manager confirms
+    /// the session, so it must read exactly what the manager will.
+    @MainActor
+    func testTheProjectionReadsTheSameTextAsTheManagerInEveryStyle() async {
+        for style in CountdownStyle.allCases {
+            let h = Harness()
+            defer { h.home.destroy() }
+            let manager = h.makeManager()
+            manager.config.countdownStyle = style
+            let projection = MenuBarModel.projectedStart(now: h.clock.now, duration: 4 * 3600, maxDuration: manager.config.maxDuration, style: style)
+            await manager.start(duration: 4 * 3600)
+            XCTAssertEqual(projection.countdown(at: h.clock.now), manager.countdownText, "\(style)")
+        }
+    }
+
+    /// The 1 Hz tick of the projected countdown has nothing to redraw when the
+    /// text is the end time.
+    @MainActor
+    func testPendingTickRunsOnlyInRemainingStyle() async {
+        _ = NSApplication.shared
+        for style in CountdownStyle.allCases {
+            let h = Harness()
+            defer { h.home.destroy() }
+            let manager = h.makeManager()
+            manager.config.countdownStyle = style
+            let clock = h.clock
+            let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {}, clock: { clock.now })
+            let gate = AsyncGate()
+            h.backstop.armGate = gate
+            controller.expand(mode: .start)
+            controller.focus(.hours)
+            XCTAssertTrue(controller.model.input.append(digit: 2, to: .hours))
+
+            controller.commit()
+            await gate.waitUntilStarted()
+            XCTAssertEqual(controller.model.phase, .starting)
+            XCTAssertEqual(controller.pendingTickArmed, style == .remaining, "\(style)")
+            XCTAssertEqual(controller.model.pendingCountdown, MenuBarModel.projectedStart(now: clock.now, duration: 2 * 3600, maxDuration: manager.config.maxDuration, style: style).countdown(at: clock.now), "\(style)")
+            await gate.open()
+            let confirmBy = Date().addingTimeInterval(2)
+            while controller.model.phase != .running, Date() < confirmBy {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(controller.model.phase, .running, "\(style)")
+            await manager.end(reason: .user)
+        }
+    }
+
+    /// The bar no longer shows the time left, so the right-click menu does.
+    /// With the time left on the bar the menu is as it was.
+    @MainActor
+    func testTheMenuOffersTheTimeLeftOnlyWithTheEndTimeCountdown() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 2 * 3600 + 14 * 60)
+        XCTAssertFalse(StatusItemController.menuItems(manager: manager, status: PlaceholderStatus()).map(\.title).contains { $0.hasPrefix("Time left") })
+
+        manager.config.countdownStyle = .endTime
+        manager.refreshCountdown()
+        let titles = StatusItemController.menuItems(manager: manager, status: PlaceholderStatus()).map(\.title)
+        XCTAssertTrue(titles.contains("Time left: 2h 14m"), "\(titles)")
+    }
+
     /// The digits are read by a local key monitor, which only sees events sent
     /// to a window this app owns. The catcher panel is that window, and the
-    /// whole fix rests on it being able to take key without taking a click,
-    /// and without activating this app: the app in front stays frontmost and
-    /// only key status moves to the pills while they are up.
+    /// panel must accept key status without taking clicks. It uses normal
+    /// app activation so keys cannot remain routed to the previous app.
     @MainActor
-    func testTheKeyCatcherPanelTakesKeyStatusWithoutTakingClicksOrActivating() {
+    func testTheKeyCatcherPanelAcceptsKeysWithoutTakingClicks() {
         _ = NSApplication.shared
         let panel = KeyCatcherPanel()
 
         XCTAssertTrue(panel.canBecomeKey)
-        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertFalse(panel.styleMask.contains(.nonactivatingPanel))
         XCTAssertTrue(panel.ignoresMouseEvents)
         XCTAssertEqual(panel.level, .statusBar)
         XCTAssertTrue(panel.collectionBehavior.contains(.canJoinAllSpaces))
@@ -1245,6 +1660,1045 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(panel?.isVisible ?? true)
         XCTAssertFalse(NSApp.windows.contains { $0 is KeyCatcherPanel && $0.isVisible })
     }
+
+    @MainActor
+    func testLosingKeyboardFocusClosesThePillsAndDropsTheKeyCatcher() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let controller = StatusItemController(manager: h.makeManager(), status: PlaceholderStatus(), showSettings: {})
+        // Off the item. On it, a lost focus waits out the press instead
+        // (RefocusWait), which PillRefocusTests covers.
+        controller.pointerLocation = { NSPoint(x: -10_000, y: -10_000) }
+        controller.expand(mode: .start)
+        let panel = NSApp.windows.compactMap { $0 as? KeyCatcherPanel }.first { $0.isVisible }
+        XCTAssertNotNil(panel)
+
+        panel?.resignKey()
+
+        XCTAssertTrue(controller.model.pillsCollapsing)
+        XCTAssertFalse(panel?.isVisible ?? true)
+        XCTAssertFalse(controller.model.focusVisible)
+        XCTAssertNil(panel?.onFocusLost)
+    }
+
+    /// Tests that open the popover must not leave it up for the next test.
+    override func tearDown() {
+        MainActor.assumeIsolated {
+            for window in NSApp.windows where window.className.contains("Popover") && window.isVisible {
+                window.orderOut(nil)
+            }
+        }
+        super.tearDown()
+    }
+
+    /// In Popover style the bar's host draws over the status bar button and
+    /// must never take a click: the button under it toggles the popover.
+    /// In the other styles the host hit-tests as a plain hosting view of
+    /// the same bar does, as on the base. On macOS 26 that view takes the
+    /// click. On macOS 27 a hosting view in a test window can answer nil
+    /// for itself, so there the check is only that the two agree.
+    @MainActor
+    func testTheBarHostLetsClicksThroughToTheButtonOnlyInPopoverStyle() {
+        let harness = Harness()
+        defer { harness.home.destroy() }
+        let manager = harness.makeManager()
+        func bar() -> StatusRootView {
+            StatusRootView(model: MenuBarModel(), manager: manager, onTapIcon: {}, onTapPill: { _ in }, onTapCountdown: {}, onHoldEnd: {}, onWidthChange: { _ in })
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 80, height: 22), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let host = StatusItemController.makeHostingView(bar())
+        let plain = NSHostingView(rootView: bar())
+        plain.sizingOptions = host.sizingOptions
+        host.frame = NSRect(x: 0, y: 0, width: 40, height: 22)
+        plain.frame = NSRect(x: 40, y: 0, width: 40, height: 22)
+        window.contentView?.addSubview(host)
+        window.contentView?.addSubview(plain)
+        window.layoutIfNeeded()
+        // A hit test takes a point in the superview's coordinates.
+        let onHost = NSPoint(x: 10, y: 10)
+        let plainTakesIt = plain.hitTest(NSPoint(x: 50, y: 10)) != nil
+        if ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 27 {
+            XCTAssertTrue(plainTakesIt, "the bar takes its clicks in the view")
+        }
+        XCTAssertEqual(host.hitTest(onHost) != nil, plainTakesIt, "Pills, Compact and Minimal take their clicks as on the base")
+        host.passesClicksThrough = true
+        XCTAssertNil(host.hitTest(onHost))
+        host.passesClicksThrough = false
+        XCTAssertEqual(host.hitTest(onHost) != nil, plainTakesIt)
+    }
+
+    /// Only Popover style gives the button an action; a style change moves
+    /// the clicks over at once, in both directions.
+    @MainActor
+    func testOnlyPopoverStyleRoutesClicksToTheButton() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        let button = try! XCTUnwrap(controller.nativeStatusItem.button)
+        let host = try! XCTUnwrap(button.subviews.compactMap { $0 as? StatusHostingView }.first)
+        func routed() -> Bool { button.action != nil || button.target != nil || host.passesClicksThrough }
+        XCTAssertFalse(routed(), "Pills, the default, keeps the base's click handling")
+        for mode in [Config.MenuBarMode.compact, .minimal] {
+            manager.config.menuBarMode = mode
+            controller.synchronizePresentation()
+            XCTAssertFalse(routed(), "\(mode)")
+        }
+        manager.config.menuBarMode = .popover
+        controller.synchronizePresentation()
+        XCTAssertTrue(host.passesClicksThrough)
+        XCTAssertTrue(button.target === controller)
+        XCTAssertNotNil(button.action)
+        manager.config.menuBarMode = .pills
+        controller.synchronizePresentation()
+        XCTAssertFalse(routed(), "leaving Popover takes the button's action away again")
+    }
+
+    /// Popover style's bar is the eye, closed while idle, and beside it a
+    /// short countdown while a session runs or starts. Typing in the
+    /// popover's fields never reaches it, and with the countdown turned off
+    /// in Settings the bar is the eye alone at one width.
+    @MainActor
+    func testThePopoverBarIsTheEyeAndAShortCountdownWhileASessionRuns() async {
+        let harness = Harness()
+        defer { harness.home.destroy() }
+        let manager = harness.makeManager()
+        manager.config.menuBarMode = .popover
+        let model = MenuBarModel()
+        func width() -> CGFloat {
+            StatusItemController.makeHostingView(StatusRootView(model: model, manager: manager, onTapIcon: {}, onTapPill: { _ in }, onTapCountdown: {}, onHoldEnd: {}, onWidthChange: { _ in })).fittingSize.width
+        }
+        let idle = width()
+        XCTAssertEqual(idle, StatusRootView.width, accuracy: 0.5, "the item hugs the eye, like the system's own icons")
+        model.texts = [.days: "12", .hours: "3", .minutes: "45"]
+        model.popoverShown = true
+        XCTAssertEqual(width(), idle, accuracy: 0.001, "the fields live in the popover, not the bar")
+
+        await manager.start(duration: 2 * 3600 + 31 * 60)
+        model.phase = .running
+        XCTAssertEqual(manager.remainingText, "2h 31m")
+        let running = width()
+        XCTAssertGreaterThan(running, idle + 20, "the short countdown sits beside the eye")
+        model.texts = [:]
+        XCTAssertEqual(width(), running, accuracy: 0.001)
+        model.phase = .starting
+        model.pendingCountdown = "2h"
+        XCTAssertGreaterThan(width(), idle + 10, "a pending start shows its projection")
+
+        manager.config.showMenuBarCountdown = false
+        XCTAssertEqual(width(), idle, accuracy: 0.001, "the countdown switch applies to Popover style too")
+        model.phase = .running
+        model.pendingCountdown = nil
+        XCTAssertEqual(width(), idle, accuracy: 0.001, "and to a running session")
+    }
+
+    /// The short countdown follows the countdown style: the time left to
+    /// the minute, or the end time. VoiceOver reads the session either way,
+    /// and names an end time for what it is.
+    @MainActor
+    func testThePopoverBarCountdownFollowsTheCountdownStyle() {
+        XCTAssertEqual(StatusRootView.popoverLiveCountdown(style: .remaining, remaining: "2h 14m", endTime: "17:30"), "2h 14m")
+        XCTAssertEqual(StatusRootView.popoverLiveCountdown(style: .endTime, remaining: "2h 14m", endTime: "17:30"), "17:30")
+        func value(running: Bool = true, starting: Bool = false, _ style: CountdownStyle, remaining: String = "2h 14m", endTime: String = "17:30") -> String {
+            StatusRootView.popoverAccessibilityValue(running: running, starting: starting, style: style, remaining: remaining, endTime: endTime)
+        }
+        XCTAssertEqual(value(.remaining), "Awake, 2h 14m left")
+        XCTAssertEqual(value(.endTime), "Awake, ends at 17:30")
+        XCTAssertEqual(value(.remaining, remaining: ""), "Awake")
+        XCTAssertEqual(value(running: false, starting: true, .remaining), "Starting session")
+        XCTAssertEqual(value(running: false, .endTime), "Idle")
+    }
+
+    /// The eye opens (and takes the accent) the moment a start is asked
+    /// for, stays open while sleep is held, and closes otherwise.
+    @MainActor
+    func testTheEyeOpensForAPendingStartOrALiveSession() {
+        XCTAssertFalse(StatusRootView.eyeOpen(isRunning: false, phase: .idle))
+        XCTAssertTrue(StatusRootView.eyeOpen(isRunning: false, phase: .starting))
+        XCTAssertTrue(StatusRootView.eyeOpen(isRunning: true, phase: .running))
+        XCTAssertTrue(StatusRootView.eyeOpen(isRunning: true, phase: .idle), "a session started outside the UI still opens it")
+        XCTAssertFalse(StatusRootView.eyeOpen(isRunning: false, phase: .running), "a phase lagging an ended session does not")
+    }
+
+    /// The projection's short form is the same minute-resolution text the
+    /// manager's live one will read, so the swap does not jump.
+    @MainActor
+    func testTheShortProjectionMatchesTheLiveMinuteText() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let month: TimeInterval = 30 * 24 * 3600
+        let projection = MenuBarModel.projectedStart(now: now, duration: 2 * 3600 + 31 * 60, maxDuration: month)
+        XCTAssertEqual(projection.shortCountdown(at: now), "2h 31m")
+        XCTAssertEqual(projection.shortCountdown(at: now.addingTimeInterval(1)), "2h 30m")
+        XCTAssertEqual(MenuBarModel.projectedStart(now: now, duration: 45 * 60, maxDuration: month).shortCountdown(at: now), "45m")
+        XCTAssertEqual(MenuBarModel.projectedStart(now: now, duration: 86400, maxDuration: month).shortCountdown(at: now), "1d")
+    }
+
+    @MainActor
+    func testThePopoverHeaderSaysWhatIsHappeningInOneLine() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let now = calendar.date(from: DateComponents(year: 2026, month: 10, day: 13, hour: 9, minute: 0))!
+        XCTAssertEqual(
+            StatusPopoverView.headerText(phase: .idle, session: nil, remaining: "", now: now, calendar: calendar),
+            "Not keeping your Mac awake"
+        )
+        XCTAssertEqual(
+            StatusPopoverView.headerText(phase: .starting, session: nil, remaining: "", now: now, calendar: calendar),
+            MenuBarModel.startingText
+        )
+        let today = Session(startedAt: now, endsAt: now.addingTimeInterval(2 * 3600 + 31 * 60))
+        let line = StatusPopoverView.headerText(phase: .running, session: today, remaining: "2h 31m", now: now, calendar: calendar)
+        XCTAssertTrue(line.hasPrefix("Awake until "), line)
+        XCTAssertTrue(line.hasSuffix(", 2h 31m left"), line)
+        XCTAssertTrue(line.contains(today.endsAt.formatted(.dateTime.hour().minute())), line)
+        // A deadline on another day names the day too.
+        let tomorrow = Session(startedAt: now, endsAt: now.addingTimeInterval(26 * 3600))
+        let later = StatusPopoverView.headerText(phase: .running, session: tomorrow, remaining: "1d 2h", now: now, calendar: calendar)
+        XCTAssertTrue(later.contains(tomorrow.endsAt.formatted(.dateTime.weekday(.abbreviated).hour().minute())), later)
+        // Through any end, with the session still active or already cleared.
+        XCTAssertEqual(
+            StatusPopoverView.headerText(phase: .running, ending: true, session: today, remaining: "2h 31m", now: now, calendar: calendar),
+            MenuBarModel.endingText
+        )
+        XCTAssertEqual(
+            StatusPopoverView.headerText(phase: .idle, ending: true, session: nil, remaining: "", now: now, calendar: calendar),
+            MenuBarModel.endingText
+        )
+    }
+
+    func testMachineRows() {
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: true, watts: 4.12, wifi: WiFiStatusName.Display(text: "iPhone", help: nil), batteryPercent: nil, isCharging: false),
+            [
+                StatusMenu.Item(title: "Lid closed", kind: .info, symbol: "laptopcomputer"),
+                StatusMenu.Item(title: "4.1 W", kind: .info, symbol: "bolt"),
+                StatusMenu.Item(title: "iPhone", kind: .info, symbol: "wifi"),
+            ]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false),
+            [StatusMenu.Item(title: "Lid open", kind: .info, symbol: "laptopcomputer")]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: 51.4, wifi: nil, batteryPercent: 54, isCharging: true).map(\.title),
+            ["Lid open", "54% \u{00B7} Charging 51 W"]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: 82, isCharging: false).last,
+            StatusMenu.Item(title: "82%", kind: .info, symbol: "battery.75percent")
+        )
+        // Plugged in at the charge limit: no "0.0 W", just on the adapter.
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: 0.0, wifi: nil, batteryPercent: 80, isCharging: true).last,
+            StatusMenu.Item(title: "80% \u{00B7} On power adapter", kind: .info, symbol: "powerplug")
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: -0.3, wifi: nil, batteryPercent: 80, isCharging: true).last?.title,
+            "80% \u{00B7} On power adapter"
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: 0.2, wifi: nil, batteryPercent: 80, isCharging: false).last?.title,
+            "80%", "on battery a tiny draw is just left out"
+        )
+        // Plugged in but draining: the adapter and the draw, never "Charging".
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: -5.62, wifi: nil, batteryPercent: 62, isCharging: true).last,
+            StatusMenu.Item(title: "62% \u{00B7} On power adapter \u{00B7} 5.6 W", kind: .info, symbol: "powerplug")
+        )
+        // Discharging: no minus sign, the draw as it is.
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: -5.62, wifi: nil, batteryPercent: 48, isCharging: false).last?.title,
+            "48% \u{00B7} 5.6 W"
+        )
+        // Location not allowed: "On", with the reason as the tooltip.
+        let hidden = StatusLines.machine(lidClosed: false, watts: nil, wifi: WiFiStatusName.row(ssid: nil, locationAuthorized: false), batteryPercent: nil, isCharging: false)
+        XCTAssertEqual(hidden.last, StatusMenu.Item(title: "On", kind: .info, symbol: "wifi", help: WiFiStatusName.hiddenHelp))
+    }
+
+    /// The battery's time, as the battery menu and Activity Monitor give
+    /// it: left on battery, to full while charging, a word while the system
+    /// is still estimating, and nothing on the adapter at rest.
+    func testPowerRowShowsTheTimeRemaining() {
+        func title(_ watts: Double?, _ percent: Int?, charging: Bool, _ time: BatteryTimeRemaining?) -> String? {
+            StatusLines.machine(lidClosed: false, watts: watts, wifi: nil, batteryPercent: percent, isCharging: charging, timeRemaining: time).dropFirst().first?.title
+        }
+        XCTAssertEqual(title(-5.6, 48, charging: false, .untilEmpty(minutes: 152)), "48% \u{00B7} 5.6 W \u{00B7} 2:32 left")
+        XCTAssertEqual(title(-12.3, 48, charging: false, .untilEmpty(minutes: 45)), "48% \u{00B7} 12 W \u{00B7} 0:45 left")
+        XCTAssertEqual(title(-5.6, 48, charging: false, .calculating), "48% \u{00B7} 5.6 W \u{00B7} Calculating\u{2026}")
+        XCTAssertEqual(title(27, 54, charging: true, .untilFull(minutes: 70)), "54% \u{00B7} Charging 27 W \u{00B7} 1:10 to full")
+        XCTAssertEqual(title(27, 54, charging: true, .calculating), "54% \u{00B7} Charging 27 W \u{00B7} Calculating\u{2026}")
+        XCTAssertEqual(title(0.1, 80, charging: true, .calculating), "80% \u{00B7} On power adapter", "no time at rest on the adapter")
+        XCTAssertEqual(title(nil, 82, charging: false, .untilEmpty(minutes: 600)), "82% \u{00B7} 10:00 left")
+        // A time for the other direction (stale across a plug change) is not shown.
+        XCTAssertEqual(title(27, 54, charging: true, .untilEmpty(minutes: 100)), "54% \u{00B7} Charging 27 W")
+        // Plugged in but draining, with a time to full from the system:
+        // neither "Charging" nor "to full" (2f582a26).
+        XCTAssertEqual(title(-5.6, 62, charging: true, .untilFull(minutes: 70)), "62% \u{00B7} On power adapter \u{00B7} 5.6 W")
+    }
+
+    /// The power source list's minutes become a time remaining: -1 while
+    /// the system is estimating, 0 where there is no time to give.
+    func testTimeRemainingFromThePowerSourceList() {
+        func battery(_ state: String, charging: Bool, empty: Int, full: Int) -> [[String: Any]] {
+            [[kIOPSTypeKey: kIOPSInternalBatteryType, kIOPSPowerSourceStateKey: state, kIOPSIsChargingKey: charging,
+              kIOPSTimeToEmptyKey: empty, kIOPSTimeToFullChargeKey: full]]
+        }
+        XCTAssertEqual(PowerMonitor.timeRemaining(sources: battery(kIOPSBatteryPowerValue, charging: false, empty: 152, full: 0)), .untilEmpty(minutes: 152))
+        XCTAssertEqual(PowerMonitor.timeRemaining(sources: battery(kIOPSBatteryPowerValue, charging: false, empty: -1, full: 0)), .calculating)
+        XCTAssertEqual(PowerMonitor.timeRemaining(sources: battery(kIOPSACPowerValue, charging: true, empty: 0, full: 70)), .untilFull(minutes: 70))
+        XCTAssertEqual(PowerMonitor.timeRemaining(sources: battery(kIOPSACPowerValue, charging: true, empty: 0, full: -1)), .calculating)
+        XCTAssertNil(PowerMonitor.timeRemaining(sources: battery(kIOPSACPowerValue, charging: false, empty: 0, full: 0)), "held or full")
+        XCTAssertNil(PowerMonitor.timeRemaining(sources: []), "no battery")
+    }
+
+    func testActionRowsAppearOnlyWhenTheyApply() {
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 0, dockerPaused: false, lastGap: nil), [])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 3, dockerPaused: true, lastGap: nil), [
+            StatusMenu.Item(title: "3 apps frozen", kind: .info, symbol: "snowflake"),
+            StatusMenu.Item(title: "Docker paused", kind: .info, symbol: "shippingbox"),
+        ])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 1, dockerPaused: false, lastGap: 12.4).map(\.title), ["1 app frozen", "Last network gap 12s"])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 0, dockerPaused: true, lastGap: 0).map(\.title), ["Docker paused"])
+    }
+
+    func testThrottleWarningInThePopover() {
+        XCTAssertNil(StatusLines.throttleWarning([]))
+        XCTAssertEqual(StatusLines.throttleWarning(["Chrome"]), "Chrome is throttled")
+        XCTAssertEqual(StatusLines.throttleWarning(["Chrome", "Arc"]), "Chrome and Arc are throttled")
+        XCTAssertEqual(StatusLines.throttleWarning(["Chrome", "Arc", "Chromium"]), "Chrome, Arc, and Chromium are throttled")
+    }
+
+    /// Facts first (the machine, what is held), then warnings,
+    /// each relaunch button on the throttle warning's row. Settings and
+    /// Quit are the footer, not rows.
+    func testRowsListFactsThenWarningsWithTheirButtons() {
+        let machine = StatusLines.machine(lidClosed: true, watts: nil, wifi: nil, batteryPercent: 82, isCharging: false)
+        let actions = StatusLines.actionRows(frozenCount: 3, dockerPaused: false, lastGap: nil)
+        let items = StatusMenu.popoverItems(
+            sessionActive: true,
+            sleepHeld: true,
+            machine: machine,
+            actions: actions,
+            throttledBrowsers: [Self.chrome],
+            error: nil
+        )
+        XCTAssertEqual(items, [
+            StatusMenu.Item(title: "Lid closed", kind: .info, symbol: "laptopcomputer"),
+            StatusMenu.Item(title: "82%", kind: .info, symbol: "battery.75percent"),
+            StatusMenu.Item(title: "3 apps frozen", kind: .info, symbol: "snowflake"),
+            StatusMenu.Item(title: "Chrome is throttled", kind: .warning),
+            StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
+        ])
+        let rows = StatusMenu.rows(items)
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertEqual(rows.last, StatusMenu.Row(item: items[3], actions: [items[4]]))
+    }
+
+    func testIdleRowsAreEmpty() {
+        let items = StatusMenu.popoverItems(sessionActive: false, sleepHeld: false, throttledBrowsers: [], error: "")
+        XCTAssertEqual(items, [])
+        XCTAssertEqual(StatusMenu.rows(items), [])
+    }
+
+    func testRowsShowTheLastErrorAsAWarning() {
+        let items = StatusMenu.popoverItems(sessionActive: false, sleepHeld: false, throttledBrowsers: [], error: "sudo: a password is required")
+        XCTAssertEqual(items, [StatusMenu.Item(title: "sudo: a password is required", kind: .warning)])
+    }
+
+    /// A hotspot join skipped for want of a password is a warning row,
+    /// between the browser row and the session error, so the failure is
+    /// never silent.
+    func testRowsShowTheHotspotPasswordProblemAsAWarning() {
+        let items = StatusMenu.popoverItems(
+            sessionActive: true,
+            sleepHeld: true,
+            throttledBrowsers: [Self.chrome],
+            hotspotWarning: HotspotPasswordProblem.unreadable.menuLine,
+            error: "sudo: a password is required"
+        )
+        XCTAssertEqual(
+            items.map(\.kind),
+            [.warning, .relaunchBrowser(Self.chrome), .warning, .warning]
+        )
+        XCTAssertEqual(items[2], StatusMenu.Item(
+            title: "Hotspot password unreadable by this build: enter it again in Settings",
+            kind: .warning
+        ))
+        XCTAssertEqual(
+            StatusMenu.popoverItems(sessionActive: false, sleepHeld: false, throttledBrowsers: [], hotspotWarning: nil, error: nil),
+            []
+        )
+    }
+
+    /// Greptile caught this as a regression once: a throttle warning with
+    /// no way to act on it. Every throttled browser keeps its own button.
+    func testEveryThrottledBrowserGetsItsOwnRelaunchButton() {
+        let items = StatusMenu.popoverItems(
+            sessionActive: true,
+            sleepHeld: true,
+            throttledBrowsers: [Self.chrome, Self.arc],
+            error: nil
+        )
+        XCTAssertEqual(
+            items.map(\.kind),
+            [.warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc)]
+        )
+        XCTAssertEqual(StatusMenu.rows(items).last?.actions.map(\.kind), [.relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc)])
+    }
+
+    /// The popover reads the watts when it opens and when the battery
+    /// changes while it is up. Its redraws read the last reading, so typing
+    /// in its fields reads IOKit not at all.
+    @MainActor
+    func testThePopoverReadsTheWattsOnOpenAndOnABatteryChangeOnly() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = CountingStatusSource()
+        source.watts = -6.5
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        controller.openPopover()
+        XCTAssertEqual(controller.model.popoverPower?.watts, -6.5)
+        let reads = source.powerReads
+        let view = controller.makePopoverView()
+        _ = view.items()
+        controller.model.texts[.hours] = "2"
+        _ = view.items()
+        XCTAssertEqual(source.powerReads, reads, "redraws read the last reading")
+
+        source.watts = 12
+        source.isCharging = true
+        for _ in 0..<200 where controller.model.popoverPower?.watts != 12 {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(controller.model.popoverPower?.watts, 12, "a battery change reads them again")
+        controller.closePopover()
+        let closed = source.powerReads
+        source.isCharging = false
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(source.powerReads, closed, "nothing is read while the popover is closed")
+    }
+
+    /// The watts and the time left move with no change in the percent or
+    /// the charging state, so an open popover reads them again on a timer,
+    /// and stops when it closes.
+    @MainActor
+    func testAnOpenPopoverReadsThePowerAgainWithNoBatteryChange() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = CountingStatusSource()
+        source.watts = -6.5
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        controller.popoverPowerInterval = 0.05
+        controller.openPopover()
+        XCTAssertEqual(controller.model.popoverPower?.watts, -6.5)
+        source.watts = -9
+        for _ in 0..<200 where controller.model.popoverPower?.watts != -9 {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(controller.model.popoverPower?.watts, -9)
+        controller.closePopover()
+        let closed = source.powerReads
+        try? await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(source.powerReads, closed, "nothing is read while the popover is closed")
+        XCTAssertNil(controller.popoverPowerTick)
+    }
+
+    /// A controller released with the popover up stops its power timer
+    /// the next time it fires.
+    @MainActor
+    func testAReleasedControllerStopsThePopoverPowerTimer() async throws {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = CountingStatusSource()
+        weak var released: StatusItemController?
+        var timer: Timer?
+        do {
+            let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+            controller.popoverPowerInterval = 0.05
+            controller.openPopover()
+            timer = controller.popoverPowerTick
+            released = controller
+        }
+        for _ in 0..<100 where released != nil {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        try XCTSkipIf(released != nil, "the controller is still held elsewhere")
+        let tick = try XCTUnwrap(timer)
+        for _ in 0..<100 where tick.isValid {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(tick.isValid)
+    }
+
+    /// One popover, toggled by the item: the first click opens it on fresh
+    /// status and empty fields, the next closes it.
+    @MainActor
+    func testClickingTheItemTogglesOnePopover() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = CountingStatusSource()
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        controller.model.texts = [.hours: "3"]
+        XCTAssertNil(controller.popover, "built on first open")
+
+        controller.togglePopover()
+        XCTAssertTrue(controller.model.popoverShown)
+        XCTAssertEqual(controller.model.texts, [:], "a fresh open starts with empty fields")
+        XCTAssertEqual(source.instant, 1, "the lid, the battery and the watts are read on open")
+        XCTAssertEqual(source.onDemand, 1, "the scans are kicked off on open")
+        let popover = controller.popover
+        XCTAssertNotNil(popover)
+        XCTAssertEqual(popover?.behavior, .applicationDefined, "the controller closes it, on a click outside or Esc")
+        XCTAssertTrue(popover?.contentViewController is NSHostingController<StatusPopoverView>)
+
+        controller.togglePopover()
+        XCTAssertFalse(controller.model.popoverShown)
+        controller.togglePopover()
+        XCTAssertTrue(controller.model.popoverShown)
+        XCTAssertTrue(controller.popover === popover, "the same popover every time")
+        XCTAssertEqual(source.instant, 2)
+        controller.closePopover()
+        XCTAssertFalse(controller.model.popoverShown)
+    }
+
+    /// A controller whose popover hangs from a plain on-screen window: a
+    /// status item in a test process may never be on screen, and a popover
+    /// asked to hang from it then never shows.
+    @MainActor
+    private func anchoredController(_ h: Harness) -> (StatusItemController, NSWindow) {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 200, y: 400, width: 120, height: 40), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.orderFrontRegardless()
+        let controller = StatusItemController(
+            manager: popoverManager(h), status: PlaceholderStatus(), showSettings: {}, appFocus: Self.quietFocus
+        )
+        controller.popoverAnchor = window.contentView
+        return (controller, window)
+    }
+
+    /// Reads Insomnia as already in front, so opening a popover in a test
+    /// neither activates the test runner nor gives focus to another app.
+    @MainActor
+    static var quietFocus: CompactDropdownController.AppFocus {
+        CompactDropdownController.AppFocus(
+            frontmost: { nil }, isActive: { true }, hasKeyWindow: { false }, activate: {}, yield: { _ in }
+        )
+    }
+
+    /// A manager in Popover style, the one style with the popover.
+    @MainActor
+    private func popoverManager(_ h: Harness) -> SessionManager {
+        let manager = h.makeManager()
+        manager.config.menuBarMode = .popover
+        return manager
+    }
+
+    /// Every click flips the popover at once, however fast they come: the
+    /// popover on screen matches the model after each one, with no waiting.
+    /// The bug this pins: the popover animated closed for about half a
+    /// second, a show during that was put off, and a transient popover also
+    /// closed itself on the item's own click, so fast clicks were swallowed
+    /// and the popover fell out of step with them.
+    @MainActor
+    func testFastClicksEachFlipThePopoverAtOnce() {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let (controller, window) = anchoredController(h)
+        defer { window.orderOut(nil) }
+        for click in 1...21 {
+            controller.togglePopover()
+            let open = click % 2 == 1
+            XCTAssertEqual(controller.model.popoverShown, open, "click \(click)")
+            XCTAssertEqual(controller.popover?.isShown, open, "click \(click): on screen")
+        }
+        let popover = try! XCTUnwrap(controller.popover)
+        XCTAssertEqual(popover.behavior, .applicationDefined, "closed by the controller only")
+        XCTAssertFalse(popover.animates, "never animates closed")
+        controller.closePopover()
+        XCTAssertFalse(popover.isShown)
+    }
+
+    /// On current macOS a click on the item first reaches the app as a
+    /// click outside it (a global mouse-down, the app resigning active),
+    /// then as the item's action. The first must not close the popover, or
+    /// the action reopens it and the click does nothing visible; a click
+    /// anywhere else closes it.
+    @MainActor
+    func testOnlyAClickAwayFromTheItemClosesThePopover() {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let (controller, window) = anchoredController(h)
+        defer { window.orderOut(nil) }
+        controller.openPopover()
+        controller.dismissUnlessOnItemOrPopover(at: NSPoint(x: window.frame.midX, y: window.frame.midY))
+        XCTAssertTrue(controller.model.popoverShown, "on the item: left to its action")
+        controller.togglePopover()
+        XCTAssertFalse(controller.model.popoverShown, "the item's action closes it")
+        XCTAssertEqual(controller.popover?.isShown, false)
+
+        controller.togglePopover()
+        controller.dismissUnlessOnItemOrPopover(at: NSPoint(x: window.frame.minX - 40, y: window.frame.midY))
+        XCTAssertFalse(controller.model.popoverShown, "a click elsewhere closes it")
+        XCTAssertEqual(controller.popover?.isShown, false)
+    }
+
+    /// A click in another of the app's windows (Settings) closes the
+    /// popover; a click in the popover, or on the item (whose action
+    /// toggles), does not. A click that comes with no window goes by its
+    /// place on screen.
+    @MainActor
+    func testAClickInAnotherWindowClosesThePopover() throws {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let (controller, window) = anchoredController(h)
+        defer { window.orderOut(nil) }
+        let other = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 50, height: 50), styleMask: [.titled], backing: .buffered, defer: true)
+        other.isReleasedWhenClosed = false
+        controller.openPopover()
+        let popoverWindow = try XCTUnwrap(controller.popover?.contentViewController?.view.window)
+        let inPopover = NSPoint(x: popoverWindow.frame.midX, y: popoverWindow.frame.midY)
+        let onItem = NSPoint(x: window.frame.midX, y: window.frame.midY)
+        let elsewhere = NSPoint(x: window.frame.minX - 40, y: window.frame.midY)
+        controller.clickedInApp(window: popoverWindow, at: inPopover)
+        XCTAssertTrue(controller.model.popoverShown, "its own controls")
+        controller.clickedInApp(window: window, at: onItem)
+        XCTAssertTrue(controller.model.popoverShown, "the item: its action toggles")
+        controller.clickedInApp(window: nil, at: inPopover)
+        controller.clickedInApp(window: nil, at: onItem)
+        XCTAssertTrue(controller.model.popoverShown, "no window, but on the popover or the item")
+        controller.clickedInApp(window: nil, at: elsewhere)
+        XCTAssertFalse(controller.model.popoverShown, "no window, elsewhere")
+        controller.openPopover()
+        controller.clickedInApp(window: other, at: inPopover)
+        XCTAssertFalse(controller.model.popoverShown)
+        XCTAssertEqual(controller.popover?.isShown, false)
+    }
+
+    /// The popover is a fixed width: a long warning wraps and makes it
+    /// taller, never wider.
+    @MainActor
+    func testThePopoverIsAFixedWidthAndLongTextWraps() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = RecordingStatusSource()
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        func size() -> NSSize {
+            NSHostingView(rootView: controller.makePopoverView()).fittingSize
+        }
+        let short = size()
+        XCTAssertEqual(short.width, StatusPopoverView.width, accuracy: 0.5)
+
+        source.relaunchProblems = [String(repeating: "Chrome quit but could not be relaunched, open it yourself. ", count: 8)]
+        source.throttledBrowsers = [Self.chrome, Self.arc]
+        let long = size()
+        XCTAssertEqual(long.width, StatusPopoverView.width, accuracy: 0.5, "never wider")
+        XCTAssertGreaterThan(long.height, short.height + 40, "the warning wraps onto more lines")
+    }
+
+    /// Enough warnings to pass the cap: the part above the footer stops at
+    /// the cap and scrolls, so Settings and Quit stay on screen.
+    @MainActor
+    func testATallPopoverScrollsAboveTheFooter() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = RecordingStatusSource()
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        func size(cap: CGFloat) -> NSSize {
+            var view = controller.makePopoverView()
+            view.maxScrollHeight = cap
+            return NSHostingView(rootView: view).fittingSize
+        }
+        let short = size(cap: 10_000)
+        XCTAssertEqual(size(cap: 2_000).height, short.height, accuracy: 0.5, "under the cap the popover hugs its content")
+
+        source.relaunchProblems = (1...14).map { "Browser \($0) quit but could not be relaunched, open it yourself and check its windows." }
+        source.throttledBrowsers = [Self.chrome, Self.arc]
+        let tall = size(cap: 10_000)
+        let capped = size(cap: 400)
+        XCTAssertGreaterThan(tall.height, 700)
+        XCTAssertGreaterThan(capped.height, 400, "the footer sits below the cap")
+        XCTAssertLessThan(capped.height, 400 + 100, "and nothing else does")
+        XCTAssertEqual(capped.width, StatusPopoverView.width, accuracy: 0.5)
+
+        XCTAssertEqual(StatusPopoverView.maxScrollHeight(screenHeight: 900), 790)
+        XCTAssertEqual(StatusPopoverView.maxScrollHeight(screenHeight: 200), StatusPopoverView.minScrollHeight)
+        XCTAssertEqual(StatusPopoverView.maxScrollHeight(screenHeight: nil), 640)
+    }
+
+    /// Eight presets do not fit one 300 pt row. The chips wrap onto more
+    /// rows (the popover grows taller) rather than shrinking to "3…", and
+    /// the popover stays its fixed width.
+    @MainActor
+    func testPresetChipsWrapInsteadOfTruncating() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        func size() -> NSSize { NSHostingView(rootView: controller.makePopoverView()).fittingSize }
+        manager.config.presets = [1800, 3600]
+        let two = size()
+        manager.config.presets = [1800, 3600, 7200, 4 * 3600, 8 * 3600, 12 * 3600, 86400, 3 * 86400]
+        let eight = size()
+        XCTAssertEqual(eight.width, StatusPopoverView.width, accuracy: 0.5)
+        XCTAssertGreaterThan(eight.height, two.height + 10, "the chips take a second row")
+        // Every label fits its cell's minimum width at the chip's size.
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize(for: .small))
+        for seconds in manager.config.presets + StatusPopoverView.extendChoices {
+            let label = "+" + chipLabel(for: seconds)
+            let width = (label as NSString).size(withAttributes: [.font: font]).width
+            XCTAssertLessThan(width + 16, StatusPopoverView.chipMinWidth + 1, label)
+        }
+    }
+
+    /// The popover opens on the time buttons alone; Custom puts the fields
+    /// out, and they go away again when the popover next opens.
+    @MainActor
+    func testThePopoverOpensOnTheTimeButtonsAndCustomShowsTheFields() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        manager.config.presets = [1800, 3600, 7200, 4 * 3600]
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        func size() -> NSSize { NSHostingView(rootView: controller.makePopoverView()).fittingSize }
+        controller.openPopover()
+        XCTAssertFalse(controller.model.customShown, "the buttons by default")
+        let buttons = size()
+        controller.model.customShown = true
+        XCTAssertGreaterThan(size().height, buttons.height + 15, "the fields row comes out")
+        controller.model.texts = [.hours: "3"]
+        controller.closePopover()
+        controller.openPopover()
+        XCTAssertFalse(controller.model.customShown, "put away on the next open")
+        XCTAssertEqual(controller.model.texts, [:])
+        controller.closePopover()
+    }
+
+    /// Four presets and Custom share one row; more wrap onto a second.
+    @MainActor
+    func testFourPresetsAndCustomFitOneRow() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        func size() -> NSSize { NSHostingView(rootView: controller.makePopoverView()).fittingSize }
+        manager.config.presets = [1800]
+        let one = size()
+        manager.config.presets = [1800, 3600, 7200, 4 * 3600]
+        let four = size()
+        XCTAssertEqual(four.height, one.height, accuracy: 0.5, "one row")
+        XCTAssertEqual(four.width, StatusPopoverView.width, accuracy: 0.5)
+    }
+
+    /// Start, Extend, Settings and Quit keep their label on one line however
+    /// little room they are offered: "Extend" never breaks into "Ex-tend".
+    @MainActor
+    func testButtonLabelsStayOnOneLine() {
+        _ = NSApplication.shared
+        for title in ["Start", "Extend"] {
+            func height(_ width: CGFloat?) -> CGFloat {
+                let button = Button(title) {}.buttonStyle(PopoverButtonStyle(kind: .prominent))
+                return NSHostingView(rootView: button.frame(width: width)).fittingSize.height
+            }
+            XCTAssertEqual(height(20), height(nil), accuracy: 0.5, title)
+        }
+    }
+
+    /// Opening the popover activates the app, which would bring a Settings
+    /// window left behind other apps back with it. Every window of ours
+    /// under another app's window is put back under the window just above
+    /// it; one already on top is left alone.
+    func testOpeningThePopoverLeavesCoveredWindowsWhereTheyWere() {
+        let me: pid_t = 1, other: pid_t = 2
+        // Front to back: another app, our Settings, another app, our second window.
+        let stack: [(number: Int, pid: pid_t)] = [(10, other), (20, me), (30, other), (40, me)]
+        XCTAssertEqual(StatusItemController.coveredWindows(stack: stack, ours: [20, 40]), [20: 10, 40: 30])
+        // Our window in front of everything: nothing to keep down.
+        XCTAssertEqual(StatusItemController.coveredWindows(stack: [(20, me), (10, other)], ours: [20]), [:])
+        // Two of ours stacked under another app: each goes back under the one above it.
+        XCTAssertEqual(StatusItemController.coveredWindows(stack: [(10, other), (20, me), (21, me)], ours: [20, 21]), [20: 10, 21: 20])
+        XCTAssertEqual(StatusItemController.coveredWindows(stack: [], ours: [20]), [:])
+    }
+
+    /// Settings closes the popover before the window comes up.
+    @MainActor
+    func testSettingsClosesThePopoverAndOpensTheWindow() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let opened = Locked(0)
+        let controller = StatusItemController(manager: popoverManager(h), status: PlaceholderStatus(), showSettings: { opened.value += 1 })
+        controller.openPopover()
+        controller.openSettingsFromPopover()
+        XCTAssertFalse(controller.model.popoverShown)
+        XCTAssertEqual(opened.value, 1)
+    }
+
+    /// The fields are read through `DurationInput`: blank is empty, a value
+    /// over its ceiling or anything that is not a whole number is invalid.
+    @MainActor
+    func testTheFieldsAreValidatedByDurationInput() {
+        let model = MenuBarModel()
+        XCTAssertTrue(model.popoverInput.isEmpty)
+        model.texts = [.hours: "2", .minutes: " 30 "]
+        XCTAssertEqual(model.popoverInput.total, 2 * 3600 + 30 * 60)
+        model.texts = [.hours: "24"]
+        XCTAssertFalse(model.popoverInput.isValid(.hours))
+        XCTAssertNil(model.popoverInput.total)
+        model.texts = [.minutes: "1.5"]
+        XCTAssertFalse(model.popoverInput.isValid(.minutes))
+        model.texts = [.days: "-1"]
+        XCTAssertFalse(model.popoverInput.isValid(.days))
+        model.texts = [.days: "", .hours: "  "]
+        XCTAssertTrue(model.popoverInput.isEmpty)
+    }
+
+    /// Something typed that is not a duration shakes the fields; it never
+    /// falls back to the default preset the way empty fields do.
+    @MainActor
+    func testAnInvalidValueShakesAndStartsNothing() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        controller.model.texts = [.hours: "99"]
+        controller.commit()
+        XCTAssertEqual(controller.model.rejectBounce, 1)
+        XCTAssertEqual(controller.model.phase, .idle)
+        controller.model.texts = [.minutes: "0"]
+        controller.commit()
+        XCTAssertEqual(controller.model.rejectBounce, 2, "zero is not a duration either")
+        await settleQueuedRequests()
+        XCTAssertFalse(manager.isActive)
+    }
+
+    /// A preset chip starts that long at once; an extend chip adds to the
+    /// live session. Neither does anything in the wrong state.
+    @MainActor
+    func testChipsStartAndExtendAtOnce() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        controller.extendBy(3600)
+        await settleQueuedRequests()
+        XCTAssertFalse(manager.isActive, "nothing to extend")
+
+        controller.startPreset(3600)
+        XCTAssertEqual(controller.model.phase, .starting)
+        let started = await waitUntil { controller.model.phase == .running }
+        XCTAssertTrue(started)
+        XCTAssertEqual(manager.countdownText, "1:00:00")
+
+        controller.startPreset(7200)
+        await settleQueuedRequests()
+        XCTAssertEqual(manager.countdownText, "1:00:00", "a preset never restarts a live session")
+
+        controller.extendBy(StatusPopoverView.extendChoices[0])
+        let extended = await waitUntil { manager.countdownText == "1:30:00" }
+        XCTAssertTrue(extended)
+    }
+
+    /// A successful start spends the typed value and puts the fields away,
+    /// but leaves the popover open on the running session: the user closes
+    /// it.
+    @MainActor
+    func testASuccessfulStartLeavesThePopoverOpen() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let controller = StatusItemController(manager: popoverManager(h), status: PlaceholderStatus(), showSettings: {})
+        controller.openPopover()
+        controller.model.customShown = true
+        controller.model.texts = [.minutes: "45"]
+        controller.commit()
+        let running = await waitUntil { controller.model.phase == .running && controller.model.texts.isEmpty }
+        XCTAssertTrue(running)
+        XCTAssertTrue(controller.model.popoverShown)
+        XCTAssertFalse(controller.model.customShown)
+        controller.closePopover()
+    }
+
+    /// An extend leaves the fields editable while it runs. A new time
+    /// typed before it finishes stays in them, and Custom stays out.
+    @MainActor
+    func testAnExtendKeepsATimeTypedWhileItRuns() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {})
+        await manager.start(duration: 3600)
+        let running = await waitUntil { controller.model.phase == .running }
+        XCTAssertTrue(running)
+        controller.openPopover()
+        controller.model.customShown = true
+        controller.model.texts = [.minutes: "30"]
+        controller.commit()
+        controller.model.texts = [.hours: "2"]
+        let extended = await waitUntil { manager.countdownText == "1:30:00" }
+        XCTAssertTrue(extended)
+        await settleQueuedRequests()
+        XCTAssertEqual(controller.model.texts, [.hours: "2"])
+        XCTAssertTrue(controller.model.customShown)
+        controller.closePopover()
+    }
+
+    @MainActor
+    func testManagerChangesMoveThePhase() {
+        XCTAssertEqual(StatusItemController.phase(forActive: true, phase: .idle), .running)
+        XCTAssertEqual(StatusItemController.phase(forActive: true, phase: .starting), .running)
+        XCTAssertEqual(StatusItemController.phase(forActive: false, phase: .running), .idle)
+        // Nothing to do when the phase already matches the manager, and a
+        // start that stays inactive is the controller's to report.
+        XCTAssertNil(StatusItemController.phase(forActive: true, phase: .running))
+        XCTAssertNil(StatusItemController.phase(forActive: false, phase: .idle))
+        XCTAssertNil(StatusItemController.phase(forActive: false, phase: .starting))
+    }
+
+    /// With the countdown off, the status item's width is written once, at
+    /// install: a session and the popover never move the bar. With it on,
+    /// it is written once when a session starts and once when it ends.
+    /// Opening the popover, typing into it and closing it never move it.
+    @MainActor
+    func testTheWidthIsWrittenOnceAndNeverChangesForASessionOrThePopover() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        manager.config.showMenuBarCountdown = false
+        let probe = WidthProbe()
+        let controller = StatusItemController(
+            manager: manager,
+            status: PlaceholderStatus(),
+            showSettings: {},
+            makeWidthWriter: { apply in probe.make(apply: apply) }
+        )
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.widthTargetChangeCount, 1, "installing the host sets the idle width")
+        XCTAssertGreaterThanOrEqual(controller.hostWidth, StatusRootView.width, "the host is laid out at the idle width, not left at zero")
+        XCTAssertEqual(controller.hostWidth, controller.widthTarget)
+        let idle = controller.widthTarget
+
+        controller.openPopover()
+        controller.model.texts = [.days: "12", .hours: "23", .minutes: "59"]
+        try? await Task.sleep(for: .milliseconds(100))
+        controller.closePopover()
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.widthTargetChangeCount, 1, "the popover never moves the bar")
+
+        await manager.start(duration: 3600)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(controller.model.phase, .running)
+        XCTAssertEqual(controller.widthTargetChangeCount, 1, "a session start never relays out the bar")
+        XCTAssertEqual(controller.widthTarget, idle)
+
+        controller.openPopover()
+        controller.closePopover()
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.widthTargetChangeCount, 1)
+
+        await manager.end(reason: .user)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(controller.model.phase, .idle)
+        XCTAssertEqual(controller.widthTargetChangeCount, 1, "nor does its end")
+        XCTAssertEqual(controller.widthTarget, idle)
+        XCTAssertEqual(probe.applied.count, 1, "one write, at install")
+
+        // The countdown on: one write as the session starts, one as it ends.
+        manager.config.showMenuBarCountdown = true
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.widthTargetChangeCount, 1, "nothing to show while idle")
+        await manager.start(duration: 3600)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(controller.widthTargetChangeCount, 2)
+        XCTAssertGreaterThan(controller.widthTarget, idle)
+        controller.openPopover()
+        controller.model.texts = [.hours: "2"]
+        controller.closePopover()
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(controller.widthTargetChangeCount, 2)
+        await manager.end(reason: .user)
+        try? await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(controller.widthTargetChangeCount, 3)
+        XCTAssertEqual(controller.widthTarget, idle)
+        XCTAssertEqual(probe.applied.count, 3)
+    }
+
+    /// While the recovery agent and pmset run, the projected countdown ticks
+    /// like the live one will, and the tick stops the moment the session is
+    /// confirmed and the live text takes over.
+    @MainActor
+    func testTheProjectedCountdownTicksWhileStartingAndStopsOnConfirmationInThePopover() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = popoverManager(h)
+        // The controller reads the manager's fake clock. The tick still runs
+        // on the real run loop, but every tick between two clock moves reads
+        // the same second, so a runner that delays or bunches ticks cannot
+        // skip a value.
+        let clock = h.clock
+        let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {}, clock: { clock.now })
+        let gate = AsyncGate()
+        h.backstop.armGate = gate
+        controller.model.texts = [.hours: "2"]
+
+        controller.commit()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(controller.model.phase, .starting)
+        XCTAssertEqual(controller.model.pendingProjection?.shape, .hours)
+        XCTAssertEqual(controller.model.pendingCountdown, "2h")
+        XCTAssertTrue(controller.pendingTickArmed)
+        // Only a tick can move the text, and it moves to what the clock reads.
+        clock.advance(1)
+        let deadline = Date().addingTimeInterval(5)
+        while controller.model.pendingCountdown == "2h", Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(controller.model.pendingCountdown, "1h 59m")
+        XCTAssertEqual(controller.model.phase, .starting)
+
+        await gate.open()
+        let confirmBy = Date().addingTimeInterval(2)
+        while controller.model.phase != .running, Date() < confirmBy {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(controller.model.phase, .running)
+        XCTAssertFalse(controller.pendingTickArmed)
+        XCTAssertNil(controller.model.pendingProjection)
+        XCTAssertNil(controller.model.pendingCountdown)
+        // The live text takes over at the minute the projection had reached.
+        XCTAssertEqual(manager.remainingText, "1h 59m")
+    }
+
+    /// Only the two mismatches are said; a session holding sleep has the
+    /// countdown and no line.
+    func testSleepHeldWarning() {
+        XCTAssertNil(SleepHeldLine.warning(sessionActive: true, sleepHeld: true))
+        XCTAssertEqual(
+            SleepHeldLine.warning(sessionActive: true, sleepHeld: false),
+            "Sleep is not held, so this session is not keeping the Mac awake"
+        )
+        XCTAssertEqual(SleepHeldLine.warning(sessionActive: false, sleepHeld: true), "Sleep still held with no session")
+        XCTAssertNil(SleepHeldLine.warning(sessionActive: false, sleepHeld: false))
+    }
 }
 
 /// A status source that records relaunch requests and reports nothing else.
@@ -1267,4 +2721,33 @@ final class RecordingStatusSource: StatusSource {
     func refreshInstant() {}
     func instantWatts() -> Double? { nil }
     func relaunchUnthrottled(_ browser: ThrottledBrowser) { relaunched.append(browser) }
+}
+
+/// A status source that counts the refreshes the popover asks for.
+@MainActor
+@Observable
+final class CountingStatusSource: StatusSource {
+    var lidClosed = false
+    var batteryPercent: Int? = nil
+    var isCharging = false
+    var wifiSSID: String? = nil
+    var lastGap: TimeInterval? = nil
+    var frozenCount = 0
+    var dockerPaused = false
+    var throttledBrowsers: [ThrottledBrowser] = []
+    var relaunchProblems: [String] = []
+    var hotspotPasswordReport: HotspotPasswordReport? = nil
+    private(set) var instant = 0
+    private(set) var onDemand = 0
+    /// What the watts read reports, and how many times it was read.
+    var watts: Double?
+    @ObservationIgnored private(set) var powerReads = 0
+
+    func refreshOnDemand() { onDemand += 1 }
+    func refreshInstant() { instant += 1 }
+    func instantWatts() -> Double? {
+        powerReads += 1
+        return watts
+    }
+    func relaunchUnthrottled(_ browser: ThrottledBrowser) {}
 }

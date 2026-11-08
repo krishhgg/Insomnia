@@ -4,6 +4,8 @@ import Foundation
 enum SessionMath {
     /// Shortest session we accept.
     static let minimumDuration: TimeInterval = 60
+    /// Calendar days ahead that a bare weekday still names the right day.
+    private static let weekdayReachDays = 6
 
     /// Clamp a requested duration into `[minimumDuration, maxDuration]`.
     static func clamp(_ duration: TimeInterval, maxDuration: TimeInterval) -> TimeInterval {
@@ -82,6 +84,42 @@ enum SessionMath {
             return clock(hours: total / 3600)
         case .minutes:
             return String(format: "%02d:%02d", total / 60, seconds)
+        }
+    }
+
+    /// The clock time a session ends at, in the system's 12 or 24 hour style.
+    /// Another day adds the weekday ("Sat 03:00"), and a week or more away the
+    /// date, since a bare weekday would then name the wrong day.
+    static func formatEndTime(
+        _ endsAt: Date,
+        now: Date,
+        calendar: Calendar = .autoupdatingCurrent,
+        locale: Locale = .autoupdatingCurrent
+    ) -> String {
+        let style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
+        let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: now), to: calendar.startOfDay(for: endsAt)).day ?? 0
+        switch days {
+        // The same style the "5 minutes left" notification prints the end in.
+        case ..<1: return endsAt.formatted(Date.FormatStyle(date: .omitted, time: .shortened, locale: locale, calendar: calendar, timeZone: calendar.timeZone))
+        case 1...weekdayReachDays: return endsAt.formatted(style.weekday(.abbreviated).hour().minute())
+        default: return endsAt.formatted(style.day().month(.abbreviated).hour().minute())
+        }
+    }
+
+    /// What the menu bar countdown reads for a session that ends at `endsAt`.
+    static func countdownText(
+        endsAt: Date,
+        shape: CountdownShape,
+        style: CountdownStyle,
+        now: Date,
+        calendar: Calendar = .autoupdatingCurrent,
+        locale: Locale = .autoupdatingCurrent
+    ) -> String {
+        switch style {
+        case .remaining:
+            formatCountdown(remaining: remaining(until: endsAt, at: now), shape: shape)
+        case .endTime:
+            formatEndTime(endsAt, now: now, calendar: calendar, locale: locale)
         }
     }
 

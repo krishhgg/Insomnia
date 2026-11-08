@@ -981,6 +981,28 @@ final class LidActionsTests: XCTestCase {
         XCTAssertTrue(log.contains("display sleep request failed"), log)
     }
 
+    /// With the screen kept awake a display sleep would lock the screen, so
+    /// the close darkens and journals as usual and asks for no sleep.
+    func testKeepScreenAwakeDarkensWithoutRequestingDisplaySleep() async throws {
+        let (m, actions) = await make()
+        m.config.keepScreenAwake = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sets, [0])
+        XCTAssertEqual(h.keyboard.sets, [0])
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.7)
+        XCTAssertNil(m.lastError)
+        XCTAssertTrue(logText().contains("keep the screen awake is on"), logText())
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets.last, 0.7)
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
+    }
+
     func testNoKeyboardBacklightSkipsTheKeyboard() async throws {
         let (m, actions) = await make()
         h.keyboard.brightness = nil

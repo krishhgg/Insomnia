@@ -47,14 +47,15 @@ reboot and installation checks are in [release validation](release-validation.md
   stopped. Verify the live process and whether it should be resumed; never
   blindly signal a PID from an old log.
 - **Identity is not an atomic guarantee:** the app checks start time to the
-  microsecond, and the backstop asks the installed app binary
-  (`Insomnia --resume-frozen`) to do the same check and send the signal for
+  microsecond, and the backstop asks the app binary in its own bundle
+  (`Insomnia --resume-frozen`, the installed app's for a checkout's copy of
+  the script) to do the same check and send the signal for
   every entry that records microseconds, all such entries in one call with a
   30-second limit. The entries go to the binary on standard input, so a long
   journal cannot exceed the argument size limit. The backstop never signals those entries itself. It keeps
   them when the binary is missing, does not finish in time, or answers
-  anything but one expected line per entry. It runs the binary only when the
-  installed bundle declares `InsomniaResumeFrozenVersion` in its
+  anything but one expected line per entry. It runs the binary only when
+  that bundle declares `InsomniaResumeFrozenVersion` in its
   `Info.plist`, so it never starts an older build. The binary holds the
   recovery lock while it can still send a signal and ends itself after the
   same limit, so a backstop run that is killed mid-call leaves no helper

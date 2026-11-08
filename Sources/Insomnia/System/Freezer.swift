@@ -78,8 +78,9 @@ enum FreezePlanner {
 
     /// Apps the automatic lid-close scope (`Config.freezeAllApps`) leaves
     /// alone even when they are not on the agent list: agent hosts, editors,
-    /// terminals, browsers, password managers, local databases, VPN, local
-    /// model runtimes, and meeting, recording and dictation apps
+    /// terminals, browsers, password managers, local databases, agent
+    /// sandbox hosts, VPN, local model runtimes, and meeting, recording
+    /// and dictation apps
     /// (`meetingApps`). Code level, not persisted, because an existing
     /// config.json already carries its own agent list and new defaults never
     /// reach it. An explicit freeze-list entry overrides this set; the hard
@@ -142,11 +143,13 @@ enum FreezePlanner {
         // tree, the automatic scope must not.
         "com.electron.dockerdesktop",       // Docker Desktop UI (installed)
         // Dock apps that host services agents depend on: SSH agents, local
-        // databases, container runtimes.
+        // databases, container runtimes, and the sandboxes a computer-use
+        // agent drives.
         "com.1password.1password",          // 1Password (cask 1password)
         "com.bitwarden.desktop",            // Bitwarden (cask bitwarden)
         "com.postgresapp.Postgres2",        // Postgres.app (cask postgres-app)
         "dev.kdrag0n.MacVirt",              // OrbStack (cask orbstack)
+        "com.trycua.spaces.macos",          // Cua Spaces (installed)
     ]).union(meetingApps)
 
     /// Meeting, recording and dictation apps. Freezing one ends a call, a

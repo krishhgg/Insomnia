@@ -799,13 +799,57 @@ MSG
   exit 1
 }
 
+# Kong's Insomnia API client runs an executable named Insomnia too, so
+# `pgrep -x Insomnia` finds it as well. A pid pgrep found is skipped only
+# when `codesign --verify` passes it against API_CLIENT_REQUIREMENT: the
+# code the process runs is signed with a certificate Apple issued (such as
+# Developer ID), with the client's identifier and Kong's team in the leaf
+# certificate. codesign checks that signature on the running code, so
+# neither an argv[0] or path made to look like the client's nor a signature
+# that only claims that identifier and team passes. Any other exit counts
+# as this app: 3 when the requirement is not met (this app, ad hoc signed,
+# is one), 1 for a process that is gone or a signature that does not
+# verify, anything else, and no answer in time. A misread the other way
+# could remove the recovery agent and the sudoers rule while the app has
+# sleep disabled.
+API_CLIENT_ID=com.insomnia.app
+API_CLIENT_TEAM=FX44YY62GV
+API_CLIENT_REQUIREMENT="anchor apple generic and identifier \"$API_CLIENT_ID\" and certificate leaf[subject.OU] = \"$API_CLIENT_TEAM\""
+# The pids already reported as the API client, so each is named once.
+API_CLIENT_SEEN=" "
+# 0 when the process with this pid is the API client (said once per pid),
+# 1 when it counts as this app.
+api_client() { # pid
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  bounded "$CODESIGN" --verify "-R=$API_CLIENT_REQUIREMENT" "$1" || return 1
+  if [[ "$API_CLIENT_SEEN" != *" $1 "* ]]; then
+    echo "Ignoring pid $1: it is Kong's Insomnia API client ($API_CLIENT_ID, team $API_CLIENT_TEAM), not this app."
+    API_CLIENT_SEEN+="$1 "
+  fi
+  return 0
+}
+# 0 when every pid pgrep printed ($1, one per line) is the API client, 1
+# when any one counts as this app, and when none was checked.
+only_api_client() { # pgrep-output
+  local pid checked=0
+  while IFS= read -r pid; do
+    api_client "$pid" || return 1
+    checked=1
+  done <<< "$1"
+  (( checked == 1 ))
+}
+
 # A pgrep that does not answer in time counts as "running": fail closed.
+# Finding only the API client is finding none.
 app_running() {
   local rc=0
   bounded "$PGREP" -x Insomnia || rc=$?
   if (( rc == 124 )); then
     echo "pgrep did not answer within ${CALL_TIMEOUT_SECONDS}s; treating Insomnia as running." >&2
     return 0
+  fi
+  if (( rc == 0 )) && only_api_client "$BOUNDED_OUTPUT"; then
+    return 1
   fi
   return "$rc"
 }

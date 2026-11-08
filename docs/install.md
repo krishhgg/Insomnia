@@ -213,7 +213,7 @@ four `pmset` commands itself.
 
 ## Upgrades
 
-Settings > App shows the installed version. "Check for updates" there asks
+Settings > General shows the installed version. "Check for updates" there asks
 GitHub once, when you click, for the release marked Latest and for the
 newest nightly, and tells you both tags and whether a newer stable release
 exists. It installs nothing; an upgrade is the steps above run again.
@@ -284,3 +284,12 @@ install left beside it: `~/Applications/.Insomnia.app.previous`, and
 Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary
 directory contents. A small shared lock file is retained to keep concurrent
 recovery operations coordinated.
+
+Kong's Insomnia API client also runs a process named `Insomnia`. The
+installer and the uninstaller tell it apart by checking the code signature
+of the running process against a code requirement (`codesign --verify
+-R=<requirement> <pid>`), not by its path. A process whose code is signed
+with a certificate Apple issued, with the identifier `com.insomnia.app` and
+Kong's team ID `FX44YY62GV`, is the client: they print its pid, ignore it,
+and do not ask it to quit. Any other process, including one that codesign
+cannot check, counts as this app, so they still stop if it does not quit.

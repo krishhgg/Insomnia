@@ -30,4 +30,12 @@ struct CoreWLANHotspotJoiner: HotspotJoining {
         try interface.associate(to: network, password: password)
         return true
     }
+
+    /// Names of the networks this Mac remembers, in auto-join order: the
+    /// hotspot names Settings suggests. A name macOS hides without Location
+    /// Services access is left out, so the list can be empty.
+    static func rememberedNetworks() -> [String] {
+        let profiles = CWWiFiClient.shared().interface()?.configuration()?.networkProfiles.array ?? []
+        return profiles.compactMap { ($0 as? CWNetworkProfile)?.ssid }
+    }
 }
