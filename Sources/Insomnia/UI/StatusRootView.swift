@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// Everything drawn inside the status item: the mark, the three pill slots
-/// while entering, or the countdown while a session runs or starts.
+/// while entering, or the countdown while a session runs or starts (unless
+/// Settings turns the countdown off, which leaves the mark alone).
 ///
 /// The layout here changes only on state the controller sets outside any
 /// animation transaction (`slotsPresent`, `phase` and `startError`), and
@@ -20,6 +21,10 @@ struct StatusRootView: View {
     let onTapCountdown: () -> Void
     let onHoldEnd: () -> Void
     let onWidthChange: (CGFloat) -> Void
+    /// Whether the left button is physically down; a test replaces it.
+    var buttonIsDown: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
+    /// Where the pointer is; a test replaces it.
+    var pointerLocation: () -> CGPoint = { NSEvent.mouseLocation }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotionEnv
 
@@ -41,8 +46,12 @@ struct StatusRootView: View {
     /// countdown for a session that is already gone.
     private var showsRunningControls: Bool { model.phase.showsRunningControls && isRunning }
     /// A pending start shows its projected countdown; a confirmed session its
-    /// live one.
-    private var showsCountdown: Bool { model.phase == .starting || showsRunningControls }
+    /// live one. With the countdown turned off in Settings neither is drawn,
+    /// nor the end ring beside it: the eye alone says a session is running,
+    /// and the time left and End session are in the right-click menu.
+    private var showsCountdown: Bool {
+        manager.config.showMenuBarCountdown && (model.phase == .starting || showsRunningControls)
+    }
     /// The eye opens the moment Enter starts a session, not when the manager
     /// confirms it: the blink is the first thing that answers the keystroke.
     /// A refused start closes it again with the pills coming back.
@@ -80,7 +89,7 @@ struct StatusRootView: View {
             } else if showsCountdown {
                 countdown
                 if showsRunningControls {
-                    HoldToEndButton(reduceMotion: reduceMotion, action: onHoldEnd)
+                    HoldToEndButton(reduceMotion: reduceMotion, action: onHoldEnd, isPressed: buttonIsDown, pointer: pointerLocation)
                         .transition(Motion.ringTransition(reduceMotion: reduceMotion))
                 }
             }
@@ -105,6 +114,9 @@ struct StatusRootView: View {
 
     /// A closed eye while idle; it opens while sleep is held, so the app
     /// visibly does something even when Low Power Mode is not showing.
+    /// Without the countdown beside it, the eye carries the time left for
+    /// VoiceOver, from the minute-granularity text so the bar is not
+    /// redrawn every second for it.
     private var icon: some View {
         EyeMarkView(isRunning: eyeOpen, reduceMotion: reduceMotion)
             .frame(width: 20, height: 20)
@@ -116,6 +128,33 @@ struct StatusRootView: View {
             }
             .onTapGesture(perform: onTapIcon)
             .accessibilityLabel("Insomnia")
+            .accessibilityValue(eyeAccessibilityValue)
+    }
+
+    private var eyeAccessibilityValue: String {
+        Self.eyeAccessibilityValue(
+            showsCountdown: manager.config.showMenuBarCountdown,
+            running: isRunning,
+            style: manager.config.countdownStyle,
+            remaining: manager.remainingText,
+            endTime: manager.countdownText
+        )
+    }
+
+    /// What VoiceOver reads on the eye when the bar shows no countdown.
+    /// With the end time nothing ticks, so a time left would go stale; the
+    /// end time stays right without a redraw. Static so it can be pinned
+    /// without a view.
+    static func eyeAccessibilityValue(
+        showsCountdown: Bool,
+        running: Bool,
+        style: CountdownStyle,
+        remaining: String,
+        endTime: String
+    ) -> String {
+        guard !showsCountdown, running, !remaining.isEmpty else { return "" }
+        if style == .endTime, !endTime.isEmpty { return "Ends at \(endTime)" }
+        return StatusMenu.remainingLine(remaining)
     }
 
     /// All three slots are in the layout whenever they are present;

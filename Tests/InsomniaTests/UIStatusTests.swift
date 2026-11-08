@@ -311,7 +311,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(StatusLines.throttleWarning(["Chrome", "Arc", "Chromium"]), "\u{26A0} Chrome, Arc, and Chromium are throttled")
     }
 
-    func testMenuListsStatusThenSettingsAndQuit() {
+    func testRunningMenuListsStatusThenEndSessionSettingsAndQuit() {
         let items = StatusMenu.items(
             sessionActive: true,
             sleepHeld: true,
@@ -327,6 +327,7 @@ final class UIStatusTests: XCTestCase {
             StatusMenu.Item(title: "\u{26A0} Chrome is throttled", kind: .warning),
             StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
             StatusMenu.Item(title: "", kind: .separator),
+            StatusMenu.Item(title: StatusMenu.endSessionTitle, kind: .endSession),
             StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
             StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
         ])
@@ -376,7 +377,7 @@ final class UIStatusTests: XCTestCase {
         )
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .warning, .warning, .separator, .endSession, .settings, .quit]
         )
         XCTAssertEqual(items[3], StatusMenu.Item(
             title: "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings",
@@ -469,7 +470,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items.filter { $0.kind == .relaunchBrowser(Self.arc) }.count, 1)
         XCTAssertEqual(
             items.map(\.kind),
-            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .settings, .quit]
+            [.info, .warning, .relaunchBrowser(Self.chrome), .relaunchBrowser(Self.arc), .separator, .endSession, .settings, .quit]
         )
     }
 
@@ -1199,18 +1200,175 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(manager.countdownText, "1:59:59")
     }
 
+    // MARK: Countdown style
+
+    /// The end time is a fixed text for the whole session, so nothing needs to
+    /// redraw the status item each second.
+    @MainActor
+    func testEndTimeStyleArmsNoCountdownTimerAndShowsTheEndTime() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 4 * 3600)
+        let endsAt = h.clock.now.addingTimeInterval(4 * 3600)
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, SessionMath.formatEndTime(endsAt, now: h.clock.now))
+        XCTAssertFalse(manager.countdownText.isEmpty)
+    }
+
+    @MainActor
+    func testRemainingStyleStillArmsTheCountdownTimer() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 4 * 3600)
+        XCTAssertTrue(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+    }
+
+    /// Settings calls `countdownStyleChanged()` on a change, and a running
+    /// session shows the new style at once; the tick goes or comes back with it.
+    @MainActor
+    func testChangingTheStyleReachesARunningSessionAtOnce() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 4 * 3600)
+        XCTAssertTrue(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+
+        manager.config.countdownStyle = .endTime
+        manager.countdownStyleChanged()
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, SessionMath.formatEndTime(h.clock.now.addingTimeInterval(4 * 3600), now: h.clock.now))
+
+        manager.config.countdownStyle = .remaining
+        manager.countdownStyleChanged()
+        XCTAssertTrue(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+    }
+
+    /// A closed lid has the tick stopped; a style change must not restart it.
+    @MainActor
+    func testChangingTheStyleDoesNotRestartAPausedCountdown() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 4 * 3600)
+        manager.pauseCountdown()
+
+        manager.config.countdownStyle = .remaining
+        manager.countdownStyleChanged()
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, "4:00:00")
+    }
+
+    @MainActor
+    func testLidOpenArmsNoCountdownTimerWithTheEndTime() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 4 * 3600)
+        let endTime = manager.countdownText
+
+        manager.pauseCountdown()
+        h.clock.advance(60)
+        manager.resumeCountdown()
+        XCTAssertFalse(manager.countdownTimerArmed)
+        XCTAssertEqual(manager.countdownText, endTime)
+    }
+
+    @MainActor
+    func testEndTimeFollowsAnExtension() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.countdownStyle = .endTime
+        await manager.start(duration: 3600)
+        let before = manager.countdownText
+        await manager.extend(by: 5 * 3600)
+        XCTAssertNotEqual(manager.countdownText, before)
+        XCTAssertEqual(manager.countdownText, SessionMath.formatEndTime(h.clock.now.addingTimeInterval(6 * 3600), now: h.clock.now))
+    }
+
+    /// The projection stands in for the live text until the manager confirms
+    /// the session, so it must read exactly what the manager will.
+    @MainActor
+    func testTheProjectionReadsTheSameTextAsTheManagerInEveryStyle() async {
+        for style in CountdownStyle.allCases {
+            let h = Harness()
+            defer { h.home.destroy() }
+            let manager = h.makeManager()
+            manager.config.countdownStyle = style
+            let projection = MenuBarModel.projectedStart(now: h.clock.now, duration: 4 * 3600, maxDuration: manager.config.maxDuration, style: style)
+            await manager.start(duration: 4 * 3600)
+            XCTAssertEqual(projection.countdown(at: h.clock.now), manager.countdownText, "\(style)")
+        }
+    }
+
+    /// The 1 Hz tick of the projected countdown has nothing to redraw when the
+    /// text is the end time.
+    @MainActor
+    func testPendingTickRunsOnlyInRemainingStyle() async {
+        _ = NSApplication.shared
+        for style in CountdownStyle.allCases {
+            let h = Harness()
+            defer { h.home.destroy() }
+            let manager = h.makeManager()
+            manager.config.countdownStyle = style
+            let clock = h.clock
+            let controller = StatusItemController(manager: manager, status: PlaceholderStatus(), showSettings: {}, clock: { clock.now })
+            let gate = AsyncGate()
+            h.backstop.armGate = gate
+            controller.expand(mode: .start)
+            controller.focus(.hours)
+            XCTAssertTrue(controller.model.input.append(digit: 2, to: .hours))
+
+            controller.commit()
+            await gate.waitUntilStarted()
+            XCTAssertEqual(controller.model.phase, .starting)
+            XCTAssertEqual(controller.pendingTickArmed, style == .remaining, "\(style)")
+            XCTAssertEqual(controller.model.pendingCountdown, MenuBarModel.projectedStart(now: clock.now, duration: 2 * 3600, maxDuration: manager.config.maxDuration, style: style).countdown(at: clock.now), "\(style)")
+            await gate.open()
+            let confirmBy = Date().addingTimeInterval(2)
+            while controller.model.phase != .running, Date() < confirmBy {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(controller.model.phase, .running, "\(style)")
+            await manager.end(reason: .user)
+        }
+    }
+
+    /// The bar no longer shows the time left, so the right-click menu does.
+    /// With the time left on the bar the menu is as it was.
+    @MainActor
+    func testTheMenuOffersTheTimeLeftOnlyWithTheEndTimeCountdown() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        await manager.start(duration: 2 * 3600 + 14 * 60)
+        XCTAssertFalse(StatusItemController.menuItems(manager: manager, status: PlaceholderStatus()).map(\.title).contains { $0.hasPrefix("Time left") })
+
+        manager.config.countdownStyle = .endTime
+        manager.refreshCountdown()
+        let titles = StatusItemController.menuItems(manager: manager, status: PlaceholderStatus()).map(\.title)
+        XCTAssertTrue(titles.contains("Time left: 2h 14m"), "\(titles)")
+    }
+
     /// The digits are read by a local key monitor, which only sees events sent
     /// to a window this app owns. The catcher panel is that window, and the
-    /// whole fix rests on it being able to take key without taking a click,
-    /// and without activating this app: the app in front stays frontmost and
-    /// only key status moves to the pills while they are up.
+    /// panel must accept key status without taking clicks. It uses normal
+    /// app activation so keys cannot remain routed to the previous app.
     @MainActor
-    func testTheKeyCatcherPanelTakesKeyStatusWithoutTakingClicksOrActivating() {
+    func testTheKeyCatcherPanelAcceptsKeysWithoutTakingClicks() {
         _ = NSApplication.shared
         let panel = KeyCatcherPanel()
 
         XCTAssertTrue(panel.canBecomeKey)
-        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertFalse(panel.styleMask.contains(.nonactivatingPanel))
         XCTAssertTrue(panel.ignoresMouseEvents)
         XCTAssertEqual(panel.level, .statusBar)
         XCTAssertTrue(panel.collectionBehavior.contains(.canJoinAllSpaces))
@@ -1244,6 +1402,27 @@ final class UIStatusTests: XCTestCase {
 
         XCTAssertFalse(panel?.isVisible ?? true)
         XCTAssertFalse(NSApp.windows.contains { $0 is KeyCatcherPanel && $0.isVisible })
+    }
+
+    @MainActor
+    func testLosingKeyboardFocusClosesThePillsAndDropsTheKeyCatcher() {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let controller = StatusItemController(manager: h.makeManager(), status: PlaceholderStatus(), showSettings: {})
+        // Off the item. On it, a lost focus waits out the press instead
+        // (RefocusWait), which PillRefocusTests covers.
+        controller.pointerLocation = { NSPoint(x: -10_000, y: -10_000) }
+        controller.expand(mode: .start)
+        let panel = NSApp.windows.compactMap { $0 as? KeyCatcherPanel }.first { $0.isVisible }
+        XCTAssertNotNil(panel)
+
+        panel?.resignKey()
+
+        XCTAssertTrue(controller.model.pillsCollapsing)
+        XCTAssertFalse(panel?.isVisible ?? true)
+        XCTAssertFalse(controller.model.focusVisible)
+        XCTAssertNil(panel?.onFocusLost)
     }
 }
 

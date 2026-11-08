@@ -473,4 +473,64 @@ final class UIStartupTests: XCTestCase {
         XCTAssertEqual(rig.model.visiblePills, 0)
         XCTAssertFalse(NSApp.windows.contains { ($0 as? KeyCatcherPanel)?.isVisible == true })
     }
+
+    // MARK: Countdown style
+
+    /// Settings can change the style while a start waits on the helper: the
+    /// projected text follows at once, and so does its 1 Hz tick.
+    @MainActor
+    func testChangingTheStyleRestylesAPendingStart() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        let gate = AsyncGate()
+        rig.h.backstop.armGate = gate
+        rig.openAndTypeOneDay()
+        rig.controller.commit()
+        await gate.waitUntilStarted()
+        let projection = MenuBarModel.projectedStart(now: rig.h.clock.now, duration: 86400, maxDuration: rig.manager.config.maxDuration)
+        XCTAssertEqual(rig.model.pendingCountdown, "1d 0:00:00")
+        XCTAssertTrue(rig.controller.pendingTickArmed)
+
+        rig.manager.config.countdownStyle = .endTime
+        var ok = await waitUntil { !rig.controller.pendingTickArmed }
+        XCTAssertTrue(ok)
+        XCTAssertEqual(rig.model.pendingCountdown, SessionMath.formatEndTime(projection.endsAt, now: rig.h.clock.now))
+
+        rig.manager.config.countdownStyle = .remaining
+        ok = await waitUntil { rig.controller.pendingTickArmed }
+        XCTAssertTrue(ok)
+        XCTAssertEqual(rig.model.pendingCountdown, "1d 0:00:00")
+
+        await gate.open()
+        ok = await waitUntil { rig.model.pendingCountdown == nil }
+        XCTAssertTrue(ok)
+        XCTAssertFalse(rig.controller.pendingTickArmed)
+    }
+
+    /// The same for an extension in flight, which has no tick of its own.
+    @MainActor
+    func testChangingTheStyleRestylesAPendingExtension() async {
+        let rig = Rig()
+        defer { rig.h.home.destroy() }
+        await rig.manager.start(duration: 3600)
+        var ok = await waitUntil { rig.model.phase == .running }
+        XCTAssertTrue(ok)
+        let gate = AsyncGate()
+        rig.h.backstop.armGate = gate
+        rig.controller.expand(mode: .extend)
+        XCTAssertTrue(rig.model.input.append(digit: 1, to: .hours))
+        rig.controller.commit()
+        await gate.waitUntilStarted()
+        XCTAssertEqual(rig.model.pendingCountdown, "2:00:00")
+
+        rig.manager.config.countdownStyle = .endTime
+        let endTime = SessionMath.formatEndTime(rig.h.clock.now.addingTimeInterval(2 * 3600), now: rig.h.clock.now)
+        ok = await waitUntil { rig.model.pendingCountdown == endTime }
+        XCTAssertTrue(ok, "\(rig.model.pendingCountdown ?? "nil")")
+        XCTAssertFalse(rig.controller.pendingTickArmed)
+
+        await gate.open()
+        ok = await waitUntil { rig.model.pendingCountdown == nil }
+        XCTAssertTrue(ok)
+    }
 }

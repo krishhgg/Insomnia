@@ -10,6 +10,12 @@ import SwiftUI
 struct HoldToEndButton: View {
     let reduceMotion: Bool
     let action: () -> Void
+    /// Whether the button is physically down. Checked when the ring closes,
+    /// so a release just before the deadline cannot still end the session.
+    var isPressed: () -> Bool = { NSEvent.pressedMouseButtons & 1 != 0 }
+    /// Where the pointer is now, in screen points. Read when the hold begins
+    /// and again when the ring closes.
+    var pointer: () -> CGPoint = { NSEvent.mouseLocation }
 
     @State private var progress: CGFloat = 0
     /// Mouse is down and the ring is drawing.
@@ -18,6 +24,8 @@ struct HoldToEndButton: View {
     /// so a single gesture never restarts the hold.
     @State private var pressed = false
     @State private var holdTask: Task<Void, Never>?
+    /// Where the pointer was when the hold began.
+    @State private var startPointer: CGPoint = .zero
 
     private let ringDiameter: CGFloat = 18
     private let lineWidth: CGFloat = 1.6
@@ -27,15 +35,18 @@ struct HoldToEndButton: View {
 
     var body: some View {
         ZStack {
+            // The label colour, like the eye mark: the menu bar is light or
+            // dark with the wallpaper, so a fixed white ring vanishes on a
+            // light bar and a pale brand tint has no contrast there either.
             Circle()
-                .stroke(Color.white.opacity(0.14), lineWidth: lineWidth)
+                .stroke(Color.primary.opacity(0.25), lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: progress)
-                .stroke(Color(brand: BrandPalette.violet), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .stroke(Color.primary, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
             Image(systemName: "xmark")
                 .font(.system(size: 7, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.85))
+                .foregroundStyle(Color.primary.opacity(0.85))
         }
         .frame(width: ringDiameter, height: ringDiameter)
         .scaleEffect(holding && !reduceMotion ? 1.12 : 1)
@@ -66,6 +77,7 @@ struct HoldToEndButton: View {
     /// Start drawing the ring and arm the completion.
     private func begin() {
         holding = true
+        startPointer = pointer()
         let duration = Motion.holdDuration
         withAnimation(.linear(duration: duration)) {
             progress = 1
@@ -74,6 +86,13 @@ struct HoldToEndButton: View {
         holdTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(duration))
             guard !Task.isCancelled, holding else { return }
+            // The drags that cancel a hold arrive from a poll, so a slide made
+            // after the last poll has not been reported yet: look for it.
+            let now = pointer()
+            guard isPressed(), hypot(now.x - startPointer.x, now.y - startPointer.y) <= cancelDistance else {
+                release()
+                return
+            }
             fire()
         }
     }

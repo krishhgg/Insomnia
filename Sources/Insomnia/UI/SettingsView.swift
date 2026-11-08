@@ -136,6 +136,13 @@ struct SettingsView: View {
                 }
             }
             .help("The pill that is focused when the pills open")
+            Picker("Countdown", selection: bind(\.countdownStyle)) {
+                Text("Time left").tag(CountdownStyle.remaining)
+                Text("End time").tag(CountdownStyle.endTime)
+            }
+            .help("What the menu bar shows during a session")
+            // Apply it now if a session is running.
+            .onChange(of: manager.config.countdownStyle) { manager.countdownStyleChanged() }
             LabeledContent("Maximum session") {
                 Text(chipLabel(for: manager.config.maxDuration)).foregroundStyle(.secondary)
             }
@@ -485,6 +492,10 @@ struct SettingsView: View {
 
     private var appSection: some View {
         Section("App") {
+            Toggle("Show the countdown in the menu bar", isOn: bind(\.showMenuBarCountdown))
+            Text("Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End session; click it to add time.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle("Launch at login", isOn: launchAtLogin)
             loginItemNote
             LabeledContent("Config") {
