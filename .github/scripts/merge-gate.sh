@@ -6,12 +6,14 @@
 # four CI jobs it requires five commit statuses, which this script posts and
 # reads:
 #
-#   merge-gate/greptile  Greptile reviewed the head and scored it 5/5. Read
-#                        from the newest description edit made by
-#                        greptile-apps (GitHub records who made each edit),
-#                        and only if that description names one score and
-#                        one reviewed commit, so text the author adds next to
-#                        Greptile's block cannot supply them.
+#   merge-gate/codex-bot The Codex bot (the ChatGPT Codex connector app)
+#                        reviewed the head and found nothing. Read from the
+#                        state the bot keeps in its review summary comment,
+#                        which names the reviewed commit and whether the
+#                        review found anything, and only if the bot made the
+#                        comment's newest edit (GitHub records who made it,
+#                        and a collaborator can edit anyone's comment) and
+#                        the comment holds one state.
 #   merge-gate/accepted  The owner added the "accepted" label: they want the
 #                        change in Insomnia. The newest add or removal of the
 #                        label must be the owner adding it.
@@ -57,7 +59,7 @@
 #   merge-gate.sh merge <pr>
 #       Runs check, then merges with a merge commit. GitHub refuses the merge
 #       if the head moved after the check, or if a required check fails by
-#       then. A label removed, a lower Greptile score or a main that moved
+#       then. A label removed, a new Codex bot finding or a main that moved
 #       in the few seconds of the check's last reads and the merge does not
 #       stop it.
 #
@@ -89,7 +91,9 @@ CI_CHECKS=(
   "ShellCheck scripts"
   "Lint workflows"
 )
-GATES=(greptile accepted evidence config codex)
+GATES=(codex-bot accepted evidence config codex)
+# The Codex bot's login, as GraphQL gives it.
+CODEX_BOT=chatgpt-codex-connector
 
 usage() {
   sed -n '/^# Usage/,/^# Environment/p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -220,42 +224,49 @@ count_lines() {
   fi
 }
 
-# "<scores> <reviewed commits> <score> <reviewed sha>" from the newest
-# description edit by greptile-apps: how many score markers and "Last
-# reviewed commit" lines that description holds, then the first of each
-# ("none" if absent). Each edit's diff is the whole description after it.
-# "tie tie tie tie" if Greptile's newest edits share a time but differ, since
-# nothing then says which came last.
-greptile_review() {
+# "<states> <editor> <reviewed sha> <status> <found> <security sha>
+# <security open>" from the Codex bot's newest review summary: a comment the
+# bot wrote that starts with its summary marker. <states> counts the review
+# states the comment holds, and the rest are read from the first: the
+# login that made the newest edit ("-" if none did), the commit the code
+# review covers, its status and whether it found anything, then the commit
+# the security review covers and whether it left findings open ("none" for
+# a missing value). "none" if the bot has no summary, and "tie" if its
+# newest summaries share a time but differ, since nothing then says which
+# came last.
+codex_bot_review() {
   local rows newest results
   # shellcheck disable=SC2016 # GraphQL and jq variables
   rows=$(gh api graphql --paginate -F owner="$OWNER" -F name="${REPO#*/}" -F number="$1" -f query='
     query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
       repository(owner: $owner, name: $name) {
         pullRequest(number: $number) {
-          userContentEdits(first: 100, after: $endCursor) {
-            nodes { editedAt editor { login } diff }
+          comments(first: 100, after: $endCursor) {
+            nodes { author { login } editor { login } createdAt lastEditedAt body }
             pageInfo { hasNextPage endCursor }
           }
         }
       }
-    }' --jq '.data.repository.pullRequest.userContentEdits.nodes[]
-      | select(.editor.login == "greptile-apps")
-      | (.diff // "") as $d
-      | [.editedAt,
-         ([$d | match("greptile_confidence_score:"; "g")] | length),
-         ([$d | match("Last reviewed commit:"; "g")] | length),
-         (($d | capture("greptile_confidence_score:(?<s>[0-9]+)").s) // "none"),
-         (($d | capture("Last reviewed commit: .*?/commit/(?<c>[0-9a-f]{40})").c) // "none")]
-      | map(tostring) | @tsv') || return 1
+    }' --jq 'def v: if . == null then "none" else tostring end;
+      .data.repository.pullRequest.comments.nodes[]
+      | select(.author.login == "'"$CODEX_BOT"'")
+      | (.body // "") as $b
+      | select($b | startswith("<!-- codex-pull-request-review-summary -->"))
+      | ((try ($b | capture("<!-- codex-review-state:v1 (?<j>\\{.*?\\}) -->").j | fromjson) catch null) // {}) as $s
+      | [(.lastEditedAt // .createdAt),
+       ([$b | match("codex-review-state:"; "g")] | length),
+       (.editor.login // "-"),
+       ($s.code_review.commit_sha | v), ($s.code_review.status | v), ($s.code_review.has_any_findings | v),
+       ($s.security_review.commit_sha | v), ($s.security_review.has_unresolved_findings | v)]
+      | map(tostring | gsub("[\t\r\n ]"; "_")) | @tsv') || return 1
   if [ -z "$rows" ]; then
-    echo "0 0 none none"
+    echo none
     return 0
   fi
   newest=$(printf '%s\n' "$rows" | cut -f 1 | sort | tail -n 1)
   results=$(printf '%s\n' "$rows" | awk -F '\t' -v t="$newest" '$1 == t' | cut -f 2- | sort -u)
   if [ "$(count_lines "$results")" -gt 1 ]; then
-    echo "tie tie tie tie"
+    echo tie
     return 0
   fi
   printf '%s\n' "$results" | tr '\t' ' '
@@ -327,27 +338,42 @@ decide() {
 # from what GitHub says now. Reads everything before evaluate posts
 # anything. Returns 1 if a read fails.
 decide_gates() {
-  local pr=$1 head=$PR_HEAD short=${PR_HEAD:0:7} review scores reviews score reviewed event compare count files f tree links
+  local pr=$1 head=$PR_HEAD short=${PR_HEAD:0:7} review states editor reviewed status found security_reviewed security_open
+  local event compare count files f tree links
   local needs_evidence=no touches_config=no
   EXISTING=$(gate_statuses "$head") || return 1
 
-  # Greptile can review a push without rewriting its summary (its check run
-  # on #34's c04e86b added a comment and left the summary on 2ff8c6c). A
-  # score for an older commit does not count, so that waits for a re-review.
-  review=$(greptile_review "$pr") || return 1
-  read -r scores reviews score reviewed <<<"$review"
-  if [ "$scores" = tie ]; then
-    decide greptile pending "Greptile's two newest edits share a time and disagree; waiting for its next one"
-  elif [ "$scores" -gt 1 ] || [ "$reviews" -gt 1 ]; then
-    decide greptile failure "the description holds $scores Greptile scores and $reviews reviewed commits; only Greptile's block may"
+  # The bot reviews when a pull request opens or is marked ready, and when
+  # someone comments "@codex review"; a push alone starts none. A review
+  # of an older commit does not count, so that waits. Its state keeps
+  # has_any_findings true after a finding's conversation is resolved, so
+  # a finding counts until a later review of the head finds nothing.
+  review=$(codex_bot_review "$pr") || return 1
+  read -r states editor reviewed status found security_reviewed security_open <<<"$review"
+  if [ "$states" = none ]; then
+    decide codex-bot pending "waiting for the Codex bot's first review; comment @codex review"
+  elif [ "$states" = tie ]; then
+    decide codex-bot pending "the Codex bot's two newest summaries share a time and disagree; waiting for its next edit"
+  elif [ "$editor" != - ] && [ "$editor" != "$CODEX_BOT" ]; then
+    decide codex-bot failure "$editor made the newest edit to the Codex bot's summary; only the bot's own edit counts"
+  elif [ "$states" = 0 ]; then
+    decide codex-bot pending "the Codex bot's summary holds no review state; comment @codex review"
+  elif [ "$states" != 1 ]; then
+    decide codex-bot failure "the Codex bot's summary holds $states review states, not 1"
   elif [ "$reviewed" = none ]; then
-    decide greptile pending "waiting for Greptile's first review"
+    decide codex-bot pending "the Codex bot's summary names no reviewed commit; comment @codex review"
   elif [ "$reviewed" != "$head" ]; then
-    decide greptile pending "waiting for a Greptile score for $short; its summary covers ${reviewed:0:7}"
-  elif [ "$score" = 5 ]; then
-    decide greptile success "Greptile scored $short 5/5"
+    decide codex-bot pending "waiting for a Codex bot review of $short; its summary covers ${reviewed:0:7}. Comment @codex review"
+  elif [ "$status" != completed ]; then
+    decide codex-bot pending "the Codex bot's review of $short is $status"
+  elif [ "$security_reviewed" = "$head" ] && [ "$security_open" = true ]; then
+    decide codex-bot failure "the Codex bot's security review of $short left findings open"
+  elif [ "$found" = false ]; then
+    decide codex-bot success "the Codex bot reviewed $short and found nothing"
+  elif [ "$found" = true ]; then
+    decide codex-bot failure "the Codex bot found issues in $short; fix them, then comment @codex review"
   else
-    decide greptile failure "Greptile scored $short $score/5; the gate needs 5/5"
+    decide codex-bot pending "the Codex bot's summary of $short does not say whether it found anything"
   fi
 
   event=$(accepted_event "$pr") || return 1
@@ -721,7 +747,7 @@ check_pr() {
   done
 
   # Each gate's newest status must be a success, and so must what the gate
-  # works out to now: a label removed, a lower Greptile score or the
+  # works out to now: a label removed, a new Codex bot finding or the
   # owner's newer failure counts before the workflow catches up. Only the
   # merge gate workflow and the owner post these; anyone else who can post
   # a status (someone given write access, an installed app) does not count.
@@ -880,10 +906,10 @@ check_pr() {
 # missing status and for an open conversation. GitHub refuses the merge if
 # the head moved after the check, and checks every required status, check
 # run and conversation as they are then. What it cannot check is a change
-# the workflow has not posted yet: a label removed, a lower Greptile score
+# the workflow has not posted yet: a label removed, a new Codex bot finding
 # or a main that moved. check_pr's last step reads those once more, so only
 # a change during those few reads (a few seconds) or before GitHub merges
-# goes unseen. The workflow posts a label or score change within about a
+# goes unseen. The workflow posts a label or review change within about a
 # minute; a main that moved stays untested until CI runs on the merge.
 merge_cmd() {
   [ $# -eq 1 ] || usage

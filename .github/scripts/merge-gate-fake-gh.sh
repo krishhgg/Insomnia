@@ -9,7 +9,7 @@
 #                  --paginate reads them all, otherwise only the first.
 #                  A commit's combined status (commits_<sha>_status) comes
 #                  from its statuses, unless a test gives one.
-#                  GraphQL queries read graphql-edits or graphql-threads. As
+#                  GraphQL queries read graphql-threads or graphql-comments. As
 #                  real gh does, --paginate fetches another GraphQL page only
 #                  while the last one says hasNextPage, and only if the query
 #                  asks for pageInfo and takes $endCursor.
@@ -84,8 +84,8 @@ graphql=no
 if [ "$path" = graphql ]; then
   graphql=yes
   case $query in
-    *userContentEdits*) key='graphql-edits' ;;
     *reviewThreads*) key='graphql-threads' ;;
+    *"comments("*) key='graphql-comments' ;;
     *) fail "unexpected GraphQL query: $query" ;;
   esac
 else
