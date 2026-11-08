@@ -70,6 +70,33 @@ final class UndoClearFailureTests: XCTestCase {
         XCTAssertFalse(menuLines(m).contains("Sleep still held with no session"), "\(menuLines(m))")
     }
 
+    /// The menu, in every style, and Popover style's popover show the line
+    /// too. Each reads the journal as it opens (`refreshMenuStatus`,
+    /// `openPopover`), so once the backstop has cleared the entry the line
+    /// is gone when either one opens.
+    func testOpeningTheMenuOrThePopoverDropsAClearedEntrysLine() async throws {
+        for popover in [false, true] {
+            let m = h.makeManager()
+            if popover { m.config.menuBarMode = .popover }
+            await m.start(duration: 3600)
+            try lockJournal(true)
+            _ = await m.end(reason: .user)
+            try lockJournal(false)
+            try assertShown(m, "sleep restored")
+            let controller = StatusItemController(manager: m, status: PlaceholderStatus(), showSettings: {})
+
+            try h.store.saveState(.clean)
+            if popover {
+                controller.openPopover()
+                XCTAssertNil(m.lastError, "the popover kept a cleared entry's line")
+                controller.closePopover(returnFocus: false)
+            } else {
+                controller.refreshMenuStatus()
+                XCTAssertNil(m.lastError, "the menu kept a cleared entry's line")
+            }
+        }
+    }
+
     /// Any transaction reads the journal first, so it drops the line too.
     func testATransactionAfterTheBackstopsClearDropsTheLine() async throws {
         let m = h.makeManager()

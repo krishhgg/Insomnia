@@ -55,7 +55,7 @@ on each day it has new commits. They have the newest code and may be broken.
 
 To install a release yourself, follow [docs/install.md](docs/install.md). It
 covers both channels, how to check the download, and `v0.1.0`, which installs
-differently. Settings > App shows the installed version, and "Check for
+differently. Settings > General shows the installed version, and "Check for
 updates" there tells you whether a newer release exists without installing
 anything.
 
@@ -103,12 +103,43 @@ file and explains how upgrades replace them.
 1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
    and press Enter.
 2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
+3. **End early.** Press and hold the end control next to the countdown, or
+   right-click the menu bar item and choose **End session**.
+   To show only the eye, turn off "Show the countdown in the menu bar" in
+   Settings. The eye opens while a session runs and closes when it ends,
+   and the right-click menu also shows the time left.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.
    Insomnia restores that output if it reconnects while the app runs, or at
    the next launch.
+5. **Menu bar style.** The Menu bar picker in Settings > General has four
+   styles. Pills, the default, works as described above. Compact keeps only
+   the eye in the bar, and a click opens the same pills, countdown and end
+   ring in a small panel. Minimal is the eye with a ring for the time left:
+   a click adds the default session length, and a 0.6 s hold ends the
+   session. Popover shows the eye and, during a session, the time left to
+   the minute (or the end time). Any click on it, left or right, opens a
+   popover with time buttons, Custom fields for days, hours and minutes,
+   the status, Settings and Quit. While a session runs it also has the
+   ring you hold to end it. Popover style has no right-click menu, since
+   the popover shows the same things.
+6. **From a script or an agent.** The app's binary drives the running app:
+
+   ```bash
+   INSOMNIA=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+   "$INSOMNIA" --session start 7200    # two hours
+   "$INSOMNIA" --session extend 1800
+   "$INSOMNIA" --session status
+   "$INSOMNIA" --session end
+   ```
+
+   It starts, extends and ends the same session the menu bar counts down,
+   with the same battery and heat rules, and prints one line. It changes
+   nothing itself, so when the app isn't running it says so and exits 1.
+   A build without this mode opens the menu bar app instead, so a script
+   that may meet one checks `InsomniaSessionCommandVersion` in the bundle's
+   `Info.plist` first.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
@@ -135,8 +166,9 @@ to undo them. The timer keeps counting down while the lid is closed.
   first. With sleep turned off, macOS no longer does this by itself.
 - **Apps on the freeze list are frozen.** Freezing sends an app's processes
   `SIGSTOP`, which pauses them until `SIGCONT` on lid open. The list starts
-  with Slack, WhatsApp and Discord. "Freeze every other app" is off by
-  default. Even when on, it skips meeting, recording and dictation apps: Zoom,
+  with Slack, WhatsApp and Discord. Edit Apps in Settings sets each app to
+  keep running or to freeze, and "All other apps" keeps running by default.
+  Set to freeze, it still skips meeting, recording and dictation apps: Zoom,
   Teams, Webex, FaceTime, Wispr Flow, Granola, Otter, OBS and Loom.
 - **Audio is muted.** Lid open unmutes each output Insomnia muted, even if you
   switched to another one.
@@ -205,10 +237,11 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
-[browser] unthrottled". It asks first, because relaunching quits the browser,
-and tabs come back only if the browser reopens them on startup. Some web apps
-may still stop with the lid closed.
+`--disable-renderer-backgrounding`, the right-click menu (the popover in
+Popover style) offers "Relaunch [browser] unthrottled". It asks first,
+because relaunching quits the browser, and tabs come back only if the
+browser reopens them on startup. Some web apps may still stop with the lid
+closed.
 [docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
 details.
 

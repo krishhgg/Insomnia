@@ -32,6 +32,35 @@ actor AsyncGate {
     }
 }
 
+/// Stands in for the manager's wait for the recovery lock
+/// (`Harness.makeManager(acquireRecoveryLock:)`). The next waits, in the
+/// order `holdNext` was called, wait for their gate. Then each gives up
+/// as for a lock still held by another process, or tries the lock once
+/// and gives up the same way if it is not free. Every other wait is the
+/// app's own.
+final class HeldLockWaits: @unchecked Sendable {
+    enum Then { case giveUp, take }
+    private let lock = NSLock()
+    private var holds: [(gate: AsyncGate, then: Then)] = []
+
+    func holdNext(until gate: AsyncGate, then: Then) {
+        lock.withLock { holds.append((gate, then)) }
+    }
+
+    /// Holds no wait has reached yet.
+    var holdsLeft: Int { lock.withLock { holds.count } }
+
+    func acquire(_ recoveryLock: RecoveryLock, timeout: TimeInterval) async throws -> RecoveryLockHandle {
+        let hold: (gate: AsyncGate, then: Then)? = lock.withLock { holds.isEmpty ? nil : holds.removeFirst() }
+        guard let hold else { return try await recoveryLock.acquire(timeout: timeout) }
+        await hold.gate.wait()
+        guard hold.then == .take, let handle = try recoveryLock.tryAcquire() else {
+            throw RecoveryLockError.busy(path: recoveryLock.path, seconds: timeout)
+        }
+        return handle
+    }
+}
+
 /// The throwaway INSOMNIA_HOME the InsomniaTestHome loader set when this
 /// bundle loaded, before XCTest discovered any test. `Log.append` and
 /// `SessionManager.live` read the variable at call time and fall back to
@@ -87,6 +116,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _restoreGate: AsyncGate?
     private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
+    private var _lockedReadGate: AsyncGate?
+    private var _throwOnLockedRead = false
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
     /// already applied the setting): the ambiguous failure shape.
@@ -129,6 +160,19 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     var readGate: AsyncGate? {
         get { lock.withLock { _readGate } }
         set { lock.withLock { _readGate = newValue } }
+    }
+    /// Holds a `pmset -g` made under the recovery lock (the sleep check's
+    /// read inside its transaction) after the call is recorded, before it
+    /// answers. A read without the lock answers at once.
+    var lockedReadGate: AsyncGate? {
+        get { lock.withLock { _lockedReadGate } }
+        set { lock.withLock { _lockedReadGate = newValue } }
+    }
+    /// A `pmset -g` made under the recovery lock fails after the call is
+    /// recorded. A read without the lock answers.
+    var throwOnLockedRead: Bool {
+        get { lock.withLock { _throwOnLockedRead } }
+        set { lock.withLock { _throwOnLockedRead = newValue } }
     }
 
     /// Commands reported as still running after SIGTERM
@@ -232,6 +276,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     func isSleepDisabled() async throws -> Bool {
         try record("pmset -g")
         if let gate = readGate { await gate.wait() }
+        if RecoveryLock.held != nil, let gate = lockedReadGate { await gate.wait() }
+        if RecoveryLock.held != nil, throwOnLockedRead {
+            throw SleepGuardError(command: "pmset -g", status: 1, stderr: "pmset: read failed")
+        }
         return sleepDisabled
     }
 
@@ -829,8 +877,11 @@ struct Harness {
     /// after a restart.
     /// `customClock` replaces the harness clock, for a test that needs time to
     /// pass by itself, as a real timer does.
+    /// `acquireRecoveryLock` replaces the wait for the recovery lock, for a
+    /// test that says when a wait ends (`HeldLockWaits`).
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
+        acquireRecoveryLock: (@Sendable (RecoveryLock, TimeInterval) async throws -> RecoveryLockHandle)? = nil,
         retryDelay: TimeInterval = 60,
         reassertDelay: Duration = .seconds(3600),
         keptRecheckDelay: Duration = .seconds(3600),
@@ -859,6 +910,7 @@ struct Harness {
             clock: customClock ?? { c.now },
             processLookup: { table.lookup($0) },
             recoveryLockTimeout: lockTimeout,
+            acquireRecoveryLock: acquireRecoveryLock ?? { try await $0.acquire(timeout: $1) },
             recoveryRetryDelay: retryDelay,
             reassertDelay: reassertDelay,
             keptRecheckDelay: keptRecheckDelay,

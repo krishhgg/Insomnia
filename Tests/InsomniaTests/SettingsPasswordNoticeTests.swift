@@ -13,15 +13,15 @@ final class SettingsPasswordNoticeTests: XCTestCase {
     /// Stopping the session clears the failover's report. The password is
     /// still unreadable, so the notice must stay.
     func testAReportClearedBySessionEndKeepsTheNoticeWhileThePasswordIsUnreadable() async {
-        let notice = await SettingsView.hotspotNotice(reported: nil, ssid: "Phone") { throw KeychainError(status: errSecAuthFailed) }
+        let notice = await HotspotPasswordField.hotspotNotice(reported: nil, ssid: "Phone") { throw KeychainError(status: errSecAuthFailed) }
 
         XCTAssertEqual(notice, HotspotPasswordProblem.unreadable.settingsNotice)
         XCTAssertNotNil(notice)
     }
 
     func testAReportClearedAfterTheFixClearsTheNotice() async {
-        let readable = await SettingsView.hotspotNotice(reported: nil, ssid: "Phone") { "pw" }
-        let missing = await SettingsView.hotspotNotice(reported: nil, ssid: "Phone") { nil }
+        let readable = await HotspotPasswordField.hotspotNotice(reported: nil, ssid: "Phone") { "pw" }
+        let missing = await HotspotPasswordField.hotspotNotice(reported: nil, ssid: "Phone") { nil }
         XCTAssertNil(readable)
         XCTAssertNil(missing, "no saved password is not a problem here")
     }
@@ -30,7 +30,7 @@ final class SettingsPasswordNoticeTests: XCTestCase {
     func testAReportedProblemIsShownWithoutAReread() async {
         var reread = false
 
-        let notice = await SettingsView.hotspotNotice(reported: Self.unreadablePhone, ssid: " Phone ") { reread = true; return "pw" }
+        let notice = await HotspotPasswordField.hotspotNotice(reported: Self.unreadablePhone, ssid: " Phone ") { reread = true; return "pw" }
 
         XCTAssertEqual(notice, HotspotPasswordProblem.unreadable.settingsNotice)
         XCTAssertFalse(reread)
@@ -43,8 +43,8 @@ final class SettingsPasswordNoticeTests: XCTestCase {
     func testAReportAboutAnSSIDEditedAwayIsNotShown() async {
         var reread = false
 
-        let readable = await SettingsView.hotspotNotice(reported: Self.unreadablePhone, ssid: "Other Phone") { reread = true; return "pw" }
-        let unreadable = await SettingsView.hotspotNotice(reported: Self.unreadablePhone, ssid: "Other Phone") { throw KeychainError(status: errSecAuthFailed) }
+        let readable = await HotspotPasswordField.hotspotNotice(reported: Self.unreadablePhone, ssid: "Other Phone") { reread = true; return "pw" }
+        let unreadable = await HotspotPasswordField.hotspotNotice(reported: Self.unreadablePhone, ssid: "Other Phone") { throw KeychainError(status: errSecAuthFailed) }
 
         XCTAssertNil(readable)
         XCTAssertTrue(reread)
@@ -54,15 +54,15 @@ final class SettingsPasswordNoticeTests: XCTestCase {
     private static let unreadablePhone = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
 
     func testLoadingFillsTheFieldOrSaysWhyItCannot() async {
-        let loaded = await SettingsView.loadedPassword { "pw" }
+        let loaded = await HotspotPasswordField.loadedPassword { "pw" }
         XCTAssertEqual(loaded.password, "pw")
         XCTAssertNil(loaded.notice)
 
-        let unreadable = await SettingsView.loadedPassword { throw KeychainError(status: errSecInteractionNotAllowed) }
+        let unreadable = await HotspotPasswordField.loadedPassword { throw KeychainError(status: errSecInteractionNotAllowed) }
         XCTAssertEqual(unreadable.password, "")
         XCTAssertEqual(unreadable.notice, HotspotPasswordProblem.unreadable.settingsNotice)
 
-        let other = await SettingsView.loadedPassword { throw Boom() }
+        let other = await HotspotPasswordField.loadedPassword { throw Boom() }
         XCTAssertEqual(other.password, "")
         XCTAssertEqual(other.notice, HotspotPasswordProblem.error("boom").settingsNotice)
     }
@@ -84,7 +84,7 @@ final class SettingsPasswordSaveTests: XCTestCase {
         await m.start(duration: 3600)
         let keychain = BlockingKeychain()
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { "Phone" }
-        let saving = Task { await SettingsView.storePassword("pw", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("pw", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         let floor = FloorRuleDriver(manager: m, notifier: h.notifier)
@@ -107,7 +107,7 @@ final class SettingsPasswordSaveTests: XCTestCase {
         await m.start(duration: 3600)
         let keychain = BlockingKeychain(blocking: .delete, items: ["\(KeychainStore.service)/Phone": "old"])
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { "Phone" }
-        let clearing = Task { await SettingsView.storePassword("", in: store) }
+        let clearing = Task { await HotspotPasswordField.storePassword("", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         _ = await m.end(reason: .user)
@@ -132,7 +132,7 @@ final class SettingsPasswordSaveTests: XCTestCase {
         var field = HotspotPasswordField()
         field.edit("pw")
         XCTAssertTrue(field.startSave())
-        let saving = Task { await SettingsView.storePassword("pw", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("pw", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         ssid.value = "Other Phone"
@@ -166,23 +166,23 @@ final class SettingsPasswordSaveTests: XCTestCase {
         let keychain = BlockingKeychain()
         let ssid = Locked("Phone")
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { ssid.value }
-        let saving = Task { await SettingsView.storePassword("pw", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("pw", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         ssid.value = "Other Phone"
         keychain.release()
         let outcome = await saving.value
-        SettingsView.passwordStored(outcome, configuredSSID: ssid.value, services: services)
+        HotspotPasswordField.passwordStored(outcome, configuredSSID: ssid.value, services: services)
 
         XCTAssertEqual(services.status.hotspotPasswordReport, otherPhone)
         XCTAssertFalse(keychain.gaveUp)
         services.status.hotspotPasswordReport = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
-        SettingsView.passwordStored(outcome, configuredSSID: ssid.value, services: services)
+        HotspotPasswordField.passwordStored(outcome, configuredSSID: ssid.value, services: services)
         XCTAssertNil(services.status.hotspotPasswordReport, "the save wrote the reported hotspot's item")
         services.status.hotspotPasswordReport = otherPhone
-        SettingsView.passwordStored(.failed(notice: "refused"), configuredSSID: "Phone", services: services)
+        HotspotPasswordField.passwordStored(.failed(notice: "refused"), configuredSSID: "Phone", services: services)
         XCTAssertEqual(services.status.hotspotPasswordReport, otherPhone, "a failed save changed nothing")
-        SettingsView.passwordStored(outcome, configuredSSID: "Phone", services: services)
+        HotspotPasswordField.passwordStored(outcome, configuredSSID: "Phone", services: services)
         XCTAssertNil(services.status.hotspotPasswordReport)
     }
 
@@ -209,20 +209,20 @@ final class SettingsPasswordSaveTests: XCTestCase {
         ssid.value = "Other Phone"
         field.edit("pw")
         XCTAssertTrue(field.startSave())
-        let saving = Task { await SettingsView.storePassword("pw", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("pw", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         ssid.value = "Phone"
         keychain.release()
         let outcome = await saving.value
         let recheck = field.finishSave(outcome, ssid: ssid.value)
-        SettingsView.passwordStored(outcome, configuredSSID: ssid.value, services: services)
+        HotspotPasswordField.passwordStored(outcome, configuredSSID: ssid.value, services: services)
 
         XCTAssertEqual(outcome, .stored(.init(ssid: "Other Phone", password: "pw", removed: "Phone")))
         XCTAssertNil(try keychain.get(service: KeychainStore.service, account: "Phone"), "the save removed the loaded account")
         XCTAssertNil(services.status.hotspotPasswordReport, "the reported item is gone")
         XCTAssertEqual(recheck?.ssid, "Phone")
-        let notice = await SettingsView.hotspotNotice(reported: services.status.hotspotPasswordReport, ssid: ssid.value, reread: store.peek)
+        let notice = await HotspotPasswordField.hotspotNotice(reported: services.status.hotspotPasswordReport, ssid: ssid.value, reread: store.peek)
         XCTAssertNil(notice, "a missing item needs no notice")
         XCTAssertFalse(keychain.gaveUp)
     }
@@ -236,7 +236,7 @@ final class SettingsPasswordSaveTests: XCTestCase {
         }
         let store = KeychainHotspotSecretStore(keychain: Refusing(), queue: KeychainQueue()) { "Phone" }
 
-        let outcome = await SettingsView.storePassword("pw", in: store)
+        let outcome = await HotspotPasswordField.storePassword("pw", in: store)
 
         XCTAssertEqual(outcome, .failed(notice: "Could not save the hotspot password: \(KeychainError(status: errSecUserCanceled).localizedDescription)"))
     }
@@ -363,7 +363,7 @@ final class HotspotPasswordFieldTests: XCTestCase {
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { edit.readAndEdit() }
         var field = HotspotPasswordField()
 
-        await SettingsView.loadForField(field.startLoad(ssid: edit.configured), secrets: store) {
+        await HotspotPasswordField.loadForField(field.startLoad(ssid: edit.configured), secrets: store) {
             field.finishRead($0, ssid: edit.configured, password: $1.password, notice: $1.notice)
         }
 
@@ -386,7 +386,7 @@ final class HotspotPasswordFieldTests: XCTestCase {
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: KeychainQueue()) { edit.readAndEdit() }
         var field = HotspotPasswordField()
 
-        await SettingsView.loadForField(field.startLoad(ssid: edit.configured), secrets: store) {
+        await HotspotPasswordField.loadForField(field.startLoad(ssid: edit.configured), secrets: store) {
             field.finishRead($0, ssid: edit.configured, password: $1.password, notice: $1.notice)
         }
 
@@ -405,10 +405,10 @@ final class HotspotPasswordFieldTests: XCTestCase {
         var field = HotspotPasswordField()
         let report = HotspotPasswordReport(ssid: "Phone", problem: .unreadable)
         func recheck() async -> (password: String, notice: String?) {
-            ("", await SettingsView.hotspotNotice(reported: report, ssid: edit.configured, reread: store.peek))
+            ("", await HotspotPasswordField.hotspotNotice(reported: report, ssid: edit.configured, reread: store.peek))
         }
 
-        await SettingsView.readForField(
+        await HotspotPasswordField.readForField(
             field.startRead(ssid: edit.configured),
             first: {
                 let answer = await recheck()
