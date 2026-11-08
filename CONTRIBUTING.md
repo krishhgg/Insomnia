@@ -12,9 +12,10 @@ because the LaunchAgent, install.sh and uninstall.sh run under 3.2 and
 ShellCheck on Linux does not catch those. It then runs `swift test` and
 builds the release with `-Xswiftc -warnings-as-errors`, so a compiler
 warning fails the build. Two Linux jobs run ShellCheck over `scripts/` and
-`.github/scripts/` and actionlint plus zizmor over `.github/workflows`. Greptile reviews every
-push to a pull request with the rules in `.greptile/`; it reads that folder
-from the pull request's branch.
+`.github/scripts/` and actionlint plus zizmor over `.github/workflows`. The
+Codex bot (the ChatGPT Codex connector) reviews a pull request when it opens
+or is marked ready for review. A push does not start a new review, so after
+your last push, comment `@codex review` to have it review the new head.
 
 The ShellCheck job, with the ShellCheck version it pins, also lists every
 finding that a directive hides in `scripts/`, and fails unless the list
@@ -49,7 +50,7 @@ during in-flight work, failed restoration, persistence failures, and recovery
 after interruption. Assert observable settings and journal consistency, not
 only that a mock method was called.
 
-Greptile comments and passing CI provide review evidence, not a safety
+Codex bot reviews and passing CI provide review evidence, not a safety
 certification. Real-machine validation requires a supervised, separately
 approved run on a ventilated surface with recoverable work. Record the exact
 revision, macOS/hardware versions, observed result, and remaining limitations
@@ -78,7 +79,7 @@ including a maintainer's fix or a merge of main, starts every check over.
 |---|---|
 | Swift test and release build (macOS 26) and (macOS 27) | `swift test` and the release build pass on both hosted macOS versions |
 | ShellCheck scripts, Lint workflows | ShellCheck, actionlint and zizmor find nothing |
-| merge-gate/greptile | Greptile reviewed the head and scored it 5/5 |
+| merge-gate/codex-bot | the Codex bot reviewed the head and found nothing |
 | merge-gate/accepted | the owner added the `accepted` label |
 | merge-gate/evidence | the maintainer checked a real-Mac report for the head, or the pull request only changes paths listed under "Real-Mac evidence" |
 | merge-gate/config | the pull request leaves the config that steers checks alone (listed below), the owner wrote it, or the owner OK'd those changes at the head |
@@ -98,9 +99,10 @@ all. Before you build a new feature or change a default, open an issue so
 that is settled first.
 
 `config` exists because some files can switch off a check: a pull request
-from a fork runs the workflow files on its own branch, and Greptile reads
-its rules from the branch it reviews. So the gate passes a change without
-the owner's OK only when every file it touches is one of these kinds:
+from a fork runs the workflow files on its own branch, and an AGENTS.md
+file on the branch can steer a review agent. So the gate passes a change
+without the owner's OK only when every file it touches is one of these
+kinds:
 
 - Swift files under `Sources/`, and `.swift`, `.h` or `.c` files under
   `Tests/`
@@ -110,7 +112,7 @@ the owner's OK only when every file it touches is one of these kinds:
   `scripts/check-lid-simulation-gate.sh`, which CI runs
 - `.plist` files under `Resources/`
 - `README.md` and `LICENSE` (`SECURITY.md` and this file set the project's
-  policy, and Greptile reads them as guidance for every review)
+  policy)
 
 Even there, some files count as config:
 

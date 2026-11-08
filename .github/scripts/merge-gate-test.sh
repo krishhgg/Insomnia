@@ -142,31 +142,41 @@ pr_json() {
       head: {sha: $head}, user: {login: $author}, labels: $labels}' | json pulls_5
 }
 
-# greptile_body <score> <reviewed sha>: Greptile's block as it writes it.
-greptile_body() {
-  printf '<h3>Greptile Summary</h3>\n\n<!-- greptile_confidence_score:%s -->\n\n' "$1"
-  printf '<sub>Last reviewed commit: ["Gate"](https://github.com/krishhgg/insomnia/commit/%s)</sub>\n' "$2"
+# summary_body <reviewed sha> <found: true, false or null> [status]
+# [security sha] [security open: true, false or null]: the Codex bot's
+# review summary as it writes it.
+summary_body() {
+  local state
+  state=$(jq -cn --arg c "$1" --argjson f "$2" --arg s "${3:-completed}" --arg sc "${4:-$1}" \
+    --argjson so "${5:-null}" '{code_review: {commit_sha: $c, has_any_findings: $f,
+      has_unresolved_findings: $f, status: $s}, security_review: {commit_sha: $sc,
+      has_any_findings: $so, has_unresolved_findings: $so, status: "completed"}}')
+  printf '<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 %s -->\n' "$state"
+  printf '### Codex Review\n\nReviewed commit: %s\n' "${1:0:10}"
 }
 
-# edit <time> <editor> <description>: one description edit as GraphQL lists
-# it; the diff is the whole description after the edit.
-edit() {
-  jq -n --arg t "2026-10-12T$1Z" --arg e "$2" --arg d "$3" '{editedAt: $t, editor: {login: $e}, diff: $d}'
+# comment <created> <edited or -> <author> <editor or -> <body>: one pull
+# request comment as GraphQL lists it.
+comment() {
+  jq -n --arg c "2026-10-12T$1Z" --arg l "$2" --arg a "$3" --arg e "$4" --arg b "$5" \
+    '{author: {login: $a}, editor: (if $e == "-" then null else {login: $e} end), createdAt: $c,
+      lastEditedAt: (if $l == "-" then null else "2026-10-12T\($l)Z" end), body: $b}'
 }
 
-# edits <file> <true|false: another page follows> <edit>...: one page of
-# description edits.
-edits() {
+# comments <file> <true|false: another page follows> <comment>...: one page
+# of pull request comments, oldest first, as GraphQL lists them.
+comments() {
   local file=$1 more=$2
   shift 2
-  printf '%s\n' "$@" | jq -s --argjson more "$more" '{data: {repository: {pullRequest: {userContentEdits: {nodes: .,
+  printf '%s\n' "$@" | jq -s --argjson more "$more" '{data: {repository: {pullRequest: {comments: {nodes: .,
     pageInfo: {hasNextPage: $more, endCursor: (if $more then "next" else null end)}}}}}}' >"$dir/$file.json"
 }
 
-# greptile <score> <reviewed sha>: Greptile's only edit.
-greptile() {
-  edits graphql-edits false "$(edit 10:00:00 greptile-apps "Fixes the gate.
-$(greptile_body "$1" "$2")")"
+# codex_bot <summary_body arguments>...: the author's comment, then the
+# Codex bot's only summary.
+codex_bot() {
+  comments graphql-comments false "$(comment 09:00:00 - someone - "@codex review")" \
+    "$(comment 10:00:00 - chatgpt-codex-connector - "$(summary_body "$@")")"
 }
 
 # label_events <[[event, login], ...]>: who added and removed "accepted".
@@ -233,7 +243,7 @@ rules() {
     {type: "update", ruleset_id: 2, parameters: {}},
     {type: "required_status_checks", ruleset_id: $rid, parameters: {required_status_checks:
       ([$names[] | {context: ., integration_id: ($pin | tonumber? // null)}]
-        + (["greptile", "accepted", "evidence", "config", "codex"] | map({context: "merge-gate/\(.)"}))
+        + (["codex-bot", "accepted", "evidence", "config", "codex"] | map({context: "merge-gate/\(.)"}))
         | map(select(.context != $drop)))}}]' | json rules_branches_main
   echo '{"id": 1, "current_user_can_bypass": "never"}' | json rulesets_1
   echo '{"id": 2, "current_user_can_bypass": "pull_requests_only"}' | json rulesets_2
@@ -248,12 +258,12 @@ threads() {
 }
 
 # Pull request #5 from "someone" changes a doc. The owner added the
-# accepted label, Greptile scored the head 5/5, the four CI jobs passed on
+# accepted label, the Codex bot found nothing in the head, the four CI jobs passed on
 # the current main, and a ruleset nobody can bypass requires everything.
 baseline() {
   echo '[]' | json "commits_${HEAD_SHA}_statuses"
   pr_json someone '[{"name": "accepted"}]'
-  greptile 5 "$HEAD_SHA"
+  codex_bot "$HEAD_SHA" false
   label_events '[["labeled", "krishhgg"]]'
   changed docs/guide.md
   head_tree '[{"path": "docs", "mode": "040000"}, {"path": "docs/guide.md", "mode": "100644"}]'
@@ -273,7 +283,7 @@ all_gates_pass() {
 
 test_ready_pull_request_merges() {
   run 0 evaluate 5
-  gate greptile success "Greptile scored 1111111 5/5"
+  gate codex-bot success "the Codex bot reviewed 1111111 and found nothing"
   gate accepted success "the owner accepted"
   gate evidence success "not needed"
   gate config success "unchanged"
@@ -540,47 +550,147 @@ test_three_hundred_files_assume_the_worst() {
   gate config pending
 }
 
-test_forged_greptile_score_fails() {
-  # The author wrote a block of their own before Greptile's edit, so
-  # Greptile's description holds both, the forged one first.
-  edits graphql-edits false "$(edit 10:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")
-$(greptile_body 2 "$HEAD_SHA")")"
+test_codex_bot_findings_fail() {
+  codex_bot "$HEAD_SHA" true
   run 0 evaluate 5
-  gate greptile failure "2 Greptile scores and 2 reviewed commits"
+  gate codex-bot failure "the Codex bot found issues in 1111111"
 }
 
-test_author_edit_after_greptile_does_not_count() {
-  edits graphql-edits false "$(edit 11:00:00 someone "$(greptile_body 5 "$HEAD_SHA")")" \
-    "$(edit 10:00:00 greptile-apps "$(greptile_body 3 "$HEAD_SHA")")"
+test_a_resolved_codex_bot_finding_still_fails() {
+  # The bot keeps has_any_findings once a finding's conversation is
+  # resolved; only a later review of the head that finds nothing passes.
+  codex_bot "$HEAD_SHA" true
+  change graphql-comments '.data.repository.pullRequest.comments.nodes[1].body |=
+    sub("\"has_unresolved_findings\":true"; "\"has_unresolved_findings\":false")'
   run 0 evaluate 5
-  gate greptile failure "Greptile scored 1111111 3/5"
+  gate codex-bot failure "found issues"
 }
 
-test_greptile_score_for_an_older_commit_waits() {
-  greptile 5 "$OLD_SHA"
+test_codex_bot_review_of_an_older_commit_waits() {
+  codex_bot "$OLD_SHA" false
   run 0 evaluate 5
-  gate greptile pending "its summary covers 3333333"
+  gate codex-bot pending "its summary covers 3333333"
 }
 
-test_no_greptile_review_waits() {
-  edits graphql-edits false "$(edit 09:00:00 someone "My change.")"
+test_no_codex_bot_review_waits() {
+  comments graphql-comments false "$(comment 09:00:00 - someone - "My change.")"
   run 0 evaluate 5
-  gate greptile pending "first review"
+  gate codex-bot pending "first review"
 }
 
-test_greptile_below_five_fails() {
-  greptile 4 "$HEAD_SHA"
+test_a_summary_from_someone_else_does_not_count() {
+  comments graphql-comments false "$(comment 09:00:00 - someone - "$(summary_body "$HEAD_SHA" false)")" \
+    "$(comment 10:00:00 - "$OWNER" - "$(summary_body "$HEAD_SHA" false)")"
   run 0 evaluate 5
-  gate greptile failure "4/5; the gate needs 5/5"
+  gate codex-bot pending "first review"
 }
 
-test_newest_greptile_edit_wins_across_pages() {
-  # GraphQL lists the newest edit first, so the last row read is the oldest.
-  rm "$dir/graphql-edits.json"
-  edits graphql-edits.1 true "$(edit 12:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")")"
-  edits graphql-edits.2 false "$(edit 09:00:00 greptile-apps "$(greptile_body 2 "$OLD_SHA")")"
+test_other_codex_bot_comments_do_not_count() {
+  comments graphql-comments false "$(comment 10:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" true)")" \
+    "$(comment 11:00:00 - chatgpt-codex-connector - "Quoting: $(summary_body "$HEAD_SHA" false)")"
   run 0 evaluate 5
-  gate greptile success
+  gate codex-bot failure "found issues"
+}
+
+test_someone_elses_edit_of_the_summary_fails() {
+  comments graphql-comments false \
+    "$(comment 10:00:00 11:00:00 chatgpt-codex-connector "$OWNER" "$(summary_body "$HEAD_SHA" false)")"
+  run 0 evaluate 5
+  gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
+}
+
+test_removing_the_marker_from_the_newest_summary_fails() {
+  # The bot's older summary says the head is clean and its newer one found
+  # issues. Without its marker the newer one is no summary, so the edit
+  # itself has to fail the gate.
+  comments graphql-comments false \
+    "$(comment 09:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")" \
+    "$(comment 10:00:00 11:00:00 chatgpt-codex-connector "$OWNER" "Codex found issues.")"
+  run 0 evaluate 5
+  gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
+}
+
+test_a_malformed_state_still_reaches_the_edit_check() {
+  # A state whose fields can't be read must not stop the read before the
+  # edit check, or the run would post nothing and leave an older success.
+  comments graphql-comments false \
+    "$(comment 09:00:00 10:00:00 chatgpt-codex-connector chatgpt-codex-connector "$(summary_body "$HEAD_SHA" true)")" \
+    "$(comment 09:30:00 11:00:00 chatgpt-codex-connector "$OWNER" '<!-- codex-review-state:v1 {"code_review":"invalid"} -->')"
+  run 0 evaluate 5
+  gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
+  # In the bot's own summary, such a state waits.
+  comments graphql-comments false "$(comment 12:00:00 - chatgpt-codex-connector - '<!-- codex-pull-request-review-summary -->
+<!-- codex-review-state:v1 {"code_review":"invalid","security_review":7} -->')"
+  run 0 evaluate 5
+  gate codex-bot pending "names no reviewed commit"
+}
+
+test_an_edit_github_names_no_account_for_fails() {
+  comments graphql-comments false \
+    "$(comment 10:00:00 11:00:00 chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")"
+  run 0 evaluate 5
+  gate codex-bot failure "an account GitHub no longer names made the newest edit"
+}
+
+test_the_codex_bot_editing_its_summary_counts() {
+  comments graphql-comments false \
+    "$(comment 10:00:00 11:00:00 chatgpt-codex-connector chatgpt-codex-connector "$(summary_body "$HEAD_SHA" false)")"
+  run 0 evaluate 5
+  gate codex-bot success
+}
+
+test_a_summary_with_two_states_fails() {
+  # A second state, as one quoted from the pull request would add, comes
+  # after the bot's own.
+  comments graphql-comments false "$(comment 10:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" true)
+$(summary_body "$HEAD_SHA" false)")"
+  run 0 evaluate 5
+  gate codex-bot failure "holds 2 review states, not 1"
+}
+
+test_a_summary_without_a_state_waits() {
+  comments graphql-comments false "$(comment 10:00:00 - chatgpt-codex-connector - "<!-- codex-pull-request-review-summary -->
+Codex is reviewing.")"
+  run 0 evaluate 5
+  gate codex-bot pending "holds no review state"
+  comments graphql-comments false "$(comment 10:00:00 - chatgpt-codex-connector - "<!-- codex-pull-request-review-summary -->
+<!-- codex-review-state:v1 {\"code_review\": -->")"
+  run 0 evaluate 5
+  gate codex-bot pending "names no reviewed commit"
+}
+
+test_a_running_codex_bot_review_waits() {
+  codex_bot "$HEAD_SHA" null running
+  run 0 evaluate 5
+  gate codex-bot pending "the Codex bot's review of 1111111 is running"
+}
+
+test_a_summary_that_does_not_say_waits() {
+  codex_bot "$HEAD_SHA" null
+  run 0 evaluate 5
+  gate codex-bot pending "does not say whether it found anything"
+}
+
+test_open_security_findings_fail() {
+  codex_bot "$HEAD_SHA" false completed "$HEAD_SHA" true
+  run 0 evaluate 5
+  gate codex-bot failure "security review of 1111111 left findings open"
+  codex_bot "$HEAD_SHA" false completed "$OLD_SHA" true
+  run 0 evaluate 5
+  gate codex-bot success
+}
+
+test_newest_codex_bot_summary_wins_across_pages() {
+  rm "$dir/graphql-comments.json"
+  comments graphql-comments.1 true "$(comment 09:00:00 - chatgpt-codex-connector - "$(summary_body "$OLD_SHA" true)")"
+  comments graphql-comments.2 false "$(comment 12:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")"
+  run 0 evaluate 5
+  gate codex-bot success
+  # An older comment the bot edited later is the newer summary.
+  comments graphql-comments.1 true \
+    "$(comment 09:00:00 13:00:00 chatgpt-codex-connector chatgpt-codex-connector "$(summary_body "$HEAD_SHA" true)")"
+  run 0 evaluate 5
+  gate codex-bot failure "found issues"
 }
 
 test_label_from_someone_else_waits() {
@@ -620,8 +730,8 @@ test_post_refuses_another_head_and_other_gates() {
   login=$OWNER
   run 2 post 5 "$OLD_SHA" codex success "fine"
   says "#5's head is $HEAD_SHA, not $OLD_SHA"
-  run 2 post 5 "$HEAD_SHA" greptile success "fine"
-  says "not greptile"
+  run 2 post 5 "$HEAD_SHA" codex-bot success "fine"
+  says "not codex-bot"
   run 2 post 5 1111111 codex success "fine"
   says "not a full commit sha"
   [ "$(posts)" = 0 ] || fail "posted"
@@ -747,11 +857,11 @@ test_check_sees_a_label_removed_before_the_workflow_runs() {
   says "posted success, but it is now pending: waiting for the owner's accepted label"
 }
 
-test_check_sees_a_lower_greptile_score_before_the_workflow_runs() {
+test_check_sees_a_new_codex_bot_finding_before_the_workflow_runs() {
   all_gates_pass
-  greptile 3 "$HEAD_SHA"
+  codex_bot "$HEAD_SHA" true
   run 1 check 5
-  says "posted success, but it is now failure: Greptile scored 1111111 3/5"
+  says "posted success, but it is now failure: the Codex bot found issues in 1111111"
 }
 
 test_check_says_when_the_workflow_is_behind() {
@@ -951,11 +1061,11 @@ test_check_counts_a_failing_run_named_like_a_gate() {
   says "as the ruleset counts it: check run from app 555: completed, failure"
 }
 
-test_greptile_edits_at_the_same_time_wait() {
-  edits graphql-edits false "$(edit 10:00:00 greptile-apps "$(greptile_body 2 "$HEAD_SHA")")" \
-    "$(edit 10:00:00 greptile-apps "$(greptile_body 5 "$HEAD_SHA")")"
+test_codex_bot_summaries_at_the_same_time_wait() {
+  comments graphql-comments false "$(comment 10:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" true)")" \
+    "$(comment 10:00:00 - chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")"
   run 0 evaluate 5
-  gate greptile pending "share a time and disagree"
+  gate codex-bot pending "share a time and disagree"
 }
 
 test_a_status_from_a_deleted_account_shifts_nothing() {

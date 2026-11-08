@@ -488,7 +488,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         XCTAssertEqual(joiner.calls, [])
         XCTAssertEqual(n.passwordReport?.problem, .unreadable)
-        XCTAssertEqual(n.passwordReport?.problem.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
+        XCTAssertEqual(n.passwordReport?.problem.menuLine, "Hotspot password unreadable by this build: enter it again in Settings")
         XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.unreadable.explanation])
         XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.contains("Enter it again in Settings"))
     }
