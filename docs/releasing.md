@@ -284,6 +284,7 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 - A left-running `disablesleep 0` that exits 0: the end finishes without running it again
 - After that command exits: Low Power Mode ownership matches the mode, and a lid open made meanwhile is undone
 - `SleepDisabled 1` set by hand with no session: left alone and reported at launch, not cleared
+- A journal clear the backstop finishes: `chflags uchg` state.json, choose End (the menu shows "sleep restored but the journal entry could not be cleared"), `chflags nouchg`, wait for the next backstop run to log "journal cleared"; the next menu opening has no error line
 - Unreadable battery (IOKit miss) ends the session on a laptop after the second read; desktop unaffected
 - Settings battery menus keep the end floor below the Low Power Mode floor by moving the other menu
 - "Show the countdown in the menu bar" off: a start leaves only the eye, open, with no countdown or end control and the item no wider than idle; the right-click menu leads with the time left and End session ends the session and closes the eye; clicking the eye still opens the extend pills; turning the setting on or off mid-session changes the bar at once

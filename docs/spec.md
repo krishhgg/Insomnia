@@ -1528,7 +1528,11 @@ downwards, never sideways. Top to bottom:
    under the fields in system orange, and the typed value stays in the
    fields for a retry. The same text is not repeated as a warning row
    while it shows there. Both survive closing and reopening the popover;
-   the next start, or a session coming up, clears them.
+   the next start, or a session coming up, clears them. When the last
+   error is a failed journal clear from undoing the start, it is not the
+   reason: the popover shows "Couldn't start", and that line stays a
+   warning row, which goes once a journal read shows the entry cleared,
+   as when the backstop clears it.
 4. **Status.** Short rows, one fact each, with an SF Symbol: the lid,
    power (the charge, what the battery is
    doing, and the time the power source list estimates: "48% · 5.6 W ·

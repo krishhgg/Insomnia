@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import Insomnia
 
 /// An undo that went through but whose journal entry could not be cleared
@@ -48,6 +49,139 @@ final class UndoClearFailureTests: XCTestCase {
         XCTAssertEqual(h.guardFake.calls, ["disablesleep 1", "disablesleep 0", "disablesleep 0"])
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
         XCTAssertNil(m.lastError, "the line still says a clear that went through will be retried")
+    }
+
+    /// The backstop clears the entry the app could not (issue #124): the
+    /// next menu opening reads the journal and the line goes. Before that,
+    /// with the entry still on disk, it stays.
+    func testLineGoesOnceTheBackstopClearsTheEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        m.recheckUnclearedEntry()
+        try assertShown(m, "sleep restored")
+        XCTAssertTrue(menuLines(m).contains("Sleep still held with no session"))
+
+        try h.store.saveState(.clean)
+        m.recheckUnclearedEntry()
+        XCTAssertNil(m.lastError)
+        XCTAssertFalse(menuLines(m).contains("Sleep still held with no session"), "\(menuLines(m))")
+    }
+
+    /// The menu, in every style, and Popover style's popover show the line
+    /// too. Each reads the journal as it opens (`refreshMenuStatus`,
+    /// `openPopover`), so once the backstop has cleared the entry the line
+    /// is gone when either one opens.
+    func testOpeningTheMenuOrThePopoverDropsAClearedEntrysLine() async throws {
+        for popover in [false, true] {
+            let m = h.makeManager()
+            if popover { m.config.menuBarMode = .popover }
+            await m.start(duration: 3600)
+            try lockJournal(true)
+            _ = await m.end(reason: .user)
+            try lockJournal(false)
+            try assertShown(m, "sleep restored")
+            let controller = StatusItemController(manager: m, status: PlaceholderStatus(), showSettings: {})
+
+            try h.store.saveState(.clean)
+            if popover {
+                controller.openPopover()
+                XCTAssertNil(m.lastError, "the popover kept a cleared entry's line")
+                controller.closePopover(returnFocus: false)
+            } else {
+                controller.refreshMenuStatus()
+                XCTAssertNil(m.lastError, "the menu kept a cleared entry's line")
+            }
+        }
+    }
+
+    /// A start refused after `disablesleep 1` went through is undone like
+    /// an end, and that end's clear can fail too. Its line says a clear is
+    /// owed, not why the start was refused: the popover says the start
+    /// failed and keeps the value for the retry, and the line is a status
+    /// row only, so it goes once the backstop clears the entry. Copied as
+    /// the start error, it stayed under the fields after that.
+    func testAPopoverStartWhoseRollbackClearFailsLeavesNoCopyOfTheLine() async throws {
+        _ = NSApplication.shared
+        let m = h.makeManager()
+        m.config.menuBarMode = .popover
+        let controller = StatusItemController(manager: m, status: PlaceholderStatus(), showSettings: {})
+        let gate = AsyncGate()
+        h.guardFake.sleepGate = gate
+        h.guardFake.throwAfterEffect = ["disablesleep 1"]
+        controller.openPopover()
+        controller.model.texts[.hours] = "2"
+        controller.commit()
+        await gate.waitUntilStarted()
+        try lockJournal(true)
+        await gate.open()
+        await controller.sessionRequest?.value
+        try lockJournal(false)
+
+        XCTAssertFalse(m.isActive)
+        try assertShown(m, "sleep restored")
+        let line = try XCTUnwrap(m.lastError)
+        XCTAssertEqual(controller.model.startError, MenuBarModel.startFailedText)
+        XCTAssertEqual(controller.model.texts[.hours], "2")
+        let rows = StatusItemController.statusItems(manager: m, status: PlaceholderStatus(), startError: controller.model.startError).map(\.title)
+        XCTAssertTrue(rows.contains(line), "\(rows)")
+
+        controller.closePopover(returnFocus: false)
+        try h.store.saveState(.clean)
+        controller.openPopover()
+        XCTAssertNil(m.lastError)
+        XCTAssertEqual(controller.model.startError, MenuBarModel.startFailedText, "the popover kept a cleared entry's line")
+        XCTAssertEqual(controller.model.texts[.hours], "2", "the retry lost its value")
+        controller.closePopover(returnFocus: false)
+    }
+
+    /// Any transaction reads the journal first, so it drops the line too.
+    func testATransactionAfterTheBackstopsClearDropsTheLine() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        try h.store.saveState(.clean)
+        await m.stopWaitingForOutput(SavedAudioOutput(deviceUID: "not-saved", name: nil, volume: 1, muted: false, saveID: nil))
+        XCTAssertNil(m.lastError)
+    }
+
+    /// A journal that does not read says nothing about the entry: the line
+    /// stays.
+    func testAnUnreadableJournalKeepsTheLine() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+
+        try Data("{".utf8).write(to: h.home.paths.stateFile)
+        m.recheckUnclearedEntry()
+        try assertShown(m, "sleep restored")
+    }
+
+    private func menuLines(_ m: SessionManager) -> [String] {
+        StatusItemController.menuItems(manager: m, status: RecordingStatusSource()).map(\.title)
+    }
+
+    /// A newer error in the menu is not the cleared entry's line, so it
+    /// stays when the backstop clears the entry.
+    func testANewerErrorStaysWhenTheBackstopClearsTheEntry() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try lockJournal(true)
+        _ = await m.end(reason: .user)
+        try lockJournal(false)
+        m.fail("something newer")
+
+        try h.store.saveState(.clean)
+        m.recheckUnclearedEntry()
+        XCTAssertEqual(m.lastError, "something newer")
     }
 
     /// The end's `lowpowermode 0` exits 0 and the clear fails.

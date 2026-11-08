@@ -959,6 +959,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         // Same for the sleep lines: re-read the bit now.
         Task { await manager.recheckForeignSleep() }
         Task { await manager.checkSleepHeld() }
+        // A journal entry the backstop cleared takes its line with it.
+        manager.recheckUnclearedEntry()
         recheckHotspotPassword()
         if model.startError == nil {
             model.clearFields()
@@ -1763,8 +1765,13 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                     // fields; the value comes back to them for the retry,
                     // unless something was typed since. A chip's start
                     // leaves them alone: what they held was not asked for.
+                    // A failed clear from the start's rollback is not the
+                    // reason: it stays a status line, which goes once the
+                    // backstop clears the entry, and the popover says only
+                    // that the start failed. A copy would outlive the line.
                     model.phase = .idle
-                    model.startError = Self.startErrorText(manager.lastError)
+                    let reason = manager.lastError == manager.unclearedEntryLine ? nil : manager.lastError
+                    model.startError = Self.startErrorText(reason)
                     if fromPopoverFields, opening != popoverOpenings, model.texts.isEmpty, !typed.isEmpty {
                         model.texts = typed
                         model.customShown = true
@@ -2044,6 +2051,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
         // An open AppKit menu blocks the main actor; this scan updates the
         // next opening if the foreign sleep setting has since been cleared.
         Task { await manager.recheckForeignSleep() }
+        // A journal entry the backstop cleared takes its line with it.
+        manager.recheckUnclearedEntry()
         // The time left is read now too: the redraw timer stops while the
         // lid is closed, and the menu can open then on an external display.
         // Nothing ticks it at all while the bar shows the end time.
