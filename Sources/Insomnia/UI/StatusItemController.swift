@@ -1635,8 +1635,13 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                     // fields; the value comes back to them for the retry,
                     // unless something was typed since. A chip's start
                     // leaves them alone: what they held was not asked for.
+                    // A failed clear from the start's rollback is not the
+                    // reason: it stays a status line, which goes once the
+                    // backstop clears the entry, and the popover says only
+                    // that the start failed. A copy would outlive the line.
                     model.phase = .idle
-                    model.startError = Self.startErrorText(manager.lastError)
+                    let reason = manager.lastError == manager.unclearedEntryLine ? nil : manager.lastError
+                    model.startError = Self.startErrorText(reason)
                     if fromPopoverFields, opening != popoverOpenings, model.texts.isEmpty, !typed.isEmpty {
                         model.texts = typed
                         model.customShown = true

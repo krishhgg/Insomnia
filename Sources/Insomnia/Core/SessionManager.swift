@@ -519,6 +519,9 @@ final class SessionManager {
     /// a journal write has that entry cleared, if it is still the one
     /// shown: it says the clear will be retried (`persistState`).
     @ObservationIgnored private var uncleared: (message: String, clear: (inout RuntimeState) -> Void)?
+    /// That line while it is up, or nil. It says why a clear is owed, not
+    /// why a start was refused, so the popover doesn't copy it as one.
+    var unclearedEntryLine: String? { uncleared?.message }
     /// A lid close or open refused while `unfinishedCommand` ran. Replayed
     /// for the lid's latest state once it has exited; cleared then, or by
     /// a session end, which undoes every lid action in the journal.

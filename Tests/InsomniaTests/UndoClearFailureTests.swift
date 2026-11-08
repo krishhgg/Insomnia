@@ -97,6 +97,46 @@ final class UndoClearFailureTests: XCTestCase {
         }
     }
 
+    /// A start refused after `disablesleep 1` went through is undone like
+    /// an end, and that end's clear can fail too. Its line says a clear is
+    /// owed, not why the start was refused: the popover says the start
+    /// failed and keeps the value for the retry, and the line is a status
+    /// row only, so it goes once the backstop clears the entry. Copied as
+    /// the start error, it stayed under the fields after that.
+    func testAPopoverStartWhoseRollbackClearFailsLeavesNoCopyOfTheLine() async throws {
+        _ = NSApplication.shared
+        let m = h.makeManager()
+        m.config.menuBarMode = .popover
+        let controller = StatusItemController(manager: m, status: PlaceholderStatus(), showSettings: {})
+        let gate = AsyncGate()
+        h.guardFake.sleepGate = gate
+        h.guardFake.throwAfterEffect = ["disablesleep 1"]
+        controller.openPopover()
+        controller.model.texts[.hours] = "2"
+        controller.commit()
+        await gate.waitUntilStarted()
+        try lockJournal(true)
+        await gate.open()
+        await controller.sessionRequest?.value
+        try lockJournal(false)
+
+        XCTAssertFalse(m.isActive)
+        try assertShown(m, "sleep restored")
+        let line = try XCTUnwrap(m.lastError)
+        XCTAssertEqual(controller.model.startError, MenuBarModel.startFailedText)
+        XCTAssertEqual(controller.model.texts[.hours], "2")
+        let rows = StatusItemController.statusItems(manager: m, status: PlaceholderStatus(), startError: controller.model.startError).map(\.title)
+        XCTAssertTrue(rows.contains(line), "\(rows)")
+
+        controller.closePopover(returnFocus: false)
+        try h.store.saveState(.clean)
+        controller.openPopover()
+        XCTAssertNil(m.lastError)
+        XCTAssertEqual(controller.model.startError, MenuBarModel.startFailedText, "the popover kept a cleared entry's line")
+        XCTAssertEqual(controller.model.texts[.hours], "2", "the retry lost its value")
+        controller.closePopover(returnFocus: false)
+    }
+
     /// Any transaction reads the journal first, so it drops the line too.
     func testATransactionAfterTheBackstopsClearDropsTheLine() async throws {
         let m = h.makeManager()
