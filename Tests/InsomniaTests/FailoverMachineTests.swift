@@ -233,7 +233,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let queue = KeychainQueue()
         let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { "Phone" }
-        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("new", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         let joiner = RecordingHotspotJoiner()
@@ -400,7 +400,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
     private func outageWithAJoinBehindABlockedSave(keychain: BlockingKeychain, savingFor ssid: String) async throws -> BlockedJoin {
         let queue = KeychainQueue()
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { ssid }
-        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("new", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         let joiner = RecordingHotspotJoiner()

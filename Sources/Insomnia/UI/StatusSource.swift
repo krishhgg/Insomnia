@@ -136,9 +136,3 @@ enum WiFiStatusName {
         return locationAuthorized ? nil : "on (name hidden until Location is allowed)"
     }
 }
-
-/// Short label for a duration: "30m", "2h", "3d". Used by the preset list in
-/// Settings.
-func chipLabel(for seconds: TimeInterval) -> String {
-    SessionMath.formatRemaining(seconds).replacingOccurrences(of: " ", with: "")
-}

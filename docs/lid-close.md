@@ -52,20 +52,20 @@ The defaults are worth knowing:
 
 - **Selected apps:** Slack, WhatsApp, and Discord are on the freeze list.
   Configured agent apps are excluded from this ordinary list.
-- **Every other app:** "Freeze every other app while the lid is closed" is
-  off, so a fresh install pauses the freeze list only. Turn it on to also pause
+- **Every other app:** "All other apps" in Edit Apps is set to keep running,
+  so a fresh install pauses the freeze list only. Set it to freeze to also pause
   every Dock app that is not an agent app, an Apple app, Docker Desktop or a
   built-in protected app (editors, terminals, browsers, AI apps, password
   managers, local databases, Tailscale, local model servers; JetBrains IDEs by
   bundle-id prefix), so only agents keep running with the lid shut. Menu-bar
-  apps are never picked up automatically; add them to the freeze list if you
-  want them paused. Settings shows a "Would freeze now" line listing what the
-  automatic scope would pause at that moment.
-- **Meeting, recording and dictation apps:** never frozen by "Freeze every
-  other app", with their helper apps: Zoom, Microsoft Teams (new and classic),
+  apps are never picked up automatically; add them in Edit Apps and set them
+  to freeze if you want them paused. Edit Apps then shows a "Would freeze now"
+  line listing what the automatic scope would pause at that moment.
+- **Meeting, recording and dictation apps:** never frozen by "All other
+  apps", with their helper apps: Zoom, Microsoft Teams (new and classic),
   Webex (and the older Webex Meetings app), FaceTime, Wispr Flow, Granola,
   Otter, OBS and Loom. Freezing one ends the call, the recording or the
-  meeting notes when the lid closes. Putting one on the freeze list by hand
+  meeting notes when the lid closes. Setting one to freeze in Edit Apps
   still freezes it, except FaceTime, which is an Apple app.
 - **Docker rule:** off. Turn it on to pause Docker Desktop on lid close when
   no container is running. The local Desktop socket is asked once to pick
@@ -89,7 +89,8 @@ The defaults are worth knowing:
 - **Display and keyboard backlight:** on ("Turn off the display and keyboard
   backlight" in Settings). Both values are saved to the journal before they
   are changed.
-- **Low Power Mode while the lid is closed:** on. With sleep disabled a closed
+- **Low Power Mode while the lid is closed:** on ("Turn on Low Power Mode" in
+  Settings). With sleep disabled a closed
   Mac otherwise keeps running at full speed; the mode is switched off again
   when the lid opens, unless a battery or thermal rule still wants it.
 - **Battery rules:** below 40% on battery, request Low Power Mode; below 10%,
@@ -100,8 +101,8 @@ The defaults are worth knowing:
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
   session. These rules require the app to be running.
-  Setting the end floor to 0 turns the battery end off. Otherwise the end
-  floor stays below the Low Power Mode floor. The Settings steppers move the
+  Setting the end floor to Never turns the battery end off. Otherwise the
+  end floor stays below the Low Power Mode floor. The Settings menus move the
   other floor when the two would cross, and a hand-edited `config.json` with
   the floors out of order is corrected at launch, and logged, by raising the
   Low Power Mode floor.
@@ -109,11 +110,12 @@ The defaults are worth knowing:
 ## Upgrading from an earlier build
 
 Upgrading from an earlier build changes two of these once. On the first
-launch of this version, a config.json saved by an earlier build gets "Freeze
-every other app" turned off and "Mute audio on lid close" turned on, and
-Insomnia posts a notification naming what changed. Settings shows the same
-line at the top of Lid-close actions until you dismiss it, for anyone with
-notifications off. The toggles are right below it. config.json records that
+launch of this version, a config.json saved by an earlier build gets "All
+other apps" set to keep running and "Mute audio" turned on, and Insomnia
+posts a notification naming what changed and where. Settings shows the same
+line at the top of When the lid closes until you dismiss it, for anyone with
+notifications off. Mute audio is right below it, and All other apps is in
+Edit Apps. config.json records that
 the update ran (`lidCloseDefaultsApplied`), so a setting you turn back stays
 the way you set it. A fresh install starts with the new defaults and no
 notice.
