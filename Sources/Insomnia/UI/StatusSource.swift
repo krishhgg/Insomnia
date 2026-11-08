@@ -37,6 +37,9 @@ protocol StatusSource: AnyObject, Observable {
     /// The battery's time to empty or to full, read on demand like the
     /// watts. Never polled.
     func batteryTimeRemaining() -> BatteryTimeRemaining?
+    /// The thermal state read now, for an open popover's timer. Outside a
+    /// session nothing keeps `thermalState` current between openings.
+    func instantThermalState() -> ProcessInfo.ThermalState
     /// Relaunch the browser the user confirmed, as the menu item or the
     /// popover's button named it.
     func relaunchUnthrottled(_ browser: ThrottledBrowser)
@@ -44,6 +47,7 @@ protocol StatusSource: AnyObject, Observable {
 
 extension StatusSource {
     func batteryTimeRemaining() -> BatteryTimeRemaining? { nil }
+    func instantThermalState() -> ProcessInfo.ThermalState { thermalState }
 }
 
 /// Stand-in until the system layer is plugged in. Reports nothing.

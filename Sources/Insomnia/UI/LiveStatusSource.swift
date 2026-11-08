@@ -44,6 +44,10 @@ final class LiveStatusSource: StatusSource {
         PowerMonitor.readTimeRemaining()
     }
 
+    func instantThermalState() -> ProcessInfo.ThermalState {
+        ProcessInfo.processInfo.thermalState
+    }
+
     func relaunchUnthrottled(_ browser: ThrottledBrowser) {
         Task { @MainActor [services] in
             await services.relaunchUnthrottled(browser)

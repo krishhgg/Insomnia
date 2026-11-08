@@ -2192,6 +2192,44 @@ final class UIStatusTests: XCTestCase {
         XCTAssertNil(controller.popoverPowerTick)
     }
 
+    /// The thermal row follows the machine while the popover stays up: a
+    /// change the session's observer reports redraws it at once, and the
+    /// popover's timer reads the state again, since after a session ends
+    /// nothing else does. A hot session that ends with the popover open
+    /// must not leave "Thermal: critical" up after the Mac cools.
+    @MainActor
+    func testAnOpenPopoverFollowsTheThermalState() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = CountingStatusSource()
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        let view = controller.makePopoverView()
+        var thermalRows: [String] { view.items().map(\.title).filter { $0.hasPrefix("Thermal") } }
+        controller.openPopover()
+        XCTAssertEqual(thermalRows, [])
+
+        // The observer's change, with the timer's 10 s far off.
+        source.thermalState = .critical
+        for _ in 0..<200 where controller.model.popoverPower?.thermal != .critical {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(thermalRows, ["Thermal: critical"], "a reported change redraws the row")
+        controller.closePopover()
+
+        // No session keeps thermalState current: only a read now sees the
+        // Mac cool.
+        controller.popoverPowerInterval = 0.05
+        controller.openPopover()
+        XCTAssertEqual(thermalRows, ["Thermal: critical"])
+        source.systemThermal = .nominal
+        for _ in 0..<200 where controller.model.popoverPower?.thermal != .nominal {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(thermalRows, [], "the timer reads the state again")
+        controller.closePopover()
+    }
+
     /// A controller released with the popover up stops its power timer
     /// the next time it fires.
     @MainActor
@@ -2826,6 +2864,9 @@ final class CountingStatusSource: StatusSource {
     /// What the watts read reports, and how many times it was read.
     var watts: Double?
     @ObservationIgnored private(set) var powerReads = 0
+    /// What a read of the thermal state now reports; nil reads
+    /// `thermalState`, as the protocol's default does.
+    @ObservationIgnored var systemThermal: ProcessInfo.ThermalState?
 
     func refreshOnDemand() { onDemand += 1 }
     func refreshInstant() { instant += 1 }
@@ -2833,5 +2874,6 @@ final class CountingStatusSource: StatusSource {
         powerReads += 1
         return watts
     }
+    func instantThermalState() -> ProcessInfo.ThermalState { systemThermal ?? thermalState }
     func relaunchUnthrottled(_ browser: ThrottledBrowser) {}
 }
