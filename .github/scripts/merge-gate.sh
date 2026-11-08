@@ -230,7 +230,8 @@ count_lines() {
 # comment holds, and the rest are read from the first: the commit the code
 # review covers, its status and whether it found anything, then the commit
 # the security review covers and whether it left findings open ("none" for
-# a missing value). "none" if the bot has no summary, and "tie" if its
+# a value that is missing or can't be read, so a malformed state never stops
+# the read). "none" if the bot has no summary, and "tie" if its
 # newest summaries share a time but differ, since nothing then says which
 # came last.
 #
@@ -254,7 +255,7 @@ codex_bot_review() {
           }
         }
       }
-    }' --jq 'def v: if . == null then "none" else tostring end;
+    }' --jq 'def field(p): (try p catch null) | if . == null then "none" else tostring end;
       .data.repository.pullRequest.comments.nodes[]
       | select(.author.login == "'"$CODEX_BOT"'")
       | (.body // "") as $b
@@ -263,8 +264,9 @@ codex_bot_review() {
          (if .lastEditedAt == null then "-" else (.editor.login // "?") end),
          (if $b | startswith("<!-- codex-pull-request-review-summary -->") then "summary" else "other" end),
          ([$b | match("codex-review-state:"; "g")] | length),
-         ($s.code_review.commit_sha | v), ($s.code_review.status | v), ($s.code_review.has_any_findings | v),
-         ($s.security_review.commit_sha | v), ($s.security_review.has_unresolved_findings | v)]
+         ($s | field(.code_review.commit_sha)), ($s | field(.code_review.status)),
+         ($s | field(.code_review.has_any_findings)),
+         ($s | field(.security_review.commit_sha)), ($s | field(.security_review.has_unresolved_findings))]
       | map(tostring | gsub("[\t\r\n ]"; "_")) | @tsv') || return 1
   if [ -z "$rows" ]; then
     echo none

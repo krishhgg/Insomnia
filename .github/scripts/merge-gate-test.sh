@@ -610,6 +610,21 @@ test_removing_the_marker_from_the_newest_summary_fails() {
   gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
 }
 
+test_a_malformed_state_still_reaches_the_edit_check() {
+  # A state whose fields can't be read must not stop the read before the
+  # edit check, or the run would post nothing and leave an older success.
+  comments graphql-comments false \
+    "$(comment 09:00:00 10:00:00 chatgpt-codex-connector chatgpt-codex-connector "$(summary_body "$HEAD_SHA" true)")" \
+    "$(comment 09:30:00 11:00:00 chatgpt-codex-connector "$OWNER" '<!-- codex-review-state:v1 {"code_review":"invalid"} -->')"
+  run 0 evaluate 5
+  gate codex-bot failure "krishhgg made the newest edit to a Codex bot comment"
+  # In the bot's own summary, such a state waits.
+  comments graphql-comments false "$(comment 12:00:00 - chatgpt-codex-connector - '<!-- codex-pull-request-review-summary -->
+<!-- codex-review-state:v1 {"code_review":"invalid","security_review":7} -->')"
+  run 0 evaluate 5
+  gate codex-bot pending "names no reviewed commit"
+}
+
 test_an_edit_github_names_no_account_for_fails() {
   comments graphql-comments false \
     "$(comment 10:00:00 11:00:00 chatgpt-codex-connector - "$(summary_body "$HEAD_SHA" false)")"
