@@ -405,6 +405,37 @@ final class MenuClickEventTests: XCTestCase {
         }
     }
 
+    /// On macOS 27 a Control-click's events carry no flags, so Control
+    /// held at the press is all it has. The monitor took the menu gesture
+    /// only when Control was on the event, so the press reached SwiftUI
+    /// and its tap started the default length. The menu opens, no part of
+    /// the click reaches the window, and nothing starts, in Pills and
+    /// Compact. On macOS 26 Control is on the events, as it comes.
+    @MainActor
+    func testAControlClickWhoseEventsCarryNoFlagsOnlyOpensTheMenu() async {
+        for mode in [Config.MenuBarMode.pills, .compact] {
+            for os in [26, 27] {
+                let rig = await makeControllerRig(mode, osMajorVersion: os)
+                let label = "\(mode), macOS \(os)"
+                rig.counts.leftDown = true
+                rig.counts.held = .control
+                post(.leftMouseDown, modifiers: os >= 27 ? [] : .control, rig)
+                if os >= 27 { post(.leftMouseUp, rig) }
+                rig.counts.leftDown = false
+                if os < 27 { post(.leftMouseUp, modifiers: .control, rig) }
+                rig.counts.held = []
+                XCTAssertEqual(rig.counts.menus, 1, label)
+                XCTAssertEqual(rig.window.mouseEvents, [], "\(label): no part of a menu gesture reaches SwiftUI")
+                await settleQueuedRequests()
+                XCTAssertFalse(controlsOpen(mode, rig), label)
+                XCTAssertEqual(rig.controller.model.phase, .idle, label)
+                XCTAssertEqual(rig.h.backstop.arms, 0, label)
+                XCTAssertFalse(rig.manager.isActive, label)
+                rig.tearDown()
+            }
+        }
+    }
+
     /// On macOS 27 the keys held as a press is handled are all it has. A
     /// press handled late, after a stall, reads the keys of a later moment,
     /// when Option and the button can be up: the click opens the controls

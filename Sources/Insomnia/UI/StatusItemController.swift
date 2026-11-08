@@ -2461,7 +2461,9 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
             if event.type == .leftMouseUp || event.type == .rightMouseUp { menuGestureTakes = [] }
             return true
         }
-        guard isPress, event.type == .rightMouseDown || event.modifierFlags.contains(.control),
+        // On macOS 27 a press carries no keys, so Control held now counts,
+        // as it does for the tap's keys (`notePress`).
+        guard isPress, event.type == .rightMouseDown || event.modifierFlags.union(heldModifiers()).contains(.control),
               isOnThisView(event) else { return false }
         if event.type == .leftMouseDown {
             stopWatchingRelease()
