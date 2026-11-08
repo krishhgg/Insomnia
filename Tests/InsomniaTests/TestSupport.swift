@@ -999,6 +999,7 @@ struct Harness {
         display: (any DisplayDimming)? = nil,
         keyboard: (any KeyboardBacklighting)? = nil,
         sleepGuard: (any SleepGuarding)? = nil,
+        displayAssertions: (any DisplayAssertionHolding)? = nil,
         bootSession: String = SignalProcessControl.bootSession,
         clock customClock: (@Sendable () -> Date)? = nil
     ) -> SessionManager {
@@ -1014,6 +1015,7 @@ struct Harness {
             display: display ?? self.display,
             keyboard: keyboard ?? self.keyboard,
             appNap: appNap,
+            displayAssertions: displayAssertions ?? NoopDisplayAssertions(),
             notifier: notifier,
             clamshell: { lid.closed },
             closedLidSleep: lidSleep,

@@ -183,6 +183,28 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
 - Nothing else runs as root.
+- `disablesleep` stops system sleep only. The display still sleeps after
+  `displaysleep` minutes, and with Lock Screen set to require a password
+  immediately the screen locks then, which stops agents that drive the
+  screen. With "Keep the screen on and unlocked" on (`keepScreenAwake`,
+  default off), `SessionManager` holds a `PreventUserIdleDisplaySleep`
+  assertion (`ScreenAwake`, the one `caffeinate -d` holds) while a session
+  is active, and Settings applies the toggle to a running session. An end
+  request releases it before the recovery lock or the journal can refuse
+  the end, so a refused end never keeps the screen unlocked past the
+  deadline. A release macOS refuses keeps the hold and says so in the
+  menu; quitting Insomnia releases it. A hold or a timeout move macOS
+  refuses says so in the menu too, and turning the toggle off and on
+  tries again. A resume at launch that fails, or stops at a `sudo pmset`
+  still running, drops the session and any hold the toggle took
+  meanwhile, before the restore waits on a command. The
+  assertion also times out at the session's deadline (`TimeoutActionTurnOff`), and an extension moves the
+  timeout, so an app that hangs can't keep the screen unlocked past the
+  deadline while the backstop restores sleep. No
+  root, no journal entry: the assertion belongs to the process, so macOS
+  drops it when the app quits or crashes, and the backstop has nothing to
+  undo. The lock setting is never read or written. Lid close then darkens
+  without asking the display to sleep (section 4).
 
 ### 3. Lid observer
 
@@ -538,7 +560,9 @@ does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
 is best effort. It is made only when a display or keyboard brightness is
 journaled, because the wake that undoes it on open, or on reconcile after
-a relaunch, runs only for such an entry. Display brightness 0 does not
+a relaunch, runs only for such an entry. With "Keep the screen on and
+unlocked" on it is not made at all: a display that sleeps locks the screen,
+and Insomnia's own assertion would refuse it anyway. Display brightness 0 does not
 switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
@@ -1251,6 +1275,7 @@ older build is tightened when the app reads it:
   picker, with one line on what a click does with the switch on and off in
   the chosen style. With Minimal chosen the row is greyed out and its line
   says the switch does nothing there (section 11, One-click start).
+- keep the screen on and unlocked on/off (default off; section 2)
 - play a sound when you start or end a session (`sessionSounds`), default
   off, also for a config.json without the key. Off, Insomnia generates,
   loads and plays nothing. On, a start or an end asked for in the menu bar
@@ -1841,6 +1866,7 @@ Insomnia/
       LidSimulation.swift
       LocationPermission.swift
       NetworkFailover.swift
+      ScreenAwake.swift
       Notifier.swift
       PowerMonitor.swift
       ShellTimeout.swift

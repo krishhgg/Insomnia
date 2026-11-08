@@ -106,6 +106,9 @@ struct SettingsView: View {
         manager.updateConfig { config in _ = minimalDuration.apply(to: &config) }
     }
 
+    /// Under the keep-awake toggle.
+    static let keepScreenAwakeNote = "Off by default. When on, the display never turns off on its own during a session, so the screen saver never starts and the screen never locks, and agents that drive the screen keep working. With the lid closed the display goes to brightness 0 instead of sleeping. When the session ends, idle display sleep and the lock come back. Anyone who opens the Mac during the session finds it unlocked."
+
     /// Under the mute toggle and in the README. Apple Platform Security,
     /// "Hardware microphone disconnect".
     nonisolated static let microphoneNote =
@@ -293,6 +296,11 @@ struct SettingsView: View {
                 Text("Show the countdown in the menu bar")
                 Text("Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End session; click it to add time.")
             }
+            Toggle("Keep the screen on and unlocked", isOn: manager.binding(\.keepScreenAwake))
+                .onChange(of: manager.config.keepScreenAwake) { manager.syncScreenAwake() }
+            Text(Self.keepScreenAwakeNote)
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Toggle(isOn: manager.binding(\.sessionSounds)) {
                 Text("Play a sound when you start or end a session")
                 Text("Only for a start or an end you ask for in the menu bar, and not while the displays sleep or the lid is closed.")

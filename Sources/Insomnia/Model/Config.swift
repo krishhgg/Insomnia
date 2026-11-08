@@ -50,6 +50,11 @@ struct Config: Codable, Equatable, Sendable {
     var countdownStyle: CountdownStyle = .remaining
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
+    /// Hold the display awake for the whole session (`ScreenAwake`), so it
+    /// never idles off and the screen never locks while agents drive it.
+    /// Off by default (and for a config.json without the key): anyone who
+    /// opens the Mac during such a session finds it unlocked.
+    var keepScreenAwake: Bool = false
 
     // Lid-close actions
     /// Bundle ids to SIGSTOP while the lid is closed.
@@ -218,6 +223,7 @@ struct Config: Codable, Equatable, Sendable {
         // Same for a style this build does not know: back to the time left.
         countdownStyle = (try? c.decodeIfPresent(CountdownStyle.self, forKey: .countdownStyle)) ?? d.countdownStyle
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
+        keepScreenAwake = try c.decodeIfPresent(Bool.self, forKey: .keepScreenAwake) ?? d.keepScreenAwake
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
         freezeAllApps = try c.decodeIfPresent(Bool.self, forKey: .freezeAllApps) ?? d.freezeAllApps
         dockerRule = try c.decodeIfPresent(Bool.self, forKey: .dockerRule) ?? d.dockerRule
