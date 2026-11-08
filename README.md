@@ -113,6 +113,22 @@ file and explains how upgrades replace them.
    undone. Saved audio for an output that isn't connected doesn't hold it up.
    Insomnia restores that output if it reconnects while the app runs, or at
    the next launch.
+5. **From a script or an agent.** The app's binary drives the running app:
+
+   ```bash
+   INSOMNIA=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+   "$INSOMNIA" --session start 7200    # two hours
+   "$INSOMNIA" --session extend 1800
+   "$INSOMNIA" --session status
+   "$INSOMNIA" --session end
+   ```
+
+   It starts, extends and ends the same session the menu bar counts down,
+   with the same battery and heat rules, and prints one line. It changes
+   nothing itself, so when the app isn't running it says so and exits 1.
+   A build without this mode opens the menu bar app instead, so a script
+   that may meet one checks `InsomniaSessionCommandVersion` in the bundle's
+   `Info.plist` first.
 
 You don't have to close the lid, and opening it doesn't end the session.
 
