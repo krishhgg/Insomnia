@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import Insomnia
 
 /// An undo that went through but whose journal entry could not be cleared
