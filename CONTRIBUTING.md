@@ -139,6 +139,24 @@ work. The release build and the lid check run before the tests for that
 reason, and the Codex review looks for tests and sources that skip, weaken
 or tamper with checks.
 
+### Pictures for changes you can see
+
+A pull request that adds or changes anything a user sees, such as the menu
+bar item, its menu or popover, Settings, an alert, a notification or the
+app icon, needs pictures in its description, so the owner can tell what
+changes before deciding on `accepted`:
+
+- **Screenshots.** Before (main) and after (your head commit), cropped to
+  the part that changed. Show light and dark appearance if they differ.
+- **A video or GIF** for anything that moves or takes more than one step:
+  an animation, a click or hold, a flow from start to end. Record it with
+  Screenshot (Shift-Command-5) and drag the file into the description;
+  GitHub uploads it.
+
+Take them on your head commit, and replace them when a later push changes
+what they show. Keep personal details out of them: Wi-Fi names, your user
+name in paths, other apps' windows and notifications.
+
 ### Real-Mac evidence
 
 A pull request that changes anything outside `docs/`, `Tests/`, `.github/`,
