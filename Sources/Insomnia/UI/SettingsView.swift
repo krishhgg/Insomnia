@@ -247,6 +247,11 @@ struct SettingsView: View {
                 Text("Menu bar")
                 Text(Self.styleDescription(manager.config.menuBarMode))
             }
+            Toggle(isOn: manager.binding(\.oneClickStart)) {
+                Text("Start a session with one click")
+                Text(Self.oneClickDescription(manager.config.menuBarMode))
+            }
+            .disabled(manager.config.menuBarMode == .minimal)
             if manager.config.menuBarMode == .minimal {
                 // Every Minimal click adds this length, so any length can be
                 // typed, not only a preset.
@@ -284,6 +289,10 @@ struct SettingsView: View {
                 Text("Show the countdown in the menu bar")
                 Text("Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End session; click it to add time.")
             }
+            Toggle(isOn: manager.binding(\.sessionSounds)) {
+                Text("Play a sound when you start or end a session")
+                Text("Only for a start or an end you ask for in the menu bar, and not while the displays sleep or the lid is closed.")
+            }
             Toggle("Open at login", isOn: launchAtLogin)
             loginItemNote
             LabeledContent("Version") {
@@ -318,6 +327,21 @@ struct SettingsView: View {
         case .compact: "Only the eye. A click opens the pills in a panel."
         case .minimal: "A ring for the time left. Click adds, hold ends."
         case .popover: "The eye and its countdown. Any click opens a popover."
+        }
+    }
+
+    /// One line under the one-click switch on what a click does with it on
+    /// and off in the chosen style.
+    static func oneClickDescription(_ style: Config.MenuBarMode) -> String {
+        switch style {
+        case .pills:
+            "On: with no session running, a click starts the default length and Option-click opens the pills. Off: a click opens the pills."
+        case .compact:
+            "On: with no session running, a click starts the default length and Option-click opens the panel. Off: a click opens the panel."
+        case .popover:
+            "On: with no session running, a click starts the default length, and Option-click or right-click opens the popover. Off: a click opens the popover."
+        case .minimal:
+            "Minimal adds the default length on every click, so this switch does nothing in Minimal."
         }
     }
 

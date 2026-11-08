@@ -32,6 +32,12 @@ struct Config: Codable, Equatable, Sendable {
         }
     }
 
+    /// A click on the eye with no session starts the default length in
+    /// Pills, Compact and Popover, and Option-click opens the usual
+    /// controls. Minimal adds the default length on every click, so it
+    /// ignores this. Off by default, and for a config.json without the key.
+    var oneClickStart: Bool = false
+
     // Session
     /// Preset durations in seconds, the choices for the default session
     /// length in Settings.
@@ -111,6 +117,11 @@ struct Config: Codable, Equatable, Sendable {
     /// right-click menu, beside End session. On by default, and for a config.json
     /// without the key.
     var showMenuBarCountdown: Bool = true
+    /// A short sound when the user starts or ends a session from the menu
+    /// bar. Never for an end the user did not ask for, nor while the
+    /// displays sleep or the lid is closed. Off by default, and for a
+    /// config.json without the key.
+    var sessionSounds: Bool = false
     var launchAtLogin: Bool = false
     /// The install (code directory hash, bundle path and the executable's
     /// file identity: `LoginItem.install`) whose login item macOS last
@@ -194,6 +205,7 @@ struct Config: Codable, Equatable, Sendable {
             let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
             menuBarMode = try legacy.decodeIfPresent(Bool.self, forKey: .compactMode) == true ? .compact : .pills
         }
+        oneClickStart = try c.decodeIfPresent(Bool.self, forKey: .oneClickStart) ?? d.oneClickStart
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
         // A value this build does not know falls back to hours; it must not
@@ -222,6 +234,7 @@ struct Config: Codable, Equatable, Sendable {
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
         showMenuBarCountdown = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarCountdown) ?? d.showMenuBarCountdown
+        sessionSounds = try c.decodeIfPresent(Bool.self, forKey: .sessionSounds) ?? d.sessionSounds
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }

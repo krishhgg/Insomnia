@@ -444,6 +444,37 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
     }
 
+    /// One-click start is opt-in: a config.json without the key keeps it
+    /// off; an explicit true is honoured and round-trips.
+    func testOneClickStartDecodesAndDefaultsOff() throws {
+        XCTAssertFalse(Config().oneClickStart)
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"menuBarMode": "compact"}"#.utf8))
+        XCTAssertFalse(legacy.oneClickStart)
+        XCTAssertEqual(legacy.menuBarMode, .compact)
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"oneClickStart": true}"#.utf8))
+        XCTAssertTrue(on.oneClickStart)
+        var expected = earlierBuild()
+        expected.oneClickStart = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+    }
+
+    /// The start and end sounds are opt-in: a config.json without the key
+    /// keeps them off; an explicit true is honoured and round-trips.
+    func testSessionSoundsDecodeAndDefaultOff() throws {
+        XCTAssertFalse(Config().sessionSounds)
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"launchAtLogin": true}"#.utf8))
+        XCTAssertFalse(legacy.sessionSounds)
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"sessionSounds": true}"#.utf8))
+        XCTAssertTrue(on.sessionSounds)
+        var expected = earlierBuild()
+        expected.sessionSounds = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+    }
+
     /// Cheap typo guard for the shipped defaults: no duplicates, and every
     /// id looks like a reverse-DNS bundle id with a lowercase first label.
     func testDefaultListsAreUniqueReverseDNSIds() throws {

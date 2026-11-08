@@ -61,6 +61,7 @@ final class HoldToEndEventTests: XCTestCase {
         )
         let host = StatusItemController.makeHostingView(root)
         host.osMajorVersion = osMajorVersion
+        host.heldModifiers = { [] }
         let size = host.fittingSize
         host.frame = NSRect(origin: .zero, size: size)
         host.pointerInWindow = { _ in NSPoint(x: hardware.pointerX, y: size.height / 2) }
