@@ -567,7 +567,11 @@ from an earlier close. Ambient auto-off can read 0 with neither suppression
 nor dimming flagged, while manual off can set the suppression flag; neither
 is a reason to restore an older positive sample over it. For a positive
 current reading, the keyboard journals that reading if trusted now, else a
-positive last sample; without either, it is left alone. A saved zero from an
+positive last sample; without either, it is left alone. A value kept after
+a refused restore gives way only to a trusted reading above 0, as for the
+display: a 0 or a held-down reading leaves it journaled and undecided, and
+the last sample is no help, since none is taken while an entry is journaled.
+A saved zero from an
 older version is cleared without a keyboard write or reassertion, including
 when the private-call guard refuses; a failed clear stays owed for retry.
 This avoids committing automatic zero as a permanent off setting. It leaves

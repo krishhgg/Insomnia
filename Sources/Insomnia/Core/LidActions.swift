@@ -205,6 +205,8 @@ final class LidActions {
     /// closing lid. The entry is left undecided, as above, and the open
     /// does not take a 0 it reads as a level set since: only a reading
     /// above 0 decides that entry (`SessionManager.restoreDisplay`).
+    /// A keyboard value kept after a refused restore stays undecided unless
+    /// a trusted reading above 0 replaces it, as for the display.
     /// A keyboard already at 0 is left alone unless a positive restore is
     /// already owed. Both manual off and ambient auto-off can read 0, with
     /// different suppression flags; neither needs another explicit off.
@@ -283,11 +285,24 @@ final class LidActions {
 
         do {
             if let current = try keyboard.readBrightness() {
+                let state = manager.effectiveState
+                let trusted = current > 0 && (sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed())
                 let value: Float?
-                if current == 0 {
-                    let owed = manager.effectiveState.savedKeyboardBrightness
-                    value = owed.flatMap { $0 > 0 ? $0 : nil }
-                } else if sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed() {
+                var keptUndecided: Float?
+                if state.keyboardRestoreRefused, let kept = state.savedKeyboardBrightness, !trusted {
+                    // As for the display above: after a refused restore the
+                    // user was told to set the level by hand, and only a
+                    // trusted reading above 0 shows that level. A 0 under
+                    // the closing lid or a held-down reading shows none,
+                    // and the sampler took no keyboard reading while the
+                    // entry was journaled, so its sample is older than the
+                    // refusal. The entry stays undecided and the open reads
+                    // the level again.
+                    value = nil
+                    keptUndecided = kept
+                } else if current == 0 {
+                    value = state.savedKeyboardBrightness.flatMap { $0 > 0 ? $0 : nil }
+                } else if trusted {
                     value = current
                 } else if let sampled = sampler?.last?.keyboard, sampled > 0 {
                     value = sampled
@@ -309,6 +324,8 @@ final class LidActions {
                     } catch {
                         Log.error("keyboard backlight off failed: \(error.localizedDescription)")
                     }
+                } else if let kept = keptUndecided {
+                    Log.info("keyboard backlight reads \(current) at the close; the value kept after a refused restore, \(kept), stays journaled and undecided, and the backlight is left alone, so the open reads it again")
                 } else {
                     Log.info(current == 0
                         ? "keyboard backlight already reads zero; leaving its automatic or user-off state untouched"

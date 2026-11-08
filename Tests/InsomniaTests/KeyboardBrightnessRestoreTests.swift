@@ -163,6 +163,76 @@ final class KeyboardBrightnessRestoreTests: XCTestCase {
         await actions.onOpen()
         XCTAssertEqual(h.keyboard.sets, [0.8])
     }
+
+    /// A restore macOS refused leaves the old value kept and the user told
+    /// to set the level by hand. A close that reads 0, as a real lid close
+    /// does once macOS has turned the backlight off, shows no level, so the
+    /// kept value stays undecided and the open keeps the level set since.
+    func testARefusedRestoreStaysUndecidedAtAZeroClose() async throws {
+        try m.journal {
+            $0.savedKeyboardBrightness = 0.6
+            $0.keyboardRestoreRefused = true
+        }
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0.6)
+        XCTAssertTrue(closed.keyboardRestoreRefused)
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertTrue(logText().contains("keyboard backlight reads 0.0 at the close; the value kept after a refused restore, 0.6, stays journaled and undecided"), logText())
+
+        h.keyboard.suppressedOrDimmed = false
+        h.keyboard.brightness = 0.3
+        await actions.onOpen()
+
+        XCTAssertEqual(h.keyboard.sets, [], "the level set since is not overwritten")
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+    }
+
+    /// The sampler takes no keyboard reading while an entry is journaled,
+    /// so its last sample is older than the refusal and is not the level
+    /// the user set since.
+    func testARefusedRestoreIgnoresASampleOlderThanIt() async throws {
+        sampler.sample()
+        XCTAssertEqual(sampler.last?.keyboard, 0.5)
+        try m.journal {
+            $0.savedKeyboardBrightness = 0.6
+            $0.keyboardRestoreRefused = true
+        }
+        h.keyboard.brightness = 0.2
+        h.keyboard.suppressedOrDimmed = true
+
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0.6)
+        XCTAssertTrue(closed.keyboardRestoreRefused)
+        XCTAssertEqual(h.keyboard.sets, [])
+    }
+
+    /// A trusted reading above 0 is the level the user set, so it still
+    /// replaces the kept value.
+    func testATrustedReadingStillReplacesARefusedRestore() async throws {
+        try m.journal {
+            $0.savedKeyboardBrightness = 0.6
+            $0.keyboardRestoreRefused = true
+        }
+        h.keyboard.brightness = 0.3
+
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0.3)
+        XCTAssertFalse(closed.keyboardRestoreRefused)
+        XCTAssertEqual(h.keyboard.sets, [0])
+    }
+
+    private func logText() -> String {
+        (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
+    }
 }
 
 private struct UnavailableKeyboard: KeyboardBacklighting {
