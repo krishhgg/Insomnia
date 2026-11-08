@@ -37,8 +37,8 @@
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
 #       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
 #                              process the app froze. Entries that record
-#                              startedAtMicros are handed to the installed
-#                              app binary (INSOMNIA_BIN --resume-frozen
+#                              startedAtMicros are handed to the app
+#                              binary (INSOMNIA_BIN --resume-frozen
 #                              <seconds>) in one call with a time limit, one
 #                              line per entry on its standard input. For
 #                              each entry in turn it does one kernel lookup
@@ -183,14 +183,27 @@ MKTEMP=/usr/bin/mktemp
 # BSD stat: GNU coreutils stat, first on PATH in many Homebrew setups, reads
 # -f as --file-system, so `-f %i` and `-f %z` print no inode or size.
 STAT=/usr/bin/stat
-# The installed app binary, for the microsecond identity check of
-# frozenProcesses entries (see above), and the bundle's Info.plist, which
-# must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
-# binary is run: an older build has no such mode and would open the menu bar
-# app instead. Fixed paths like the tools, never PATH. install.sh puts the
+# The app binary, for the microsecond identity check of frozenProcesses
+# entries (see above), and the bundle's Info.plist, which must declare
+# InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the binary is
+# run: an older build has no such mode and would open the menu bar app
+# instead. Fixed paths like the tools, never PATH. install.sh puts the
 # bundle here, copying the binary before Info.plist.
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
+# The copy sealed in a bundle uses that bundle's binary and Info.plist
+# instead. Everything that runs that copy (the LaunchAgent, install.sh,
+# uninstall.sh) verifies the whole bundle first, and the app pins the bundle
+# it runs from, so a bundle moved out of ~/Applications resumes its entries
+# with its own sealed binary, not with another install's or with none. A
+# checkout's copy keeps the paths above.
+case "${BASH_SOURCE[0]}" in
+  /*.app/Contents/Resources/backstop.sh)
+    BUNDLED_APP="${BASH_SOURCE[0]%/Contents/Resources/backstop.sh}"
+    INSOMNIA_BIN="$BUNDLED_APP/Contents/MacOS/Insomnia"
+    INSOMNIA_INFO="$BUNDLED_APP/Contents/Info.plist"
+    ;;
+esac
 RESUME_FROZEN_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is

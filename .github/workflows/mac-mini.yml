@@ -6,8 +6,12 @@ name: Mac mini
 # Mac. docs/mac-mini-ci.md has the setup and what a job in the VM can reach.
 #
 # Not a required check. A job waits in the queue while the mini is off,
-# and GitHub cancels it after 24 hours. Runs for pull requests from outside
-# contributors start only once the owner approves them.
+# and GitHub cancels it after 24 hours.
+#
+# A pull request from a fork skips the job, so fork code reaches the mini
+# only through a branch in this repository, which the owner makes after
+# reading it. That alone is no fence: a fork's pull request can edit this
+# file. The fence is GitHub's approval of fork runs; see the doc.
 
 on:
   push:
@@ -27,6 +31,7 @@ concurrency:
 jobs:
   swift:
     name: Swift test (Mac mini, macOS 27 VM)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, insomnia-mini]
     timeout-minutes: 60
     steps:

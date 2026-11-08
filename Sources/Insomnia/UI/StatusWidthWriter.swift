@@ -8,9 +8,9 @@ import AppKit
 /// session end (measured; see the design spec, revision 4). Driving the
 /// length per frame therefore stalls the main thread on every frame, and
 /// no pacing or frame-rate request changes that. So the length is written
-/// exactly once per layout change, as Apple's own items do, and everything
-/// that moves does so inside the item's window: the content is laid out at
-/// its final width and its pills, countdown and mark animate in place.
+/// exactly once per layout change, as Apple's own items do. The Pills style's
+/// `StatusItemWidthMotion` keeps all travel inside that reservation and
+/// releases native space only when the return animation has settled.
 ///
 /// A repeat of the current width is not written again.
 @MainActor

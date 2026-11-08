@@ -6,6 +6,16 @@
 
 <!-- The tests you added or changed, and anything you ran by hand. -->
 
+## Screenshots
+
+<!--
+Needed if users can see the change (menu bar, menu, Settings, alerts,
+notifications, icon): before and after screenshots, plus a video or GIF
+for anything that moves or takes more than one step. CONTRIBUTING.md,
+"Pictures for changes you can see", has the details. Delete this section
+otherwise.
+-->
+
 ## Real-Mac evidence
 
 <!--

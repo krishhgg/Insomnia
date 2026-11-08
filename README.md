@@ -113,7 +113,34 @@ file and explains how upgrades replace them.
    undone. Saved audio for an output that isn't connected doesn't hold it up.
    Insomnia restores that output if it reconnects while the app runs, or at
    the next launch.
-5. **From a script or an agent.** The app's binary drives the running app:
+5. **Menu bar style.** The Menu bar picker in Settings > General has four
+   styles. Pills, the default, works as described above. Compact keeps only
+   the eye in the bar, and a click opens the same pills, countdown and end
+   ring in a small panel. Minimal is the eye with a ring for the time left:
+   a click adds the default session length, and a 0.6 s hold ends the
+   session. Popover shows the eye and, during a session, the time left to
+   the minute (or the end time). Any click on it, left or right, opens a
+   popover with time buttons, Custom fields for days, hours and minutes,
+   the status, Settings and Quit. While a session runs it also has the
+   ring you hold to end it. Popover style has no right-click menu, since
+   the popover shows the same things.
+6. **One click.** Turn on "Start a session with one click" in Settings >
+   General, under the Menu bar picker. Then, in Pills, Compact and Popover,
+   a click on the eye with no session running starts the default session
+   length. Option-click opens the usual controls to pick another length,
+   and in Popover a right-click or Control-click does too. A click during a
+   session works as it does with the switch off, and never ends the
+   session. If the start is refused, the pills, the panel or the popover
+   opens with the reason. Minimal already adds the default length on every
+   click, so Settings greys the switch out there. It is off by default.
+7. **Sounds.** "Play a sound when you start or end a session" in Settings >
+   General plays a short tone when you start or end a session from the
+   menu bar. It is off by default, and while it is off Insomnia makes no
+   sound and loads none. A session that ends without you asking (the
+   timer, the recovery agent, Quit, a battery or heat rule, recovery after
+   a crash) makes no sound. Nothing plays while the displays sleep or the
+   lid is closed, and `--session` commands make no sound.
+8. **From a script or an agent.** The app's binary drives the running app:
 
    ```bash
    INSOMNIA=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
@@ -235,10 +262,11 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
-[browser] unthrottled". It asks first, because relaunching quits the browser,
-and tabs come back only if the browser reopens them on startup. Some web apps
-may still stop with the lid closed.
+`--disable-renderer-backgrounding`, the right-click menu (the popover in
+Popover style) offers "Relaunch [browser] unthrottled". It asks first,
+because relaunching quits the browser, and tabs come back only if the
+browser reopens them on startup. Some web apps may still stop with the lid
+closed.
 [docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
 details.
 

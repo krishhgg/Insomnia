@@ -4,6 +4,40 @@ import Foundation
 /// Decoding tolerates missing keys so configs written by older builds load
 /// with defaults filled in.
 struct Config: Codable, Equatable, Sendable {
+    // Menu bar
+    /// The menu bar style. A style is one more case here, a row in the
+    /// Settings picker and a branch where the controller presents it.
+    enum MenuBarMode: String, Codable, CaseIterable, Sendable {
+        /// The inline duration pills and countdown beside the eye.
+        case pills
+        /// The eye alone; a click opens the same controls in a panel.
+        case compact
+        /// The eye with a ring for the time left; a click adds the
+        /// default session length and a hold ends the session.
+        case minimal
+        /// The eye and a short countdown; any click opens a popover with
+        /// the time buttons, the status and Settings.
+        case popover
+    }
+
+    var menuBarMode: MenuBarMode = .pills
+
+    /// Boolean access for Compact-only controls. Turning it off must not
+    /// replace another selected mode, such as Minimal.
+    var compactMode: Bool {
+        get { menuBarMode == .compact }
+        set {
+            if newValue { menuBarMode = .compact }
+            else if menuBarMode == .compact { menuBarMode = .pills }
+        }
+    }
+
+    /// A click on the eye with no session starts the default length in
+    /// Pills, Compact and Popover, and Option-click opens the usual
+    /// controls. Minimal adds the default length on every click, so it
+    /// ignores this. Off by default, and for a config.json without the key.
+    var oneClickStart: Bool = false
+
     // Session
     /// Preset durations in seconds, the choices for the default session
     /// length in Settings.
@@ -92,6 +126,11 @@ struct Config: Codable, Equatable, Sendable {
     /// right-click menu, beside End session. On by default, and for a config.json
     /// without the key.
     var showMenuBarCountdown: Bool = true
+    /// A short sound when the user starts or ends a session from the menu
+    /// bar. Never for an end the user did not ask for, nor while the
+    /// displays sleep or the lid is closed. Off by default, and for a
+    /// config.json without the key.
+    var sessionSounds: Bool = false
     var launchAtLogin: Bool = false
     /// The install (code directory hash, bundle path and the executable's
     /// file identity: `LoginItem.install`) whose login item macOS last
@@ -159,9 +198,23 @@ struct Config: Codable, Equatable, Sendable {
 
     init() {}
 
+    private enum LegacyCodingKeys: String, CodingKey {
+        case compactMode
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Config()
+        if c.contains(.menuBarMode) {
+            // A style this build does not know (one a newer build wrote, or
+            // the "standard" an early build of Compact wrote) reads as
+            // Pills; it must not cost the user the rest of the config.
+            menuBarMode = (try? c.decode(MenuBarMode.self, forKey: .menuBarMode)) ?? d.menuBarMode
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            menuBarMode = try legacy.decodeIfPresent(Bool.self, forKey: .compactMode) == true ? .compact : .pills
+        }
+        oneClickStart = try c.decodeIfPresent(Bool.self, forKey: .oneClickStart) ?? d.oneClickStart
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
         // A value this build does not know falls back to hours; it must not
@@ -192,6 +245,7 @@ struct Config: Codable, Equatable, Sendable {
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
         showMenuBarCountdown = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarCountdown) ?? d.showMenuBarCountdown
+        sessionSounds = try c.decodeIfPresent(Bool.self, forKey: .sessionSounds) ?? d.sessionSounds
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }

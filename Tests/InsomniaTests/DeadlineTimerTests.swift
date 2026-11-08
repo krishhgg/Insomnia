@@ -7,14 +7,25 @@ import XCTest
 /// reads the deadline. The session must still end.
 @MainActor
 final class DeadlineTimerTests: XCTestCase {
-    /// The real clock, optionally held 0.1 s short of a time until released.
+    /// The real clock, optionally held 0.1 s short of a deadline until
+    /// released. It counts the reads it answers held after the real time
+    /// has passed the deadline.
     private final class HeldClock: @unchecked Sendable {
         private let lock = NSLock()
-        private var heldAt: Date?
+        private var deadline: Date?
+        private var lateReads = 0
 
-        func hold(at date: Date) { lock.withLock { heldAt = date } }
-        func release() { lock.withLock { heldAt = nil } }
-        func now() -> Date { lock.withLock { min(Date(), heldAt ?? .distantFuture) } }
+        func hold(shortOf deadline: Date) { lock.withLock { self.deadline = deadline } }
+        func release() { lock.withLock { deadline = nil } }
+        var heldReadsPastTheDeadline: Int { lock.withLock { lateReads } }
+        func now() -> Date {
+            lock.withLock {
+                let real = Date()
+                guard let deadline else { return real }
+                if real >= deadline { lateReads += 1 }
+                return min(real, deadline.addingTimeInterval(-0.1))
+            }
+        }
     }
 
     private func waitUntil(_ timeout: TimeInterval, _ condition: @MainActor () -> Bool) async -> Bool {
@@ -27,18 +38,24 @@ final class DeadlineTimerTests: XCTestCase {
     }
 
     /// A live session loaded the way a launch loads it. With `held`, the
-    /// clock stays 0.1 s short of the deadline until the timer has fired
-    /// (its tolerance is 1 s), so the first fire always finds time left and
-    /// only a retry can end the session.
+    /// clock stays 0.1 s short of the deadline until the timer has fired and
+    /// tried again, so the first fire always finds time left and only a
+    /// retry can end the session. The held case launches with the lid
+    /// closed, so the 1 Hz countdown never starts and only the deadline
+    /// timer reads the clock after the reconcile.
     ///
     /// session.json keeps whole seconds, so the deadline is the next whole
-    /// second at least half a second away.
+    /// second at least half a second away. Both cases hold the clock while
+    /// the launch loads the session, so a runner slow enough to reach the
+    /// deadline first cannot make the launch find it expired. The plain
+    /// case lets go as soon as the reconcile returns.
     private func assertTheSessionEnds(held: Bool) async throws {
         let h = Harness()
         defer { h.home.destroy() }
         let endsAt = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 1.5).rounded(.down))
         let clock = HeldClock()
-        if held { clock.hold(at: endsAt.addingTimeInterval(-0.1)) }
+        clock.hold(shortOf: endsAt)
+        if held { h.clamshell.closed = true }
         try h.store.saveSession(Session(startedAt: endsAt.addingTimeInterval(-60), endsAt: endsAt))
         var journal = RuntimeState()
         journal.sleepDisabledByUs = true
@@ -48,10 +65,19 @@ final class DeadlineTimerTests: XCTestCase {
         let m = h.makeManager(clock: { clock.now() })
         await m.reconcile()
         XCTAssertTrue(m.isActive, "the session is live before its deadline (held: \(held))")
+        if !held { clock.release() }
 
         if held {
-            _ = await waitUntil(endsAt.timeIntervalSinceNow + 1.3) { false }
-            XCTAssertTrue(m.isActive, "the timer fired and found time left, so the session goes on")
+            // Two held reads past the deadline after the reconcile are a
+            // fire and a retry, which the timer makes only after it ran and
+            // found time left. Counting from here leaves out the reconcile's
+            // own reads if a slow setup reached the deadline. Waiting for
+            // them, not for a fixed time, keeps a late first fire on a busy
+            // runner from ending the session after the release.
+            let before = clock.heldReadsPastTheDeadline
+            let retried = await waitUntil(max(endsAt.timeIntervalSinceNow, 0) + 10) { clock.heldReadsPastTheDeadline >= before + 2 }
+            XCTAssertTrue(retried, "the timer ran while the clock was behind it and tried again")
+            XCTAssertTrue(m.isActive, "the timer found time left, so the session goes on")
             clock.release()
         }
 
