@@ -1,12 +1,14 @@
 import SwiftUI
 
-/// Press-and-hold "end session" control that sits to the right of the
-/// countdown in the status item.
+/// Press-and-hold "end session" control, shown while a session runs: to
+/// the right of the countdown in the status item in Pills style, and in
+/// the menu bar popover in Popover style.
 ///
 /// A ring draws around the glyph for `Motion.holdDuration` while the mouse
 /// is down; only a completed ring ends the session. Releasing early, or
 /// dragging away, springs the ring back with no action, so a stray click
-/// while reaching for the menu bar clock cannot kill a session.
+/// while reaching for the menu bar clock, or on the way to another popover
+/// control, cannot kill a session.
 struct HoldToEndButton: View {
     let reduceMotion: Bool
     var foreground: Color = .primary
@@ -14,6 +16,10 @@ struct HoldToEndButton: View {
     /// Native menu bar windows need AppKit to deliver the physical press.
     /// The original inline control keeps its existing SwiftUI gesture.
     var usesNativePointer = false
+    /// A soft fill behind the ring under the pointer, like every other
+    /// popover button's hover, shown at once. Only the popover turns it on;
+    /// the rings in Pills and in the Compact panel have no hover fill.
+    var hoverFill = false
     let action: () -> Void
     /// Whether the button is physically down. Checked when the ring closes,
     /// so a release just before the deadline cannot still end the session.
@@ -31,6 +37,8 @@ struct HoldToEndButton: View {
     @State private var holdTask: Task<Void, Never>?
     /// Where the pointer was when the hold began.
     @State private var startPointer: CGPoint = .zero
+    /// The pointer is over the ring. Read only with `hoverFill`.
+    @State private var hovering = false
 
     private let ringDiameter: CGFloat = 18
     private let lineWidth: CGFloat = 1.6
@@ -40,6 +48,8 @@ struct HoldToEndButton: View {
 
     var body: some View {
         ZStack {
+            Circle()
+                .fill(Color.primary.opacity(hoverFill && hovering ? DesignTokens.Hover.fill : 0))
             // The label colour, like the eye mark: the menu bar is light or
             // dark with the wallpaper, so a fixed white ring vanishes on a
             // light bar and a pale brand tint has no contrast there either.
@@ -58,6 +68,7 @@ struct HoldToEndButton: View {
         .animation(Motion.snappy(reduceMotion: reduceMotion), value: holding)
         .frame(width: 20, height: 20)
         .contentShape(Rectangle())
+        .onHover { if hoverFill { hovering = $0 } }
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in

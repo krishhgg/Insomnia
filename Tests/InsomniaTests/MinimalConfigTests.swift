@@ -13,7 +13,7 @@ final class MinimalConfigTests: XCTestCase {
     /// "standard" the first Compact builds wrote, reads as Pills and keeps
     /// the rest of the file.
     func testAnUnknownStyleReadsAsPillsAndKeepsTheRestOfTheConfig() throws {
-        for value in ["\"standard\"", "\"popover\"", "\"\"", "7"] {
+        for value in ["\"standard\"", "\"menu\"", "\"\"", "7"] {
             let json = "{\"menuBarMode\": \(value), \"compactMode\": true, \"defaultPreset\": 900, \"hotspotSSID\": \"iPhone\"}"
             let config = try Store.makeDecoder().decode(Config.self, from: Data(json.utf8))
             XCTAssertEqual(config.menuBarMode, .pills, value)
@@ -26,6 +26,16 @@ final class MinimalConfigTests: XCTestCase {
         XCTAssertEqual(Config.MenuBarMode.pills.rawValue, "pills")
         let config = try Store.makeDecoder().decode(Config.self, from: Data("{\"menuBarMode\": \"pills\"}".utf8))
         XCTAssertEqual(config.menuBarMode, .pills)
+    }
+
+    func testThePopoverStyleIsStoredAsPopover() throws {
+        XCTAssertEqual(Config.MenuBarMode.popover.rawValue, "popover")
+        let json = "{\"menuBarMode\": \"popover\", \"defaultPreset\": 900, \"hotspotSSID\": \"iPhone\"}"
+        let config = try Store.makeDecoder().decode(Config.self, from: Data(json.utf8))
+        XCTAssertEqual(config.menuBarMode, .popover)
+        XCTAssertFalse(config.compactMode)
+        XCTAssertEqual(config.defaultPreset, 900)
+        XCTAssertEqual(config.hotspotSSID, "iPhone")
     }
 
     func testLegacyCompactChoiceMigratesWithoutChangingSessionSettings() throws {

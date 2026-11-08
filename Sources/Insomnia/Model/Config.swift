@@ -15,6 +15,9 @@ struct Config: Codable, Equatable, Sendable {
         /// The eye with a ring for the time left; a click adds the
         /// default session length and a hold ends the session.
         case minimal
+        /// The eye and a short countdown; any click opens a popover with
+        /// the time buttons, the status and Settings.
+        case popover
     }
 
     var menuBarMode: MenuBarMode = .pills

@@ -109,7 +109,7 @@ struct CompactMenuView: View {
         reduceMotion ? nil : .easeInOut(duration: Motion.collapseDuration)
     }
     private var countdown: String {
-        if model.isEnding { return "Ending\u{2026}" }
+        if model.isEnding { return MenuBarModel.endingText }
         return StatusRootView.countdownText(pending: menuBar.pendingCountdown, live: manager.countdownText, phase: menuBar.phase)
     }
     /// Recovery can fail after the submission finishes. Read its current

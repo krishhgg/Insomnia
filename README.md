@@ -113,7 +113,18 @@ file and explains how upgrades replace them.
    undone. Saved audio for an output that isn't connected doesn't hold it up.
    Insomnia restores that output if it reconnects while the app runs, or at
    the next launch.
-5. **From a script or an agent.** The app's binary drives the running app:
+5. **Menu bar style.** The Menu bar picker in Settings > General has four
+   styles. Pills, the default, works as described above. Compact keeps only
+   the eye in the bar, and a click opens the same pills, countdown and end
+   ring in a small panel. Minimal is the eye with a ring for the time left:
+   a click adds the default session length, and a 0.6 s hold ends the
+   session. Popover shows the eye and, during a session, the time left to
+   the minute (or the end time). Any click on it, left or right, opens a
+   popover with time buttons, Custom fields for days, hours and minutes,
+   the status, Settings and Quit. While a session runs it also has the
+   ring you hold to end it. Popover style has no right-click menu, since
+   the popover shows the same things.
+6. **From a script or an agent.** The app's binary drives the running app:
 
    ```bash
    INSOMNIA=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
@@ -226,10 +237,11 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
-[browser] unthrottled". It asks first, because relaunching quits the browser,
-and tabs come back only if the browser reopens them on startup. Some web apps
-may still stop with the lid closed.
+`--disable-renderer-backgrounding`, the right-click menu (the popover in
+Popover style) offers "Relaunch [browser] unthrottled". It asks first,
+because relaunching quits the browser, and tabs come back only if the
+browser reopens them on startup. Some web apps may still stop with the lid
+closed.
 [docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
 details.
 
