@@ -436,6 +436,42 @@ final class MenuClickEventTests: XCTestCase {
         }
     }
 
+    /// The keys held are read once for a press: Control held as the host
+    /// keeps the press's keys and up a moment later still makes the click
+    /// the menu's. Read again for the menu, Control was gone, the press
+    /// went on to SwiftUI with Control kept for its tap, and the tap started
+    /// the default length. Here the host's reader returns Control on its
+    /// first call only. The menu opens, nothing reaches the window, and
+    /// nothing starts, in Pills and Compact.
+    @MainActor
+    func testControlComingUpAsThePressIsHandledStillOpensTheMenu() async {
+        final class Reads { var count = 0 }
+        for mode in [Config.MenuBarMode.pills, .compact] {
+            for os in [26, 27] {
+                let rig = await makeControllerRig(mode, osMajorVersion: os)
+                let label = "\(mode), macOS \(os)"
+                let reads = Reads()
+                rig.host.heldModifiers = {
+                    reads.count += 1
+                    return reads.count == 1 ? .control : []
+                }
+                rig.counts.leftDown = true
+                post(.leftMouseDown, modifiers: os >= 27 ? [] : .control, rig)
+                if os >= 27 { post(.leftMouseUp, rig) }
+                rig.counts.leftDown = false
+                if os < 27 { post(.leftMouseUp, modifiers: .control, rig) }
+                XCTAssertEqual(rig.counts.menus, 1, label)
+                XCTAssertEqual(rig.window.mouseEvents, [], "\(label): no part of a menu gesture reaches SwiftUI")
+                await settleQueuedRequests()
+                XCTAssertFalse(controlsOpen(mode, rig), label)
+                XCTAssertEqual(rig.controller.model.phase, .idle, label)
+                XCTAssertEqual(rig.h.backstop.arms, 0, label)
+                XCTAssertFalse(rig.manager.isActive, label)
+                rig.tearDown()
+            }
+        }
+    }
+
     /// On macOS 27 the keys held as a press is handled are all it has. A
     /// press handled late, after a stall, reads the keys of a later moment,
     /// when Option and the button can be up: the click opens the controls

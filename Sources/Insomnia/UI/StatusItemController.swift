@@ -852,12 +852,14 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
 
     /// Whether a click starts the default length (Settings, "Start a
     /// session with one click"). Only with the switch on, outside Minimal
-    /// (whose click always adds the default length), without Option, and
-    /// with no session running, starting or ending. Any other click does
-    /// what it does with the switch off; none of them ends a session.
+    /// (whose click always adds the default length), without Option or
+    /// Control, and with no session running, starting or ending. A
+    /// Control-click is the menu's (`takesMenuGesture`); if one reaches the
+    /// tap anyway, it starts nothing. Any other click does what it does
+    /// with the switch off; none of them ends a session.
     private func clickStartsASession(_ modifiers: NSEvent.ModifierFlags) -> Bool {
         manager.config.oneClickStart && manager.config.menuBarMode != .minimal
-            && !modifiers.contains(.option)
+            && !modifiers.contains(.option) && !modifiers.contains(.control)
             && !manager.isActive && model.phase == .idle
             && !sessionEndPending && !model.endUnderway(manager) && !compactModel.isBusy
     }
@@ -2461,9 +2463,13 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
             if event.type == .leftMouseUp || event.type == .rightMouseUp { menuGestureTakes = [] }
             return true
         }
-        // On macOS 27 a press carries no keys, so Control held now counts,
-        // as it does for the tap's keys (`notePress`).
-        guard isPress, event.type == .rightMouseDown || event.modifierFlags.union(heldModifiers()).contains(.control),
+        // On macOS 27 a press carries no keys, so the keys `notePress` just
+        // kept for a left press on this view count: the event's flags and
+        // the keys held as it was handled. One reading serves the menu and
+        // the tap, so Control coming up in between cannot send the press on
+        // to SwiftUI with Control kept for its tap.
+        let keys = event.type == .leftMouseDown ? pressKeys ?? event.modifierFlags : event.modifierFlags
+        guard isPress, event.type == .rightMouseDown || keys.contains(.control),
               isOnThisView(event) else { return false }
         if event.type == .leftMouseDown {
             stopWatchingRelease()
