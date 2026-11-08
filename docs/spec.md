@@ -389,9 +389,12 @@ so the agent is armed for it, or the app keeps it while the flag is still
 owed. A write whose clear is owed is done all the same: the second write
 2 s later still goes out, and a display written under Insomnia's Low Power
 Mode still owes its write after the mode, as the clear would have
-journaled. A lid close that can read the device clears the flag too: it
-keeps the earlier saved value while the device reads 0, and saves the new
-level when it reads above 0. For the display that level must be trusted:
+journaled. A lid close that can read the display clears the flag too: it
+keeps the earlier saved value while the display reads 0, and saves the new
+level when it reads above 0. For the keyboard only a trusted current
+reading above 0 does that, and it becomes the saved value; a 0, a
+held-down reading or the last sample leaves the entry flagged and the
+backlight as it is. For the display that level must be trusted:
 the last sample, the value owed after the mode, or a current read taken
 with the panel awake and Insomnia's Low Power Mode not on at any point in
 the run, nor over the entry since the Mac last started. Without one, the close leaves the entry flagged and the panel as
