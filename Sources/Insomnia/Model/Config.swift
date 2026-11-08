@@ -4,13 +4,44 @@ import Foundation
 /// Decoding tolerates missing keys so configs written by older builds load
 /// with defaults filled in.
 struct Config: Codable, Equatable, Sendable {
+    // Menu bar
+    /// The menu bar style. A style is one more case here, a row in the
+    /// Settings picker and a branch where the controller presents it.
+    enum MenuBarMode: String, Codable, CaseIterable, Sendable {
+        /// The inline duration pills and countdown beside the eye.
+        case pills
+        /// The eye alone; a click opens the same controls in a panel.
+        case compact
+        /// The eye with a ring for the time left; a click adds the
+        /// default session length and a hold ends the session.
+        case minimal
+        /// The eye and a short countdown; any click opens a popover with
+        /// the time buttons, the status and Settings.
+        case popover
+    }
+
+    var menuBarMode: MenuBarMode = .pills
+
+    /// Boolean access for Compact-only controls. Turning it off must not
+    /// replace another selected mode, such as Minimal.
+    var compactMode: Bool {
+        get { menuBarMode == .compact }
+        set {
+            if newValue { menuBarMode = .compact }
+            else if menuBarMode == .compact { menuBarMode = .pills }
+        }
+    }
+
     // Session
-    /// Preset durations in seconds, shown as chips.
+    /// Preset durations in seconds, the choices for the default session
+    /// length in Settings.
     var presets: [TimeInterval] = Config.defaultPresets
     var defaultPreset: TimeInterval = 4 * 3600
     /// The pill that is focused when the pills open, for a start and for an
     /// extend.
     var defaultFocusField: DurationInput.Field = .hours
+    /// What the menu bar countdown reads during a session.
+    var countdownStyle: CountdownStyle = .remaining
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
     /// Hold the display awake for the whole session (`ScreenAwake`), so it
@@ -79,6 +110,12 @@ struct Config: Codable, Equatable, Sendable {
     var tmuxNudgePressesEnter: Bool = false
 
     // App
+    /// Show the live countdown and the hold-to-end ring next to the eye
+    /// while a session runs. Off: the eye alone says whether a session is
+    /// running (open) or not (closed), and the time left moves to the
+    /// right-click menu, beside End session. On by default, and for a config.json
+    /// without the key.
+    var showMenuBarCountdown: Bool = true
     var launchAtLogin: Bool = false
     /// The install (code directory hash, bundle path and the executable's
     /// file identity: `LoginItem.install`) whose login item macOS last
@@ -146,14 +183,29 @@ struct Config: Codable, Equatable, Sendable {
 
     init() {}
 
+    private enum LegacyCodingKeys: String, CodingKey {
+        case compactMode
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Config()
+        if c.contains(.menuBarMode) {
+            // A style this build does not know (one a newer build wrote, or
+            // the "standard" an early build of Compact wrote) reads as
+            // Pills; it must not cost the user the rest of the config.
+            menuBarMode = (try? c.decode(MenuBarMode.self, forKey: .menuBarMode)) ?? d.menuBarMode
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            menuBarMode = try legacy.decodeIfPresent(Bool.self, forKey: .compactMode) == true ? .compact : .pills
+        }
         presets = try c.decodeIfPresent([TimeInterval].self, forKey: .presets) ?? d.presets
         defaultPreset = try c.decodeIfPresent(TimeInterval.self, forKey: .defaultPreset) ?? d.defaultPreset
         // A value this build does not know falls back to hours; it must not
         // cost the user the rest of the config.
         defaultFocusField = (try? c.decodeIfPresent(DurationInput.Field.self, forKey: .defaultFocusField)) ?? d.defaultFocusField
+        // Same for a style this build does not know: back to the time left.
+        countdownStyle = (try? c.decodeIfPresent(CountdownStyle.self, forKey: .countdownStyle)) ?? d.countdownStyle
         maxDuration = try c.decodeIfPresent(TimeInterval.self, forKey: .maxDuration) ?? d.maxDuration
         keepScreenAwake = try c.decodeIfPresent(Bool.self, forKey: .keepScreenAwake) ?? d.keepScreenAwake
         freezeList = try c.decodeIfPresent([String].self, forKey: .freezeList) ?? d.freezeList
@@ -175,9 +227,18 @@ struct Config: Codable, Equatable, Sendable {
         nudgeThreshold = try c.decodeIfPresent(TimeInterval.self, forKey: .nudgeThreshold) ?? d.nudgeThreshold
         tmuxTargets = try c.decodeIfPresent([String].self, forKey: .tmuxTargets) ?? d.tmuxTargets
         tmuxNudgePressesEnter = try c.decodeIfPresent(Bool.self, forKey: .tmuxNudgePressesEnter) ?? d.tmuxNudgePressesEnter
+        showMenuBarCountdown = try c.decodeIfPresent(Bool.self, forKey: .showMenuBarCountdown) ?? d.showMenuBarCountdown
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         launchAtLoginInstall = try c.decodeIfPresent(String.self, forKey: .launchAtLoginInstall)
     }
+}
+
+/// How the menu bar countdown reads during a session.
+enum CountdownStyle: String, Codable, CaseIterable, Sendable {
+    case remaining
+    /// The clock time the session ends at. It changes only when the session
+    /// does, so nothing redraws the status item in between.
+    case endTime
 }
 
 // MARK: Lid-close update
@@ -209,25 +270,32 @@ struct LidCloseDefaultsChange: Codable, Equatable, Sendable {
 
     static let title = "Lid-close settings changed"
 
-    /// The changes as one clause, for example: "Mute audio on lid close"
-    /// is now on.
+    /// The changes as one clause, for example: "Mute audio" is now on.
     var changes: String {
         var parts: [String] = []
-        if turnedOffFreezeAll { parts.append("\"Freeze every other app while the lid is closed\" is now off") }
-        if turnedOnMute { parts.append("\"Mute audio on lid close\" is now on") }
+        if turnedOffFreezeAll { parts.append("\"All other apps\" now keep running when the lid closes") }
+        if turnedOnMute { parts.append("\"Mute audio\" is now on") }
         return parts.joined(separator: " and ")
     }
 
     private var both: Bool { turnedOffFreezeAll && turnedOnMute }
 
+    /// Where each change lives in Settings: Mute audio sits under the line,
+    /// All other apps in the Edit Apps sheet.
+    private var places: String {
+        var parts: [String] = []
+        if turnedOnMute { parts.append("Mute audio is under When the lid closes") }
+        if turnedOffFreezeAll { parts.append("All other apps is behind the Edit Apps\u{2026} button") }
+        return parts.joined(separator: ", and ") + "."
+    }
+
     var notificationBody: String {
         "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
-            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon and look under Lid-close actions."
+            + "To change \(both ? "them" : "it") back, choose Settings\u{2026} from the Insomnia menu bar icon. \(places)"
     }
 
     var settingsLine: String {
-        "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). "
-            + "\(both ? "Both toggles are" : "The toggle is") below."
+        "This update changed \(both ? "two lid-close settings" : "a lid-close setting"): \(changes). \(places)"
     }
 }
 
@@ -277,5 +345,67 @@ extension Config {
         }
         guard (lowPowerFloor, endFloor) != before else { return nil }
         return "battery floors corrected: lowPowerFloor \(before.0) -> \(lowPowerFloor), endFloor \(before.1) -> \(endFloor)"
+    }
+
+    /// The levels Settings offers for a floor: 0 (never) and every step up
+    /// to `max`, plus `current` when a hand-edited config.json holds a
+    /// level between steps, so the menu still shows it.
+    static func floorChoices(through max: Int, keeping current: Int) -> [Int] {
+        Set(Array(stride(from: 0, through: max, by: floorStep)) + [current]).sorted()
+    }
+}
+
+// MARK: App rules
+
+/// What Settings does with an app it lists: agent apps keep running (never
+/// frozen or throttled), the others freeze while the lid is closed.
+enum AppRule: Equatable, Sendable {
+    case keepRunning
+    case freeze
+}
+
+extension Config {
+    /// Every app either list names, once, agent apps first.
+    var listedApps: [String] {
+        var seen = Set<String>()
+        return (agentList + freezeList).filter { seen.insert($0).inserted }
+    }
+
+    /// The listed apps with `rule`, once each, as Edit Apps shows them. The
+    /// summaries in Settings name these, so an app on both lists appears
+    /// only under Keep running.
+    func apps(with rule: AppRule) -> [String] {
+        listedApps.filter { self.rule(for: $0) == rule }
+    }
+
+    /// The rule Settings shows for `id`, or nil when neither list names it:
+    /// what the freeze planner does with it. An id on both lists keeps
+    /// running, and so does one the planner never freezes from the list
+    /// (`FreezePlanner.isDenied`: Apple apps, Insomnia, Docker Desktop),
+    /// which an older config.json can have on the freeze list alone.
+    func rule(for id: String) -> AppRule? {
+        guard agentList.contains(id) || freezeList.contains(id) else { return nil }
+        return FreezePlanner.isDenied(id, config: self) ? .keepRunning : .freeze
+    }
+
+    /// Puts `id` on the list for `rule`, and off the other one; nil takes it
+    /// off both. Settings shows one row per app, so an app is never on the
+    /// list the user didn't pick. An app already on the list for `rule`
+    /// keeps its place there, and still comes off the other list, where an
+    /// older config.json can also have it.
+    mutating func setRule(_ rule: AppRule?, for id: String) {
+        if rule != .keepRunning { agentList.removeAll { $0 == id } }
+        if rule != .freeze { freezeList.removeAll { $0 == id } }
+        if rule == .keepRunning, !agentList.contains(id) { agentList.append(id) }
+        if rule == .freeze, !freezeList.contains(id) { freezeList.append(id) }
+    }
+
+    /// Edit Apps adds `id` as Keep running, so adding an app never freezes
+    /// it by surprise; an app either list names already keeps its rule.
+    /// Apple apps are added too: the agent list is also the App Nap list
+    /// (`disableAppNapForAgents`), and Terminal, on it by default, has to
+    /// be able to come back after a Remove.
+    mutating func addApp(_ id: String) {
+        if rule(for: id) == nil { setRule(.keepRunning, for: id) }
     }
 }

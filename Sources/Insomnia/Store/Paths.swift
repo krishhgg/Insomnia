@@ -88,6 +88,24 @@ struct Paths: Sendable, Equatable {
     /// Written by scripts/simulate-lid.sh ("closed" or "open") to drive the
     /// lid-close action path without touching the hinge. See LidSimulation.
     var simulateLidFile: URL { appSupport.appendingPathComponent("simulate-lid") }
+    /// `Insomnia --session` writes each request to its own file, named by
+    /// the command line's id, for the running app (`SessionCommandWatcher`),
+    /// and the app answers next to it.
+    func sessionCommandRequest(_ id: String) -> URL {
+        appSupport.appendingPathComponent("session-command.\(id).request")
+    }
+    func sessionCommandReply(_ id: String) -> URL {
+        appSupport.appendingPathComponent("session-command.\(id).reply")
+    }
+    /// The id in a request or answer file name; nil for any other name.
+    static func sessionCommandRequestID(_ name: String) -> String? { sessionCommandID(name, suffix: ".request") }
+    static func sessionCommandReplyID(_ name: String) -> String? { sessionCommandID(name, suffix: ".reply") }
+    private static func sessionCommandID(_ name: String, suffix: String) -> String? {
+        let prefix = "session-command."
+        guard name.hasPrefix(prefix), name.hasSuffix(suffix), name.count > prefix.count + suffix.count else { return nil }
+        let id = String(name.dropFirst(prefix.count).dropLast(suffix.count))
+        return SessionCommand.isRequestID(id) ? id : nil
+    }
 
     /// Both logs are owner-only and rotate to `<name>.1` past
     /// `OwnerOnly.maxLogBytes`; uninstall.sh --purge removes the `.1` too.

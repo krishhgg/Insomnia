@@ -268,6 +268,62 @@ with `scripts/install.sh`. Comet 154.0.8037.179, Google Chrome 154.0.8037.98.
   freeze list (FreezerTests covers the protected list), and page timers in
   Comet with the lid closed.
 
+## October 12, 2026 Settings window (MacBook Pro, Apple M2 Max)
+
+Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0 (26A428).
+Build: `main` `db9085e` with the Settings change, built with Xcode 27.1
+(Swift 6.4) by `swift build -c release` and run unbundled with a throwaway
+`INSOMNIA_HOME`. Nothing was installed and no session was started.
+
+- Settings… from the menu bar icon opened a 490 × 896 pt window with every
+  setting on one page and no scrolling, in light and dark appearance, with
+  minimize and zoom dimmed.
+- Edit Apps listed the 13 listed apps installed on this Mac, each with its
+  icon. Terminal and Docker Desktop showed Keep running and could not be
+  changed. Setting Slack to Keep running and Cursor to Freeze when lid closes
+  moved `com.tinyspeck.slackmacgap` to `agentList` and
+  `com.todesktop.230313mzl4w4u92` to `freezeList` in config.json.
+- The hotspot name field offered a network this Mac had joined, and a name
+  typed with a curly apostrophe was saved as typed (U+2019) in config.json.
+- After review, the window became resizable with a fixed width, so AppKit
+  fits it to a shorter screen. With the default config it opened at
+  490 × 897 pt, and with the two-change lid-close notice at 490 × 983 pt, the
+  notice wrapped. A scratch copy with 14 extra rows opened 1084 pt tall, the
+  screen's whole visible height, and its form scrolled to Open at login.
+- An app bundle built in the workspace and never opened was not found by its
+  bundle ID. After `RunningApps.bundleID(ofAppAt:)`, which Choose… calls, it
+  was, under its own name. The open panel itself was not driven.
+- Not exercised: a lid close after a rule change, Choose… through the open
+  panel, the Allow… button in a bundled build, and VoiceOver.
+
+## October 18, 2026 Settings review fixes (MacBook Pro, Apple M2 Max)
+
+Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0.1 (26A434).
+Build: `settings-hig` at `544b7c9` (with `main` `ad96f8b` merged), and for
+the Apple app check, the commit that records it. Each was built with Xcode
+27.1 (Swift 6.4) by `swift build -c release -Xswiftc -warnings-as-errors`
+and run unbundled with a throwaway `INSOMNIA_HOME`. Nothing was installed
+and no session was started.
+
+- With Slack on both `agentList` and `freezeList` in config.json, the page
+  read "Keep running: Slack, Terminal" and "Freeze when lid closes: Discord",
+  and Edit Apps listed Slack once, as Keep running. Choosing Keep running for
+  Slack in Edit Apps left `freezeList` as `["com.hnc.Discord"]` and Slack
+  first on `agentList`.
+- With 30 tmux targets in config.json, a scratch copy of this build whose
+  tmux section starts open (Accessibility cannot open the disclosure) and
+  whose joined-networks list is empty opened the hotspot sheet at
+  470 × 825 pt inside the 490 × 897 pt Settings window, with its bottom 36 pt
+  above the window's and 176 pt above the screen's. Its form scrolled to
+  `agents:30.0` and the Add row, and Done stayed on screen.
+- With TextEdit and Docker Desktop on `freezeList` alone, which the freeze
+  planner never freezes from the list, the page read "Keep running:
+  Terminal, TextEdit, Docker" and "Freeze when lid closes: Discord", both
+  rows in Edit Apps read Keep running and could not be changed, and
+  TextEdit's Remove button took it off `freezeList`.
+- Not exercised: a screen shorter than the Settings window, such as a
+  13-inch MacBook Air, and VoiceOver.
+
 ## Distribution boundary
 
 Packaging is automated: `scripts/build-app.sh` makes the bundle, and the

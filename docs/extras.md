@@ -5,7 +5,10 @@ The [README](../README.md#optional-extras) has a summary of each.
 ## iPhone hotspot handoff
 
 Set **System Settings → Wi-Fi → Ask to join hotspots → Automatically**, then
-enter the hotspot SSID and password in Insomnia Settings. The password is
+open Insomnia Settings and choose **Set Up…** under If Wi-Fi drops. Pick the
+hotspot from the networks this Mac has joined, or type its name; a straight
+apostrophe still finds an iPhone's curly one. Then enter the password and
+click Save. The password is
 stored in the login Keychain under service `insomnia-hotspot`. Insomnia uses
 CoreWLAN to find and join that network without putting the password in process
 arguments.
@@ -35,9 +38,10 @@ A build signed with a stable identity would keep the item readable across
 upgrades.
 
 macOS requires Location Services permission to reveal network names. Insomnia
-requests it on the first hotspot save, or when starting a session with a
-configured hotspot, not merely on launch. If denied, use the Location row in
-Settings to open **Privacy & Security → Location Services**. Mac apps have no
+requests it when you click **Allow…** next to Location access in the hotspot
+sheet, on the first hotspot save, or when starting a session with a
+configured hotspot, never at launch. If denied, the same row opens
+**Privacy & Security → Location Services**. Mac apps have no
 when-in-use grant, so System Settings records it as Location Services access
 for Insomnia. Insomnia uses it only to read Wi-Fi network names through
 CoreWLAN and never requests your location.
@@ -55,8 +59,9 @@ tmux set-option -p -t <session:window.pane> @insomnia-nudge on
 
 Mark a dedicated, disposable agent pane, not one you type in, because pending
 text is opaque to Insomnia. Enter is off by default, so the word is typed and
-nothing submits it. Turn on "Press Enter after continue" in Settings to submit
-it, knowing that Enter also submits anything already typed in that pane. The
+nothing submits it. Turn on "Press Enter after continue" in Settings, under
+If Wi-Fi drops, to submit it, knowing that Enter also submits anything
+already typed in that pane. The
 option must be on the pane itself (`-p`). One set on the session or window
 does not count. Pane options need tmux 3.0 or later. Ending a session cancels
 pending automation but cannot retract keystrokes already sent.
@@ -112,7 +117,7 @@ points to, and it logs that once. You set up the link, so trimming the file
 it points to is up to you.
 
 Insomnia makes one kind of network request, and only when you click "Check
-for updates" in Settings > App: two unauthenticated GETs at api.github.com,
+for updates" in Settings > General: two unauthenticated GETs at api.github.com,
 for the release this repository marks Latest and for the first page of its
 releases list, with the installed version as their user agent and nothing
 else about the Mac. It never checks on its own, opens the releases page only

@@ -235,7 +235,11 @@ jobs:
           tools="$RUNNER_TEMP/shellcheck"
           dump="$RUNNER_TEMP/test-scripts"
           mkdir -p "$tools"
-          curl -sSfL --retry 3 -o "$tools/shellcheck.tar.gz" \
+          # Release downloads can fail with curl 56, which --retry alone
+          # does not retry. Bound each attempt and keep checksum verification.
+          curl -sSfL --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --retry-max-time 300 \
+            -o "$tools/shellcheck.tar.gz" \
             "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.darwin.aarch64.tar.gz"
           echo "${SHELLCHECK_SHA256}  $tools/shellcheck.tar.gz" | shasum -a 256 -c -
           tar -xzf "$tools/shellcheck.tar.gz" -C "$tools" --strip-components 1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"

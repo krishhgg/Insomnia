@@ -213,7 +213,7 @@ four `pmset` commands itself.
 
 ## Upgrades
 
-Settings > App shows the installed version. "Check for updates" there asks
+Settings > General shows the installed version. "Check for updates" there asks
 GitHub once, when you click, for the release marked Latest and for the
 newest nightly, and tells you both tags and whether a newer stable release
 exists. It installs nothing; an upgrade is the steps above run again.

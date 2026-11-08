@@ -299,7 +299,7 @@ final class NoRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     }
 }
 
-/// The "Check for updates" button in Settings > App. Two requests to
+/// The "Check for updates" button in Settings > General. Two requests to
 /// GitHub when the user clicks (the Latest release and the first page of
 /// the list), a report under the button, and nothing installed: an upgrade
 /// is the installer run again (docs/install.md, Upgrades). The app never
