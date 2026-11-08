@@ -501,6 +501,13 @@ final class SessionManager {
     /// nil in tests. Started after a session starts, stopped when it ends.
     @ObservationIgnored var services: AppServices?
 
+    /// The display hold behind `Config.keepScreenAwake` (`ScreenAwake`).
+    @ObservationIgnored private let screenAwake: ScreenAwake
+    /// Set by an end request, cleared when a session starts. From the
+    /// request on the display is not held, even while a refused end (busy
+    /// lock, unreadable journal) leaves the session active.
+    @ObservationIgnored private var endRequestedSinceStart = false
+
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
@@ -646,6 +653,7 @@ final class SessionManager {
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
+        displayAssertions: any DisplayAssertionHolding = NoopDisplayAssertions(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
         closedLidSleep: any ClosedLidSleeping = NoopClosedLidSleep(),
@@ -674,6 +682,7 @@ final class SessionManager {
         self.display = display
         self.keyboard = keyboard
         self.appNap = appNap
+        self.screenAwake = ScreenAwake(assertions: displayAssertions)
         self.notifier = notifier
         self.clamshell = clamshell
         self.closedLidSleep = closedLidSleep
@@ -763,6 +772,7 @@ final class SessionManager {
             display: display,
             keyboard: keyboard,
             appNap: CFAppNapPreferences(),
+            displayAssertions: IOPMDisplayAssertions(),
             notifier: notifier,
             closedLidSleep: IOKitClosedLidSleep(),
             closedLidWatcher: LidObserver()
@@ -779,6 +789,56 @@ final class SessionManager {
         services.logStartupSnapshot()
         return m
     }
+
+    // MARK: Screen awake
+
+    /// Whether the display is held awake right now.
+    var screenAwakeHeld: Bool { screenAwake.isHeld }
+
+    /// Holds the display awake while a session is active with
+    /// `Config.keepScreenAwake` on and no end requested since it started,
+    /// and releases it otherwise. The hold times out at the session's
+    /// deadline, so a hung process can't keep the screen unlocked past it,
+    /// and each new deadline moves the timeout. Settings calls it when the
+    /// toggle changes. A hold or a move of its timeout that macOS refuses
+    /// goes to the menu, and so does a refused release, which stays held;
+    /// quitting Insomnia releases it, since the assertion belongs to the
+    /// process. A retry that fails the same way leaves a newer line about
+    /// anything else in place. Once the hold matches again, that menu line
+    /// goes if it is still the line shown; a newer failure stays.
+    func syncScreenAwake() {
+        if isActive, config.keepScreenAwake, !endRequestedSinceStart, let endsAt = session?.endsAt {
+            if screenAwake.hold(until: endsAt, now: clock()) {
+                clearScreenAwakeFailure()
+            } else {
+                reportScreenAwakeFailure(Self.screenAwakeHoldFailure)
+            }
+        } else if screenAwake.release() {
+            clearScreenAwakeFailure()
+        } else {
+            reportScreenAwakeFailure(Self.screenAwakeReleaseFailure)
+        }
+    }
+
+    /// The screen awake failure last put in the menu, until a hold or a
+    /// release works again.
+    @ObservationIgnored private var screenAwakeFailure: String?
+
+    /// Shows `message` unless it is the failure already reported and the
+    /// menu now shows something else, which came after it.
+    private func reportScreenAwakeFailure(_ message: String) {
+        if screenAwakeFailure == message, lastError != nil { return }
+        screenAwakeFailure = message
+        fail(message)
+    }
+
+    private func clearScreenAwakeFailure() {
+        if let shown = screenAwakeFailure, lastError == shown { lastError = nil }
+        screenAwakeFailure = nil
+    }
+
+    private static let screenAwakeHoldFailure = "could not hold the display on until the session ends, so the display can sleep and lock the screen; turn \"Keep the screen on and unlocked\" off and on in Settings to try again"
+    private static let screenAwakeReleaseFailure = "could not release the display hold, so the display stays on and the screen does not lock on its own; quit Insomnia to release it"
 
     // MARK: Lifecycle queue
 
@@ -1434,6 +1494,8 @@ final class SessionManager {
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
         applyAppNapInJournal()
+        endRequestedSinceStart = false
+        syncScreenAwake()
         // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
@@ -1491,6 +1553,7 @@ final class SessionManager {
         lastError = nil
         Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
         await armDeadline(updated.endsAt)
+        syncScreenAwake()
         // The cap is now + maxDuration, so at the cap the end only creeps out
         // by the time since the last extend, and after a lower maxDuration
         // it moves earlier. Neither is an extension to report. A request is
@@ -1511,6 +1574,11 @@ final class SessionManager {
         endsRunning += 1
         defer { endsRunning -= 1 }
         endTicket += 1
+        // Before the lock or the journal can refuse the end: a refused end
+        // leaves the session active, and the display must not stay held
+        // past the deadline or the user's end.
+        endRequestedSinceStart = true
+        syncScreenAwake()
         if reason == .quit { quitRequested = true }
         // Only an end that finds the session owes the sleep. A retry of an
         // end that has already run (session.json kept in place, a restore
@@ -1741,6 +1809,10 @@ final class SessionManager {
         countdownPaused = false
         session = nil
         sleepNotHeld = false
+        // The display hold goes with the session, before the restore below
+        // waits on any command. A reconcile or a failed start ends here
+        // without `end()`, which releases it first otherwise.
+        syncScreenAwake()
         // Every lid action is undone from the journal below, or by the
         // retry of this end, and Low Power Mode restored from it: a lid
         // event refused earlier, a settle pass waiting to run again and
@@ -1767,6 +1839,7 @@ final class SessionManager {
         }
         let stuck = await restoreAll()
         services?.stop()
+        syncScreenAwake()
 
         if let stuck {
             // restoreAll stopped at a sudo pmset that did not stop on SIGTERM
@@ -3022,8 +3095,11 @@ final class SessionManager {
                 lastError = nil
             } catch let still as CommandStillRunningError {
                 // Not surfaced: the session file and journal stay for the end
-                // that runs once the command has exited.
+                // that runs once the command has exited. A display hold that
+                // the Settings toggle took during the awaits above goes with
+                // the session.
                 session = nil
+                syncScreenAwake()
                 stopTransaction(for: still, thenEnd: .recoveryUnavailable)
                 return
             } catch {
@@ -3049,6 +3125,7 @@ final class SessionManager {
             countdownPaused = lidClosed == true && (!lidAtDesk() || state.hasLidActions)
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
+            syncScreenAwake()
             services?.start(for: self)
             return
         }
