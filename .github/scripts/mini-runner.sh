@@ -1,8 +1,9 @@
 #!/bin/bash
 # Runs the jobs of .github/workflows/mac-mini.yml on the owner's Mac mini,
 # one job per throwaway VM. Each pass of the loop:
-#   1. asks GitHub for a just-in-time runner, which takes one job and then
-#      unregisters itself;
+#   1. checks that GitHub holds every outside contributor's runs for the
+#      owner's approval, then asks GitHub for a just-in-time runner, which
+#      takes one job and then unregisters itself;
 #   2. clones the VM that mini-base.sh made and boots it on Softnet;
 #   3. starts the runner in the clone and waits for it to exit;
 #   4. stops and deletes the clone, so no job sees another job's files, and
@@ -56,6 +57,27 @@ github_curl() {
       -H 'Accept: application/vnd.github+json' \
       -H 'X-GitHub-Api-Version: 2022-11-28' \
       "$@" "https://api.github.com/repos/$REPO/$path"
+}
+
+# A fork's pull request can edit the workflows to ask for this runner, so
+# GitHub's approval of fork runs is what keeps outside code off the mini.
+# Each pass checks that it covers every outside contributor before it
+# offers a runner, and offers none if it can't tell. A runner already
+# waiting isn't checked again, so stop the loop before weakening it.
+approval_ok() {
+  local response policy
+  response=$(github_curl GET actions/permissions/fork-pr-contributor-approval -f) || {
+    log "could not read the fork run approval setting"
+    return 1
+  }
+  policy=$(printf '%s' "$response" | plutil -extract approval_policy raw -o - -) || {
+    log "could not read the fork run approval setting in GitHub's answer"
+    return 1
+  }
+  if [ "$policy" != all_external_contributors ]; then
+    log "fork run approval is $policy, not all_external_contributors; no runner offered (docs/mac-mini-ci.md)"
+    return 1
+  fi
 }
 
 # Removes a runner's registration. GitHub answers 404 for one that is
@@ -180,6 +202,7 @@ one_job() {
   name="mini-$(date '+%Y%m%d-%H%M%S')"
   runner_log="$LOG_DIR/$name.log"
 
+  approval_ok || return 1
   response=$(github_curl POST actions/runners/generate-jitconfig -f --data \
     "{\"name\":\"$name\",\"runner_group_id\":1,\"labels\":[\"self-hosted\",\"macOS\",\"ARM64\",\"$LABEL\"],\"work_folder\":\"_work\"}") || {
     log "GitHub gave no runner config"
