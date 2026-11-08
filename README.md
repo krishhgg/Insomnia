@@ -9,12 +9,14 @@
 </p>
 
 <p align="center">
-  A macOS menu bar app for timed awake sessions. Set how long your Mac stays
-  awake, choose what happens when the lid closes, and see when something could
-  not be undone.
+  A macOS menu bar app for timed awake sessions. Insomnia is an eye icon that
+  lives in your MacBook menu bar. It has no Dock icon and no main window. Set
+  how long your Mac stays awake, choose what happens when the lid closes, and
+  see when something could not be undone.
 </p>
 
 <p align="center">
+  <a href="https://getinsomnia.app"><strong>Website</strong></a> ·
   <a href="#install"><strong>Install</strong></a> ·
   <a href="#using-it"><strong>Using it</strong></a> ·
   <a href="#what-happens-when-the-lid-closes"><strong>Lid close</strong></a> ·
@@ -53,7 +55,9 @@ on each day it has new commits. They have the newest code and may be broken.
 
 To install a release yourself, follow [docs/install.md](docs/install.md). It
 covers both channels, how to check the download, and `v0.1.0`, which installs
-differently.
+differently. Settings > General shows the installed version, and "Check for
+updates" there tells you whether a newer release exists without installing
+anything.
 
 ### Build from source
 
@@ -99,14 +103,71 @@ file and explains how upgrades replace them.
 1. **Start.** Click the eye in the menu bar, enter days, hours and minutes,
    and press Enter.
 2. **Add time.** Click the eye or the countdown during a session.
-3. **End early.** Press and hold the end control next to the countdown.
+3. **End early.** Press and hold the end control next to the countdown, or
+   right-click the menu bar item and choose **End session**.
+   To show only the eye, turn off "Show the countdown in the menu bar" in
+   Settings. The eye opens while a session runs and closes when it ends,
+   and the right-click menu also shows the time left.
 4. **Settings and status.** Right-click the eye. Quit asks Insomnia to undo
    the session first, and it refuses while a change is still waiting to be
    undone. Saved audio for an output that isn't connected doesn't hold it up.
    Insomnia restores that output if it reconnects while the app runs, or at
    the next launch.
+5. **Menu bar style.** The Menu bar picker in Settings > General has four
+   styles. Pills, the default, works as described above. Compact keeps only
+   the eye in the bar, and a click opens the same pills, countdown and end
+   ring in a small panel. Minimal is the eye with a ring for the time left:
+   a click adds the default session length, and a 0.6 s hold ends the
+   session. Popover shows the eye and, during a session, the time left to
+   the minute (or the end time). Any click on it, left or right, opens a
+   popover with time buttons, Custom fields for days, hours and minutes,
+   the status, Settings and Quit. While a session runs it also has the
+   ring you hold to end it. Popover style has no right-click menu, since
+   the popover shows the same things.
+6. **One click.** Turn on "Start a session with one click" in Settings >
+   General, under the Menu bar picker. Then, in Pills, Compact and Popover,
+   a click on the eye with no session running starts the default session
+   length. Option-click opens the usual controls to pick another length,
+   and in Popover a right-click or Control-click does too. A click during a
+   session works as it does with the switch off, and never ends the
+   session. If the start is refused, the pills, the panel or the popover
+   opens with the reason. Minimal already adds the default length on every
+   click, so Settings greys the switch out there. It is off by default.
+7. **Sounds.** "Play a sound when you start or end a session" in Settings >
+   General plays a short tone when you start or end a session from the
+   menu bar. It is off by default, and while it is off Insomnia makes no
+   sound and loads none. A session that ends without you asking (the
+   timer, the recovery agent, Quit, a battery or heat rule, recovery after
+   a crash) makes no sound. Nothing plays while the displays sleep or the
+   lid is closed, and `--session` commands make no sound.
+8. **From a script or an agent.** The app's binary drives the running app:
+
+   ```bash
+   INSOMNIA=~/Applications/Insomnia.app/Contents/MacOS/Insomnia
+   "$INSOMNIA" --session start 7200    # two hours
+   "$INSOMNIA" --session extend 1800
+   "$INSOMNIA" --session status
+   "$INSOMNIA" --session end
+   ```
+
+   It starts, extends and ends the same session the menu bar counts down,
+   with the same battery and heat rules, and prints one line. It changes
+   nothing itself, so when the app isn't running it says so and exits 1.
+   A build without this mode opens the menu bar app instead, so a script
+   that may meet one checks `InsomniaSessionCommandVersion` in the bundle's
+   `Info.plist` first.
 
 You don't have to close the lid, and opening it doesn't end the session.
+
+Insomnia stops system sleep, not display sleep, so the display still turns
+off when idle. If your Mac then asks for a password, agents that drive the
+screen stop at the lock screen. **Keep the screen on and unlocked** in Settings >
+General holds the display awake during a session, like `caffeinate -d`, so the
+screen saver never starts and the screen never locks. With the lid closed, the
+display goes to brightness 0 instead of sleeping. When the session ends or
+Insomnia quits or crashes, macOS drops the hold, and the display sleeps and
+locks as before. Insomnia never changes the lock setting. The switch is off by
+default because anyone who opens the Mac during a session finds it unlocked.
 
 On battery power, Insomnia turns on Low Power Mode below 40% and ends the
 session below 10%. Those are the defaults. You can change both in Settings,
@@ -131,8 +192,9 @@ to undo them. The timer keeps counting down while the lid is closed.
   first. With sleep turned off, macOS no longer does this by itself.
 - **Apps on the freeze list are frozen.** Freezing sends an app's processes
   `SIGSTOP`, which pauses them until `SIGCONT` on lid open. The list starts
-  with Slack, WhatsApp and Discord. "Freeze every other app" is off by
-  default. Even when on, it skips meeting, recording and dictation apps: Zoom,
+  with Slack, WhatsApp and Discord. Edit Apps in Settings sets each app to
+  keep running or to freeze, and "All other apps" keeps running by default.
+  Set to freeze, it still skips meeting, recording and dictation apps: Zoom,
   Teams, Webex, FaceTime, Wispr Flow, Granola, Otter, OBS and Loom.
 - **Audio is muted.** Lid open unmutes each output Insomnia muted, even if you
   switched to another one.
@@ -204,16 +266,17 @@ It doesn't press Enter unless you turn that on. Mark a pane you don't type in.
 </details>
 
 <details>
-<summary><strong>Chrome, Chromium and Arc throttling</strong></summary>
+<summary><strong>Chrome, Chromium, Arc and Comet throttling</strong></summary>
 
 These browsers slow down windows that macOS reports as hidden, which includes
 every window while the lid is closed. If a running browser lacks
 `--disable-backgrounding-occluded-windows` or
-`--disable-renderer-backgrounding`, the right-click menu offers "Relaunch
-[browser] unthrottled". It asks first, because relaunching quits the browser,
-and tabs come back only if the browser reopens them on startup. Some web apps
-may still stop with the lid closed.
-[docs/extras.md](docs/extras.md#chrome-chromium-and-arc-throttling) has the
+`--disable-renderer-backgrounding`, the right-click menu (the popover in
+Popover style) offers "Relaunch [browser] unthrottled". It asks first,
+because relaunching quits the browser, and tabs come back only if the
+browser reopens them on startup. Some web apps may still stop with the lid
+closed.
+[docs/extras.md](docs/extras.md#chrome-chromium-arc-and-comet-throttling) has the
 details.
 
 </details>

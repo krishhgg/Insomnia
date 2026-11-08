@@ -1,17 +1,21 @@
 import AppKit
 import SwiftUI
 
-/// Menu bar app. The status item is an `NSStatusItem` hosting SwiftUI, and
-/// the settings window is an `NSWindow` this app opens itself (see
-/// `SettingsWindow`), so there is no SwiftUI scene with any content in it.
-/// `App` still requires one, hence the empty `Settings`. main.swift starts
-/// this app unless the command line asks for a one-shot mode first.
+/// One AppKit status item hosts every presentation. Compact opens an
+/// arrowless panel with the shared controls; mode changes never remove or
+/// replace the status item. Settings uses the app-owned SettingsWindow.
 struct InsomniaApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     var body: some Scene {
         Settings {
             EmptyView()
+        }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings\u{2026}") { delegate.openSettings() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 }
@@ -23,9 +27,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
     let loginItem = LoginItem()
+    let releases = ReleaseChecker()
     private var statusItem: StatusItemController?
     private var settingsWindow: SettingsWindow?
+    private var displaySleep: DisplaySleepObserver?
+    private var timeChange: TimeChangeObserver?
+    private let sessionCommands = SessionCommandWatcher()
     private var terminating = false
+
+    func openSettings() {
+        statusItem?.menuOpenSettings()
+    }
 
     override init() {
         let manager = SessionManager.live()
@@ -53,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // No Dock icon even when run from `swift run` (the bundle has LSUIElement).
         NSApp.setActivationPolicy(.accessory)
-        Log.info("launched")
+        Log.info("launched, version \(AppBuild.current.label)")
         if LidSimulationBuild.isCompiledIn {
             Log.info(LidSimulationBuild.marker)
         }
@@ -70,21 +82,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Log.error("could not save config after the launch at login check: \(error.localizedDescription)")
             }
         }
-        let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem] in
-            AnyView(
-                SettingsView(
-                    manager: manager,
-                    secrets: secrets,
-                    locationPermission: locationPermission,
-                    loginItem: loginItem
-                )
+        let settings = SettingsWindow { [manager, secrets, locationPermission, loginItem, releases] in
+            SettingsView(
+                manager: manager,
+                secrets: secrets,
+                locationPermission: locationPermission,
+                loginItem: loginItem,
+                releases: releases
             )
         }
         settingsWindow = settings
-        statusItem = StatusItemController(manager: manager, status: status) { [weak settings] in
-            settings?.show()
+        statusItem = StatusItemController(
+            manager: manager,
+            status: status,
+            showSettings: { [weak settings] in settings?.show() },
+            secrets: secrets,
+            playSessionSound: { SessionSounds.shared.play($0) }
+        )
+        displaySleep = DisplaySleepObserver { [manager] asleep in manager.displaysAsleepChanged(asleep) }
+        timeChange = TimeChangeObserver { [manager] in manager.refreshCountdown() }
+        sessionCommands.onRequest = { [manager] request in
+            Task { await manager.serve(request) }
         }
-        Task { await manager.reconcile() }
+        Task {
+            await manager.reconcile()
+            // `Insomnia --session` from a script or an agent, once reconcile
+            // has adopted or cleared what it found, so no request is
+            // answered against a session that is about to resume.
+            sessionCommands.start(paths: manager.paths)
+        }
     }
 
     /// Quitting always ends the session (spec 1). Terminate is deferred until

@@ -97,6 +97,9 @@ struct EyeMarkView: View {
     let progress: CGFloat
     let reduceMotion: Bool
     var size: CGFloat = 17
+    /// A presentation can coordinate the blink with its own size/fade change.
+    /// Other modes keep the original lid and pupil timing.
+    var animationOverride: Animation?
 
     /// What the blink's animations are keyed on. Keying on both means a
     /// Reduce Motion change mid-blink is itself a value change, so it
@@ -107,15 +110,16 @@ struct EyeMarkView: View {
         var reduceMotion: Bool
     }
 
-    init(isRunning: Bool, reduceMotion: Bool, size: CGFloat = 17) {
-        self.init(progress: isRunning ? 1 : 0, reduceMotion: reduceMotion, size: size)
+    init(isRunning: Bool, reduceMotion: Bool, size: CGFloat = 17, animationOverride: Animation? = nil) {
+        self.init(progress: isRunning ? 1 : 0, reduceMotion: reduceMotion, size: size, animationOverride: animationOverride)
     }
 
     /// One frozen frame of the blink, for previews.
-    init(progress: CGFloat, reduceMotion: Bool = true, size: CGFloat = 17) {
+    init(progress: CGFloat, reduceMotion: Bool = true, size: CGFloat = 17, animationOverride: Animation? = nil) {
         self.progress = progress
         self.reduceMotion = reduceMotion
         self.size = size
+        self.animationOverride = animationOverride
     }
 
     static func stroke(size: CGFloat) -> StrokeStyle {
@@ -156,7 +160,7 @@ struct EyeMarkView: View {
             // The pupil runs on its own curve, keyed on the eye state so a
             // close during its opening delay retargets it from wherever it is.
             EyePupilLayer(scale: pupilScale, opacity: pupilOpacity)
-                .animation(Motion.pupil(opening: opening, reduceMotion: reduceMotion), value: state)
+                .animation(animationOverride ?? Motion.pupil(opening: opening, reduceMotion: reduceMotion), value: state)
             // The lid and the lashes share the lid's curve, so the lash
             // hand-over follows the lid edge. Under Reduce Motion the closed
             // lid crossfades instead of lifting; the lashes hand over the
@@ -172,7 +176,7 @@ struct EyeMarkView: View {
                     .stroke(.black, style: stroke)
                     .modifier(EyeLashFade(progress: progress, side: .above))
             }
-            .animation(Motion.blink(opening: opening, reduceMotion: reduceMotion), value: state)
+            .animation(animationOverride ?? Motion.blink(opening: opening, reduceMotion: reduceMotion), value: state)
         }
     }
 }

@@ -86,7 +86,7 @@ enum DisplayPower {
     /// type information, so on any other major the calls are refused until
     /// someone measures them again, rather than passing a display id and a
     /// float pointer into a function whose signature may have changed.
-    static let measuredDisplayServicesMajors: Set<Int> = [26]
+    static let measuredDisplayServicesMajors: Set<Int> = [26, 27]
 
     /// nil when `major` was measured; otherwise why DisplayServices is refused.
     static func displayServicesRefusal(osMajorVersion major: Int) -> String? {
@@ -160,7 +160,7 @@ struct NoopKeyboardBacklight: KeyboardBacklighting {
     func isSuppressedOrDimmed() -> Bool { false }
 }
 
-/// Private DisplayServices.framework, measured on macOS 26 (see
+/// Private DisplayServices.framework, measured on macOS 26 and 27 (see
 /// docs/release-validation.md): Get/SetBrightness take effect at once
 /// whether the display is awake, asleep or held by a display assertion.
 /// Symbols are resolved once, lazily, under a lock, and only on a macOS

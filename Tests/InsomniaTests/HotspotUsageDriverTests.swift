@@ -348,11 +348,60 @@ final class HotspotUsageUITests: XCTestCase {
         XCTAssertEqual(items.map(\.kind), [.hotspotUsage, .warning, .info, .separator, .settings, .quit])
         XCTAssertEqual(items[0].title, "Hotspot: 820 MB / 1.00 GB")
         XCTAssertEqual(items[2].title, "Paused, on another Wi-Fi network")
-        let menu = StatusMenu.menu(items, target: nil, settings: #selector(UsageMenuTarget.settings), quit: #selector(UsageMenuTarget.quit), relaunchBrowser: #selector(UsageMenuTarget.quit), stopWaitingForOutput: #selector(UsageMenuTarget.quit))
+        let menu = StatusMenu.menu(items, target: nil, endSession: #selector(UsageMenuTarget.quit), settings: #selector(UsageMenuTarget.settings), quit: #selector(UsageMenuTarget.quit), relaunchBrowser: #selector(UsageMenuTarget.quit), stopWaitingForOutput: #selector(UsageMenuTarget.quit))
         XCTAssertEqual(menu.items[0].action, #selector(UsageMenuTarget.settings))
         XCTAssertTrue(menu.items[0].isEnabled)
         XCTAssertEqual(menu.items[0].keyEquivalent, "")
         XCTAssertFalse(menu.items[1].isEnabled)
+    }
+
+    func testUsageMenuKeepsNetworkTimeLeftAndOneEndAction() {
+        let usage = HotspotUsageStatus(ledger: HotspotUsageLedger(received: 820_000_000, budgetBytes: 1_000_000_000), phase: .otherNetwork)
+        let items = StatusMenu.items(
+            sessionActive: true, sleepHeld: true, machine: nil, network: "Wi-Fi: Example Network",
+            actions: nil, throttledBrowsers: [], error: nil, remaining: "2h 14m", hotspotUsage: usage
+        )
+        XCTAssertEqual(items.first?.title, "Time left: 2h 14m")
+        XCTAssertTrue(items.contains { $0.title == "Wi-Fi: Example Network" })
+        XCTAssertEqual(items.filter { $0.kind == .hotspotUsage }.map(\.title), ["Hotspot: 820 MB / 1.00 GB"])
+        XCTAssertEqual(items.filter { $0.kind == .endSession }.count, 1)
+        XCTAssertTrue(StatusMenu.Item.Kind.hotspotUsage.isAction)
+        XCTAssertTrue(items.contains { $0.kind == .warning && $0.title == usage.warning })
+    }
+
+    func testSharedUsageShortcutOpensSettingsWithoutEndingAnyMenuBarMode() async throws {
+        _ = NSApplication.shared
+        for mode in Config.MenuBarMode.allCases {
+            let h = Harness()
+            defer { h.home.destroy() }
+            let manager = h.makeManager()
+            manager.config.menuBarMode = mode
+            manager.config.trackHotspotUsage = true
+            let source = PlaceholderStatus()
+            source.hotspotUsage = HotspotUsageStatus(ledger: HotspotUsageLedger(received: 800, budgetBytes: 1_000), phase: .tracking)
+            let settingsOpened = Locked(0)
+            let notifications = Locked(0)
+            let observer = NotificationCenter.default.addObserver(forName: SettingsView.showHotspotUsage, object: nil, queue: nil) { _ in
+                notifications.value += 1
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+            let controller = StatusItemController(manager: manager, status: source, showSettings: { settingsOpened.value += 1 })
+            await manager.start(duration: 3600)
+            let action = try XCTUnwrap(controller.menuItems().first { $0.kind == .hotspotUsage })
+            let calls = h.guardFake.calls
+
+            controller.performMenuAction(action.kind)
+            for _ in 0..<200 where notifications.value == 0 {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+
+            XCTAssertEqual(settingsOpened.value, 1, "Usage must open Settings in \(mode)")
+            XCTAssertEqual(notifications.value, 1, "Usage must request the budget section in \(mode)")
+            XCTAssertTrue(manager.isActive)
+            XCTAssertTrue(h.guardFake.sleepDisabled)
+            XCTAssertEqual(h.guardFake.calls, calls, "Opening the budget must not change power settings")
+            await manager.end(reason: .user)
+        }
     }
 
     func testOptOutHidesMenuWhileSettingsRetainsSavedTotal() {

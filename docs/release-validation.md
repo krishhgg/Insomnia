@@ -245,6 +245,117 @@ the mode dropped while state.json refuses that clear stays dropped. Unit
 tests with an injected version and fake classes cover the guards. They came
 after v0.1.0, so their real-Mac checks are in the release checklist.
 
+## October 10, 2026 macOS 27.0.1 (MacBook Pro, Apple M5 Pro)
+
+Machine: MacBook Pro, Apple M5 Pro, 64 GB, macOS 27.0.1 (26A434). Build:
+main `b5f7cf0` plus the DisplayServices major gate opened to 27, compiled with
+the Command Line Tools' Swift 6.4 against the macOS 26.5 SDK (the macOS 27 SDK
+expands SwiftUI `@State` as a macro whose plugin ships with Xcode only, so a
+Command Line Tools build against it fails), ad-hoc signed, installed with
+`scripts/install.sh`.
+
+- A read-only probe on 27.0.1 found `DisplayServicesGetBrightness`,
+  `DisplayServicesSetBrightness` and `DisplayServicesCanChangeBrightness`;
+  `GetBrightness` returned 0 with brightness 1.0 and `CanChangeBrightness`
+  returned true for the built-in display. All six `KeyboardBrightnessClient`
+  type encodings matched the macOS 26 measurements.
+- Supervised lid test on AC power on a desk: a 900 s session, lid closed
+  for about 11 minutes. `pmset -g log` shows no sleep or wake in the window;
+  a logger sampling every 30 s kept running. The log shows "display
+  darkened (was brightness 1.0)"; the built-in brightness read 0.000 for the
+  whole closed period and was restored to 1.0 at the timer end. The keyboard
+  backlight, audio mute and the WhatsApp freeze were applied and undone.
+  Battery temperature (`ioreg` "Temperature") went from 34.0 to 35.4 °C
+  while charging from 48 to 67 %; thermal state stayed nominal.
+- Low Power Mode was never enabled in that session: macOS 27 `pmset -g
+  custom` prints `powermode` instead of `lowpowermode`, so the read failed
+  ("no lowpowermode line under Battery Power") on every power event. On the
+  same machine `sudo -n pmset -b lowpowermode 1` set `powermode 1` under
+  Battery Power and `lowpowermode 0` set it back to `0`, so the existing
+  sudoers commands still apply; only the read changes. The parser now falls
+  back to `powermode` and reads `powermode 2` (High Power) as unknown.
+  A standalone harness of the new parser read the live output as off and
+  passed 8 cases; the Swift test suite was not run on this machine (the
+  Command Line Tools have no XCTest), so hosted CI is the gate for it.
+- Not exercised: a lid-closed session with the new Low Power read, any
+  session on battery, a session longer than 15 minutes, or heavy load.
+
+## October 11, 2026 Comet relaunch (MacBook Pro, Apple M2 Max)
+
+Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0 (26A428).
+Build: `main` `bb5cf2b` with the Comet change and the open PRs #58, #76 and
+#74 applied, built with Xcode 27.1 (Swift 6.4), ad-hoc signed, installed
+with `scripts/install.sh`. Comet 154.0.8037.179, Google Chrome 154.0.8037.98.
+
+- Comet's Info.plist gives `ai.perplexity.comet`. Its framework binary has
+  both `--disable-backgrounding-occluded-windows` and
+  `--disable-renderer-backgrounding`, as Chrome's has.
+- In a session with both browsers started without the flags, the log listed
+  "throttled browsers: Comet, Google Chrome". "Relaunch Comet unthrottled"
+  logged "relaunched ai.perplexity.comet unthrottled", and `ps -o args=`
+  showed both flags on the new Comet main process. Chrome did the same.
+- With Comet added to the freeze list by hand, two lid closes froze it (27
+  and 21 processes) and the opens resumed all of them, none gone or failed.
+- Not exercised: "Freeze every other app" with Comet running and not on the
+  freeze list (FreezerTests covers the protected list), and page timers in
+  Comet with the lid closed.
+
+## October 12, 2026 Settings window (MacBook Pro, Apple M2 Max)
+
+Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0 (26A428).
+Build: `main` `db9085e` with the Settings change, built with Xcode 27.1
+(Swift 6.4) by `swift build -c release` and run unbundled with a throwaway
+`INSOMNIA_HOME`. Nothing was installed and no session was started.
+
+- Settings… from the menu bar icon opened a 490 × 896 pt window with every
+  setting on one page and no scrolling, in light and dark appearance, with
+  minimize and zoom dimmed.
+- Edit Apps listed the 13 listed apps installed on this Mac, each with its
+  icon. Terminal and Docker Desktop showed Keep running and could not be
+  changed. Setting Slack to Keep running and Cursor to Freeze when lid closes
+  moved `com.tinyspeck.slackmacgap` to `agentList` and
+  `com.todesktop.230313mzl4w4u92` to `freezeList` in config.json.
+- The hotspot name field offered a network this Mac had joined, and a name
+  typed with a curly apostrophe was saved as typed (U+2019) in config.json.
+- After review, the window became resizable with a fixed width, so AppKit
+  fits it to a shorter screen. With the default config it opened at
+  490 × 897 pt, and with the two-change lid-close notice at 490 × 983 pt, the
+  notice wrapped. A scratch copy with 14 extra rows opened 1084 pt tall, the
+  screen's whole visible height, and its form scrolled to Open at login.
+- An app bundle built in the workspace and never opened was not found by its
+  bundle ID. After `RunningApps.bundleID(ofAppAt:)`, which Choose… calls, it
+  was, under its own name. The open panel itself was not driven.
+- Not exercised: a lid close after a rule change, Choose… through the open
+  panel, the Allow… button in a bundled build, and VoiceOver.
+
+## October 18, 2026 Settings review fixes (MacBook Pro, Apple M2 Max)
+
+Machine: MacBook Pro (Mac14,6), Apple M2 Max, 64 GB, macOS 27.0.1 (26A434).
+Build: `settings-hig` at `544b7c9` (with `main` `ad96f8b` merged), and for
+the Apple app check, the commit that records it. Each was built with Xcode
+27.1 (Swift 6.4) by `swift build -c release -Xswiftc -warnings-as-errors`
+and run unbundled with a throwaway `INSOMNIA_HOME`. Nothing was installed
+and no session was started.
+
+- With Slack on both `agentList` and `freezeList` in config.json, the page
+  read "Keep running: Slack, Terminal" and "Freeze when lid closes: Discord",
+  and Edit Apps listed Slack once, as Keep running. Choosing Keep running for
+  Slack in Edit Apps left `freezeList` as `["com.hnc.Discord"]` and Slack
+  first on `agentList`.
+- With 30 tmux targets in config.json, a scratch copy of this build whose
+  tmux section starts open (Accessibility cannot open the disclosure) and
+  whose joined-networks list is empty opened the hotspot sheet at
+  470 × 825 pt inside the 490 × 897 pt Settings window, with its bottom 36 pt
+  above the window's and 176 pt above the screen's. Its form scrolled to
+  `agents:30.0` and the Add row, and Done stayed on screen.
+- With TextEdit and Docker Desktop on `freezeList` alone, which the freeze
+  planner never freezes from the list, the page read "Keep running:
+  Terminal, TextEdit, Docker" and "Freeze when lid closes: Discord", both
+  rows in Edit Apps read Keep running and could not be changed, and
+  TextEdit's Remove button took it off `freezeList`.
+- Not exercised: a screen shorter than the Settings window, such as a
+  13-inch MacBook Air, and VoiceOver.
+
 ## Distribution boundary
 
 Packaging is automated: `scripts/build-app.sh` makes the bundle, and the

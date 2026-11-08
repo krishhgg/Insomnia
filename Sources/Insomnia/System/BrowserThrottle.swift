@@ -12,6 +12,7 @@ enum ChromiumFlags {
         "com.google.Chrome",
         "org.chromium.Chromium",
         "company.thebrowser.Browser",
+        "ai.perplexity.comet",
     ]
 
     /// Known Chromium ids plus any agent-list id mentioning chrome/chromium.

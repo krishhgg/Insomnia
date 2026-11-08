@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// One of the Days / Hours / Minutes fields in the menu bar. Flat dark
-/// rounded rectangle, unit name as placeholder, a crisp blue-grey ring when
-/// focused, snappy bounce on focus and on a rejected key.
+/// One of the Days / Hours / Minutes fields in the menu bar. Flat rounded
+/// rectangle tinted with the label colour (so it reads on a light or a dark
+/// menu bar), unit name as placeholder, a crisp ring when focused, snappy
+/// bounce on focus and on a rejected key.
 ///
 /// The pill is a fixed slot: its width is the placeholder's at the typed
 /// weight and padding, and the visible text is centred in it. Typing never
@@ -38,25 +39,24 @@ struct PillView: View {
             Text(text ?? field.placeholder)
                 .font(.system(size: 12, weight: isPlaceholder ? .regular : .semibold, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(isPlaceholder ? Color.white.opacity(0.42) : Color.white)
+                .foregroundStyle(isPlaceholder ? Color.primary.opacity(0.45) : Color.primary)
                 .contentTransition(.numericText())
                 .animation(Motion.base(reduceMotion: reduceMotion), value: text)
         }
         .frame(minWidth: 28)
         .frame(height: 19)
-        .background(shape.fill(Color(brand: BrandPalette.charcoal).opacity(0.92)))
+        .background(shape.fill(Color.primary.opacity(0.12)))
         .overlay {
-            shape.strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5)
+            shape.strokeBorder(Color.primary.opacity(0.18), lineWidth: 0.5)
         }
         .overlay {
             shape
-                .strokeBorder(Color(brand: BrandPalette.violet).opacity(ringVisible ? 1 : 0), lineWidth: 1.5)
+                .strokeBorder(Color.primary.opacity(ringVisible ? 0.75 : 0), lineWidth: 1.5)
                 .animation(Motion.base(reduceMotion: reduceMotion), value: ringVisible)
         }
         .overlay {
             shape.strokeBorder(Color.red.opacity(valid ? 0 : 0.8), lineWidth: 1)
         }
-        .environment(\.colorScheme, .dark)
         .contentShape(Rectangle())
         .help(field.help)
         .onTapGesture(perform: onTap)

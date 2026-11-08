@@ -233,7 +233,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
         let queue = KeychainQueue()
         let keychain = BlockingKeychain(items: ["\(KeychainStore.service)/Phone": "old"])
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { "Phone" }
-        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("new", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         let joiner = RecordingHotspotJoiner()
@@ -400,7 +400,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
     private func outageWithAJoinBehindABlockedSave(keychain: BlockingKeychain, savingFor ssid: String) async throws -> BlockedJoin {
         let queue = KeychainQueue()
         let store = KeychainHotspotSecretStore(keychain: keychain, queue: queue) { ssid }
-        let saving = Task { await SettingsView.storePassword("new", in: store) }
+        let saving = Task { await HotspotPasswordField.storePassword("new", in: store) }
         await fulfillment(of: [keychain.entered], timeout: 5)
 
         let joiner = RecordingHotspotJoiner()
@@ -488,7 +488,7 @@ final class NetworkFailoverDriverTests: XCTestCase {
 
         XCTAssertEqual(joiner.calls, [])
         XCTAssertEqual(n.passwordReport?.problem, .unreadable)
-        XCTAssertEqual(n.passwordReport?.problem.menuLine, "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings")
+        XCTAssertEqual(n.passwordReport?.problem.menuLine, "Hotspot password unreadable by this build: enter it again in Settings")
         XCTAssertEqual(notifier.posts.map(\.body), [HotspotPasswordProblem.unreadable.explanation])
         XCTAssertTrue(HotspotPasswordProblem.unreadable.explanation.contains("Enter it again in Settings"))
     }

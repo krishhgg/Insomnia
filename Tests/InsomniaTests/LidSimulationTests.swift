@@ -103,6 +103,24 @@ final class LidSimulationGateTests: XCTestCase {
         let plain = StatusMenu.items(sessionActive: false, sleepHeld: false, machine: nil, actions: nil, throttledBrowsers: [], error: nil, lidSimulationBuild: false)
         XCTAssertEqual(plain.map(\.kind), [.settings, .quit])
     }
+
+    /// Such a build says so with a badge in the popover's footer, the
+    /// marker as its tooltip, so it is never mistaken for a normal
+    /// release; it is not a warning row. A release build has no badge.
+    @MainActor
+    func testThePopoverMarksALidSimulationBuildWithAFooterBadge() throws {
+        let badge = try XCTUnwrap(StatusPopoverView.lidSimulationBadge)
+        XCTAssertEqual(badge.text, "Lid simulation build")
+        XCTAssertEqual(badge.help, LidSimulationBuild.marker)
+        XCTAssertTrue(LidSimulationBuild.marker.contains("simulate-lid.sh"))
+        // The gate script looks for the marker's "Lid simulation build:";
+        // the badge text must not carry that colon into any binary.
+        XCTAssertFalse(LidSimulationBuild.badge.contains(":"))
+
+        XCTAssertNil(StatusPopoverView.badge(compiledIn: false, text: "Lid simulation build", help: "x"))
+        XCTAssertNil(StatusPopoverView.badge(compiledIn: true, text: "", help: ""))
+        XCTAssertEqual(StatusMenu.popoverItems(sessionActive: false, sleepHeld: false, throttledBrowsers: [], error: nil), [])
+    }
 }
 
 #if DEBUG || INSOMNIA_LID_SIMULATION

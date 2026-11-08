@@ -18,7 +18,8 @@
 # state.json, decide, undo, publish the new journal atomically, release. If
 # the lock is not free within LOCK_TIMEOUT_SECONDS the run does nothing and
 # exits 75; launchd retries a minute later. The lock file is never unlinked
-# or replaced here, so every party locks the same inode.
+# or replaced here, so every party locks the same inode. The one run that
+# skips the lock is the idle one (see Idle below).
 #
 # Locking detail: the script opens the lock file on fd 9 and locks that fd
 # with `lockf <fd>`. If a caller (uninstall.sh) already holds the lock and
@@ -36,8 +37,8 @@
 #       lowPowerSetByUs     -> sudo -n pmset -b lowpowermode 0
 #       frozenProcesses     -> SIGCONT, but only to a pid verified to be the
 #                              process the app froze. Entries that record
-#                              startedAtMicros are handed to the installed
-#                              app binary (INSOMNIA_BIN --resume-frozen
+#                              startedAtMicros are handed to the app
+#                              binary (INSOMNIA_BIN --resume-frozen
 #                              <seconds>) in one call with a time limit, one
 #                              line per entry on its standard input. For
 #                              each entry in turn it does one kernel lookup
@@ -120,9 +121,11 @@
 #                              defaults delete <bundleId> NSAppSleepDisabled
 #                              when the key was absent. A delete that fails
 #                              counts as done only when defaults read then
-#                              says the key does not exist; a read that
-#                              fails any other way proves nothing and the
-#                              entry stays.
+#                              says the key is not there ("does not exist"
+#                              up to macOS 26, "Could not find key" or
+#                              "Domain ... not found" on macOS 27); a read
+#                              that fails any other way proves nothing and
+#                              the entry stays.
 #     A flag is cleared only after its undo succeeded. Unknown keys survive.
 #     Exit 0 only when the journal is clean afterwards; otherwise exit 1 so
 #     the failure is visible and the next periodic run retries.
@@ -177,14 +180,30 @@ RM=/bin/rm
 MV=/bin/mv
 CP=/bin/cp
 MKTEMP=/usr/bin/mktemp
-# The installed app binary, for the microsecond identity check of
-# frozenProcesses entries (see above), and the bundle's Info.plist, which
-# must declare InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the
-# binary is run: an older build has no such mode and would open the menu bar
-# app instead. Fixed paths like the tools, never PATH. install.sh puts the
+# BSD stat: GNU coreutils stat, first on PATH in many Homebrew setups, reads
+# -f as --file-system, so `-f %i` and `-f %z` print no inode or size.
+STAT=/usr/bin/stat
+# The app binary, for the microsecond identity check of frozenProcesses
+# entries (see above), and the bundle's Info.plist, which must declare
+# InsomniaResumeFrozenVersion RESUME_FROZEN_VERSION before the binary is
+# run: an older build has no such mode and would open the menu bar app
+# instead. Fixed paths like the tools, never PATH. install.sh puts the
 # bundle here, copying the binary before Info.plist.
 INSOMNIA_BIN="${HOME:-}/Applications/Insomnia.app/Contents/MacOS/Insomnia"
 INSOMNIA_INFO="${HOME:-}/Applications/Insomnia.app/Contents/Info.plist"
+# The copy sealed in a bundle uses that bundle's binary and Info.plist
+# instead. Everything that runs that copy (the LaunchAgent, install.sh,
+# uninstall.sh) verifies the whole bundle first, and the app pins the bundle
+# it runs from, so a bundle moved out of ~/Applications resumes its entries
+# with its own sealed binary, not with another install's or with none. A
+# checkout's copy keeps the paths above.
+case "${BASH_SOURCE[0]}" in
+  /*.app/Contents/Resources/backstop.sh)
+    BUNDLED_APP="${BASH_SOURCE[0]%/Contents/Resources/backstop.sh}"
+    INSOMNIA_BIN="$BUNDLED_APP/Contents/MacOS/Insomnia"
+    INSOMNIA_INFO="$BUNDLED_APP/Contents/Info.plist"
+    ;;
+esac
 RESUME_FROZEN_VERSION=1
 LOCK_TIMEOUT_SECONDS=10
 # Longest a single undo command (sudo pmset, defaults) may run before it is
@@ -218,6 +237,36 @@ log() { # level message
   printf '%s [%s] backstop: %s\n' "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" >> "$LOG"
 }
 
+# --- Idle ---------------------------------------------------------------------
+# launchd runs this every 60 s, and between sessions there is nothing to do:
+# no session.json, and the clean journal the app leaves behind. That run ends
+# here, before the lock and without starting a process. The journal must match
+# token for token; anything else, and every --force run, goes the full way.
+#
+# No lock is needed: the app publishes each file with one rename, and this
+# pair means nothing to undo on either side of a transaction. tighten is
+# skipped too; install.sh's --force run and every non-idle run still do it.
+if (( force == 0 )) && [[ ! -e "$SESSION" && ! -L "$SESSION" && -f "$STATE" ]]; then
+  idle_ws=$'[ \t\r\n]*'
+  idle_clean="^$idle_ws"
+  for idle_token in '\{' \
+      '"appNapOverrides"' : '\[' '\]' ',' \
+      '"dockerFrozen"' : false ',' \
+      '"frozenProcesses"' : '\[' '\]' ',' \
+      '"lowPowerSetByUs"' : false ',' \
+      '"savedAudioOutputs"' : '\[' '\]' ',' \
+      '"sleepDisabledByUs"' : false \
+      '\}'; do
+    idle_clean+="$idle_token$idle_ws"
+  done
+  idle_clean+='$'
+  idle_journal=""
+  # read returns non-zero at end of file; zero means it stopped at a NUL byte.
+  if ! { IFS= read -r -d '' idle_journal < "$STATE"; } 2>/dev/null && [[ "$idle_journal" =~ $idle_clean ]]; then
+    exit 0
+  fi
+fi
+
 # --- Lock --------------------------------------------------------------------
 "$MKDIR" -p "$APP_SUPPORT"
 # An upgrade over an older build: tighten what it left loose (0644 files,
@@ -241,7 +290,7 @@ tighten() { # path...
   done
 }
 tighten "$APP_SUPPORT" "$LOG_DIR" "$LOG" "$LOCK" "$STATE" "$SESSION"
-inode() { stat -f %i "$1" 2>/dev/null; }
+inode() { "$STAT" -f %i "$1" 2>/dev/null; }
 lock_shared=0
 if [[ -e /dev/fd/9 && -e "$LOCK" && -n "$(inode "$LOCK")" && "$(inode /dev/fd/9)" == "$(inode "$LOCK")" ]]; then
   lock_shared=1 # fd 9 is the caller's handle on the lock file; share its lock.
@@ -1168,7 +1217,7 @@ resume_via_app() {
     valid=0
   else
     answer="$app_answer_dir/out"
-    size="$(stat -f %z "$answer" 2>/dev/null || echo 0)"
+    size="$("$STAT" -f %z "$answer" 2>/dev/null || echo 0)"
     excerpt="$(head -c 200 "$answer" | tr -c '[:print:]' ' ')"
     # A valid line is at most 24 bytes ("<10-digit pid> unverifiable\n").
     if (( size > n * 32 )); then
@@ -1349,7 +1398,9 @@ if (( app_nap_count > 0 )); then
       # The key was absent before, so it goes. `defaults delete` fails when
       # the key is already gone, which is the wanted state. A failed delete
       # clears the entry only when `defaults read` then says in so many
-      # words that the key does not exist. A read that succeeds means the
+      # words that the key is not there: "does not exist" up to macOS 26,
+      # "Could not find key" for an existing domain and "Domain ... not
+      # found" for a missing one on macOS 27. A read that succeeds means the
       # key is still set; one that fails any other way (cfprefsd not
       # answering, a timeout) proves nothing, so the entry stays for the
       # next run.
@@ -1368,7 +1419,7 @@ if (( app_nap_count > 0 )); then
           log error "defaults delete $bundle NSAppSleepDisabled failed and the key is still set; keeping journal entry for retry"
           failures+=("App Nap is still off for $bundle: defaults delete failed")
           keep_app_nap_entry "$i"
-        elif grep -q "does not exist" "$probe" 2>/dev/null; then
+        elif grep -qE "does not exist|Could not find key 'NSAppSleepDisabled' in domain '|Domain '[^']*' not found\." "$probe" 2>/dev/null; then
           log info "defaults delete $bundle NSAppSleepDisabled: the key is already absent"
           changed=1
         else
