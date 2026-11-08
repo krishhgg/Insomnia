@@ -1,0 +1,2 @@
+2026-11-08T03:10:28Z Own claim released after cleanup verification. The test VM was left running.
+Staged ZIP SHA-256 000ac4f85c82839a4787834386ee48e2cadecbe057ec7cf8ade9edb83b257e5f unchanged.

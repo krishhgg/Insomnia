@@ -1,0 +1,366 @@
+{
+  "commit": "22f27560fee2d88b54685d53710a74c9ff8560aa",
+  "counts": {
+    "1": {
+      "PASS": 16
+    },
+    "2": {
+      "PASS": 2
+    },
+    "3": {
+      "PASS": 4
+    },
+    "4": {
+      "PASS": 11
+    },
+    "5": {
+      "PASS": 4
+    },
+    "6": {
+      "PASS": 1
+    },
+    "7": {
+      "PASS": 4
+    },
+    "8": {
+      "KNOWN-GAP": 2
+    }
+  },
+  "option_timing": [
+    {
+      "trial": "c1-Compact-immediate-hid-1",
+      "mouse_hold_ms": 89.08486366271973,
+      "release_after_mouse_up_ms": 0.2129077911376953,
+      "down_epoch": 1794106630.1770191,
+      "up_epoch": 1794106630.266104,
+      "option_up_epoch": 1794106630.266317
+    },
+    {
+      "trial": "c1-Compact-immediate-hid-2",
+      "mouse_hold_ms": 95.29805183410645,
+      "release_after_mouse_up_ms": 0.45680999755859375,
+      "down_epoch": 1794106636.878967,
+      "up_epoch": 1794106636.974265,
+      "option_up_epoch": 1794106636.974722
+    },
+    {
+      "trial": "c1-Compact-immediate-hid-3",
+      "mouse_hold_ms": 100.79574584960938,
+      "release_after_mouse_up_ms": 0.4551410675048828,
+      "down_epoch": 1794106643.1028252,
+      "up_epoch": 1794106643.203621,
+      "option_up_epoch": 1794106643.204076
+    },
+    {
+      "trial": "c1-Compact-immediate-session-1",
+      "mouse_hold_ms": 92.66281127929688,
+      "release_after_mouse_up_ms": 0.4439353942871094,
+      "down_epoch": 1794106649.343995,
+      "up_epoch": 1794106649.436658,
+      "option_up_epoch": 1794106649.4371018
+    },
+    {
+      "trial": "c1-Compact-immediate-session-2",
+      "mouse_hold_ms": 88.98019790649414,
+      "release_after_mouse_up_ms": 0.29087066650390625,
+      "down_epoch": 1794106655.5795069,
+      "up_epoch": 1794106655.668487,
+      "option_up_epoch": 1794106655.668778
+    },
+    {
+      "trial": "c1-Compact-immediate-session-3",
+      "mouse_hold_ms": 97.66101837158203,
+      "release_after_mouse_up_ms": 0.4229545593261719,
+      "down_epoch": 1794106661.8311229,
+      "up_epoch": 1794106661.928784,
+      "option_up_epoch": 1794106661.9292068
+    },
+    {
+      "trial": "c1-Pills-immediate-hid-1",
+      "mouse_hold_ms": 92.73099899291992,
+      "release_after_mouse_up_ms": 0.1671314239501953,
+      "down_epoch": 1794106552.792609,
+      "up_epoch": 1794106552.88534,
+      "option_up_epoch": 1794106552.885507
+    },
+    {
+      "trial": "c1-Pills-immediate-hid-2",
+      "mouse_hold_ms": 97.06711769104004,
+      "release_after_mouse_up_ms": 0.4496574401855469,
+      "down_epoch": 1794106559.201019,
+      "up_epoch": 1794106559.2980862,
+      "option_up_epoch": 1794106559.2985358
+    },
+    {
+      "trial": "c1-Pills-immediate-hid-3",
+      "mouse_hold_ms": 90.56615829467773,
+      "release_after_mouse_up_ms": 0.2789497375488281,
+      "down_epoch": 1794106565.3481889,
+      "up_epoch": 1794106565.438755,
+      "option_up_epoch": 1794106565.439034
+    },
+    {
+      "trial": "c1-Pills-immediate-session-1",
+      "mouse_hold_ms": 96.56095504760742,
+      "release_after_mouse_up_ms": 0.44989585876464844,
+      "down_epoch": 1794106571.466788,
+      "up_epoch": 1794106571.563349,
+      "option_up_epoch": 1794106571.563799
+    },
+    {
+      "trial": "c1-Pills-immediate-session-2",
+      "mouse_hold_ms": 95.42584419250488,
+      "release_after_mouse_up_ms": 0.5021095275878906,
+      "down_epoch": 1794106577.636907,
+      "up_epoch": 1794106577.732333,
+      "option_up_epoch": 1794106577.732835
+    },
+    {
+      "trial": "c1-Pills-immediate-session-3",
+      "mouse_hold_ms": 92.05818176269531,
+      "release_after_mouse_up_ms": 0.4439353942871094,
+      "down_epoch": 1794106583.776517,
+      "up_epoch": 1794106583.868575,
+      "option_up_epoch": 1794106583.869019
+    }
+  ],
+  "late_click_fallback_trials": [],
+  "zero_flag_control_trials_verified": 0,
+  "zero_flag_control_trials_required": 6,
+  "zero_flag_control_limit": "Normal posting clears Control before app delivery; bypass posting keeps Control held but delivers no event to Insomnia. The changed left-press path remains unverified.",
+  "single_menu_window_ids": {
+    "c4-Pills-right-1": [
+      "297"
+    ],
+    "c4-Pills-right-2": [
+      "300"
+    ],
+    "c4-Pills-control": [
+      "301"
+    ],
+    "c4-Compact-right-1": [
+      "318"
+    ],
+    "c4-Compact-right-2": [
+      "319"
+    ],
+    "c4-Compact-control": [
+      "320"
+    ],
+    "c4-Minimal-right-1": [
+      "325"
+    ],
+    "c4-Minimal-right-2": [
+      "326"
+    ],
+    "c4-Minimal-control": [
+      "327"
+    ]
+  },
+  "accessibility": [
+    {
+      "trial": "c8-Pills-AXPress",
+      "return_code": 0,
+      "raw_event_flags": 536870912,
+      "modifier_key_bits": 0,
+      "result": {
+        "status": "KNOWN-GAP",
+        "detail": "AXPress returned success but had no visible effect; no session, SleepDisabled 0 and no controls. Same as prior run."
+      }
+    },
+    {
+      "trial": "c8-Compact-AXPress",
+      "return_code": 0,
+      "raw_event_flags": 536870912,
+      "modifier_key_bits": 0,
+      "result": {
+        "status": "KNOWN-GAP",
+        "detail": "AXPress returned success but had no visible effect; no session, SleepDisabled 0 and no controls. Same as prior run."
+      }
+    }
+  ],
+  "recorded_results": {
+    "c1-Pills-immediate-hid-1": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-immediate-hid-2": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-immediate-hid-3": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-immediate-session-1": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-immediate-session-2": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-immediate-session-3": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-held": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Pills-flags": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c2-Pills-plain-after-option": {
+      "status": "PASS",
+      "detail": "duration 600, controls closed, SleepDisabled 1, starts 1"
+    },
+    "c1-Compact-immediate-hid-1": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-immediate-hid-2": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-immediate-hid-3": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-immediate-session-1": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-immediate-session-2": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-immediate-session-3": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-held": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c1-Compact-flags": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c2-Compact-plain-after-option": {
+      "status": "PASS",
+      "detail": "duration 600, controls closed, SleepDisabled 1, starts 1"
+    },
+    "c3-Popover-option-flags": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c3-Popover-option-keywrap": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c3-Popover-option-system": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c3-Popover-plain": {
+      "status": "PASS",
+      "detail": "duration 600, controls closed, SleepDisabled 1, starts 1"
+    },
+    "c4-Pills-right-1": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Pills-right-2": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Pills-control": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Pills-left-dismiss": {
+      "status": "PASS",
+      "detail": "right-open menu count 1, left-dismiss menu count 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Compact-right-1": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Compact-right-2": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Compact-control": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Compact-left-dismiss": {
+      "status": "PASS",
+      "detail": "right-open menu count 1, left-dismiss menu count 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Minimal-right-1": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Minimal-right-2": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c4-Minimal-control": {
+      "status": "PASS",
+      "detail": "menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c5-Popover-right-open": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c5-Popover-right-close": {
+      "status": "PASS",
+      "detail": "popover closed, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c5-Popover-control-open": {
+      "status": "PASS",
+      "detail": "controls open, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c5-Popover-control-close": {
+      "status": "PASS",
+      "detail": "popover closed, session.json absent, SleepDisabled 0, starts 0"
+    },
+    "c6-Minimal-plain-hold": {
+      "status": "PASS",
+      "detail": "800 ms hold on confirmed 7200 s session; user ends 1, restorations 1, session.json absent, SleepDisabled 0"
+    },
+    "c7-Pills-start": {
+      "status": "PASS",
+      "detail": "duration 600, controls closed, SleepDisabled 1, starts 1"
+    },
+    "c7-Pills-hold-end": {
+      "status": "PASS",
+      "detail": "650 ms hold; user ends 1, restorations 1, session.json absent, SleepDisabled 0"
+    },
+    "c7-Compact-start": {
+      "status": "PASS",
+      "detail": "duration 600, controls closed, SleepDisabled 1, starts 1"
+    },
+    "c7-Compact-hold-end": {
+      "status": "PASS",
+      "detail": "650 ms hold; user ends 1, restorations 1, session.json absent, SleepDisabled 0"
+    },
+    "c8-Pills-AXPress": {
+      "status": "KNOWN-GAP",
+      "detail": "AXPress returned success but had no visible effect; no session, SleepDisabled 0 and no controls. Same as prior run."
+    },
+    "c8-Compact-AXPress": {
+      "status": "KNOWN-GAP",
+      "detail": "AXPress returned success but had no visible effect; no session, SleepDisabled 0 and no controls. Same as prior run."
+    }
+  },
+  "picture_count": 7,
+  "full_defaults_match": true,
+  "installer_source_matches": true,
+  "cleanup": "PASS full first-launch defaults, Pills, both switches off, Default field Hours\n2026-11-08T03:09:59Z independent SleepDisabled 0\n2026-11-08T03:09:59Z independent SleepDisabled 0\n2026-11-08T03:10:00Z independent SleepDisabled 0\nInstalled CDHash baf2ef0b9687c057a8aa9a14a87404828e782b7c\nAudit followed /private/tmp and compared creation and modification times with the run start.\nTop-level entries: 3\nTotal entries inspected: 3\nEntries created during the run: 0\nEntries modified during the run: 0\nExisting entries were left untouched.\n",
+  "claim_release": "2026-11-08T03:10:28Z Own claim released after cleanup verification. The test VM was left running.\nStaged ZIP SHA-256 000ac4f85c82839a4787834386ee48e2cadecbe057ec7cf8ade9edb83b257e5f unchanged.\n",
+  "overall_status": "partial_verification"
+}

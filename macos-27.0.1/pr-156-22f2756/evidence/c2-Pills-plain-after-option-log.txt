@@ -1,0 +1,9 @@
+2026-11-08T02:56:47Z [info] insomnia: session started until 2026-11-08T03:06:41Z (600s requested)
+2026-11-08T02:56:47Z [info] insomnia: lid observer started (lid open)
+2026-11-08T02:56:47Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-08T02:56:47Z [info] insomnia: notification authorization denied
+2026-11-08T02:56:47Z [info] insomnia: power monitor started (battery n/a (no battery), on battery, thermal nominal)
+2026-11-08T02:56:47Z [error] insomnia: notification authorization failed: Notifications are not allowed for this application
+2026-11-08T02:56:47Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports
+2026-11-08T02:56:47Z [info] insomnia: network failover started (wifi unresolved)
+2026-11-08T02:56:47Z [info] insomnia: wifi path unsatisfied

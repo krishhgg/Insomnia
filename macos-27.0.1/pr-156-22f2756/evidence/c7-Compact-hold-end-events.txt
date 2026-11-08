@@ -1,0 +1,4 @@
+window epoch=1794107319.764821 stage=before-press id=276 owner=Insomnia layer=101 frame=1220,32,91,44
+window epoch=1794107319.764840 stage=before-press id=14 owner=Dock layer=20 frame=0,0,1440,900
+post before=1794107319.764940977 after=1794107319.764971972 type=1 flags=0 key=0 combinedFlagsBefore=536870912 controlKeyBefore=0
+post before=1794107320.420938015 after=1794107320.421000004 type=2 flags=0 key=0 combinedFlagsBefore=536870912 controlKeyBefore=0

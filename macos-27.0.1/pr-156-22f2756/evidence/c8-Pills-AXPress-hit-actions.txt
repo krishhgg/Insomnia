@@ -1,0 +1,8 @@
+epoch=1794107358.234096 hit-test=application result=0
+depth=0 role=AXMenuBarItem title= description= value= actions_rc=0 actions=["AXPress"]
+depth=1 role=AXMenuBar title= description= value= actions_rc=0 actions=[]
+depth=2 role=AXApplication title=Insomnia description= value= actions_rc=0 actions=[]
+epoch=1794107358.240954 hit-test=system result=0
+depth=0 role=AXMenuBarItem title= description= value= actions_rc=0 actions=["AXPress"]
+depth=1 role=AXMenuBar title= description= value= actions_rc=0 actions=[]
+depth=2 role=AXApplication title=Insomnia description= value= actions_rc=0 actions=[]

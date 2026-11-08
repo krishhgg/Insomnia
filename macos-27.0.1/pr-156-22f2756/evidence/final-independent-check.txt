@@ -1,0 +1,11 @@
+PASS full first-launch defaults, Pills, both switches off, Default field Hours
+2026-11-08T03:09:59Z independent SleepDisabled 0
+2026-11-08T03:09:59Z independent SleepDisabled 0
+2026-11-08T03:10:00Z independent SleepDisabled 0
+Installed CDHash baf2ef0b9687c057a8aa9a14a87404828e782b7c
+Audit followed /private/tmp and compared creation and modification times with the run start.
+Top-level entries: 3
+Total entries inspected: 3
+Entries created during the run: 0
+Entries modified during the run: 0
+Existing entries were left untouched.

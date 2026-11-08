@@ -1,0 +1,6 @@
+Audit followed /private/tmp and compared creation and modification times with the run start.
+Top-level entries: 3
+Total entries inspected: 3
+Entries created during the run: 0
+Entries modified during the run: 0
+Existing entries were left untouched.

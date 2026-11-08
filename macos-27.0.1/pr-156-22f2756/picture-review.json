@@ -1,0 +1,48 @@
+{
+  "reviewed_at_utc": "2026-11-08T03:10:58.723324+00:00",
+  "method": "Every selected image was opened and visually inspected.",
+  "pictures": [
+    {
+      "file": "pictures/setup-settings.png",
+      "sha256": "3edbb9885b75601ce2f8cc803b6fa5fe7b81060aec39b5712b73aa2fd8fb0006",
+      "accepted": true,
+      "review": "Settings only. One-click on, 10 minutes, sounds off; no private identifier or other window."
+    },
+    {
+      "file": "pictures/c1-Pills-immediate-hid-1.png",
+      "sha256": "437dae4693e9d0cf92c2fc97bba5dbe38fe9bf484e817f67cc2a5dc185b2c037",
+      "accepted": true,
+      "review": "Insomnia eye and expanded Pills only."
+    },
+    {
+      "file": "pictures/c1-Compact-immediate-hid-1.png",
+      "sha256": "bc056acfcdeee678bfbedece4d90b9f6df44f50aad1fabe7dc86d3f621e7be27",
+      "accepted": true,
+      "review": "Insomnia eye and Compact duration panel only."
+    },
+    {
+      "file": "pictures/c3-Popover-option-flags.png",
+      "sha256": "f25368d63dc388891c1e18837b0e7892c3edd9c56e7433d829c398ecd16bdb6f",
+      "accepted": true,
+      "review": "Insomnia eye and popover only. No network name or private identifier."
+    },
+    {
+      "file": "pictures/c4-Pills-right-1.png",
+      "sha256": "6af3f4f2341fbfa577f68c97a8a9f4565894fd07fd9db97ffd228559f12113ca",
+      "accepted": true,
+      "review": "Insomnia eye and menu only. Network name is hidden."
+    },
+    {
+      "file": "pictures/c8-Pills-AXPress.png",
+      "sha256": "5375008f2e71de79a0f7c342812c0112cc09850f5f2500fe5697f2319946f769",
+      "accepted": true,
+      "review": "Idle Insomnia eye only."
+    },
+    {
+      "file": "pictures/c8-Compact-AXPress.png",
+      "sha256": "5375008f2e71de79a0f7c342812c0112cc09850f5f2500fe5697f2319946f769",
+      "accepted": true,
+      "review": "Idle Insomnia eye only."
+    }
+  ]
+}

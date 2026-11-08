@@ -1,0 +1,1 @@
+session.json present, SleepDisabled 1, lowpowermode , app pid 18033

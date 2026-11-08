@@ -1,0 +1,7 @@
+epoch=1794107096.959407091 stage=app-sendEvent type=3 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=0.165 window=4294967296
+epoch=1794107096.966592073 stage=app-modifierFlags-read type=3 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=7.350 window=4294967296
+epoch=1794107096.976305962 stage=app-modifierFlags-read type=4 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=17.063 window=4294967296
+epoch=1794107097.001041889 stage=app-modifierFlags-read type=8 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=13.028 window=322
+epoch=1794107101.381973028 stage=app-modifierFlags-read type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=157.033 window=5
+epoch=1794107101.382505894 stage=app-modifierFlags-read type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=157.565 window=5
+epoch=1794107101.382554054 stage=app-modifierFlags-read type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=157.612 window=5

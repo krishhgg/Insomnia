@@ -1,0 +1,1 @@
+2026-11-08T03:08:38.766Z AXApplication[Insomnia](-) AXMenuBar[](on)@1219,3,34,24 AXMenuBarItem[](on)@1219,3,34,24 AXWindow[Insomnia](-)@1220,32,91,44 AXButton[Time remaining/09:50](on)*focused*@1232,46,40,16 AXButton[End session](on)@1279,44,20,20

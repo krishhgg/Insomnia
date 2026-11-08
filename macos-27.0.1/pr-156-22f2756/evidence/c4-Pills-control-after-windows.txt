@@ -1,0 +1,7 @@
+id=301 pid=18033 owner=Insomnia layer=101 frame=(944.0, 9.0, 292.0, 117.0) title=
+id=5 pid=182 owner=Window Server layer=24 frame=(0.0, 0.0, 1440.0, 30.0) title=Menubar
+id=14 pid=358 owner=Dock layer=20 frame=(0.0, 0.0, 1440.0, 900.0) title=Dock
+id=25 pid=362 owner=Finder layer=0 frame=(260.0, 120.0, 920.0, 436.0) title=Applications
+id=41 pid=393 owner=Notification Center layer=-2147483601 frame=(8.0, 218.0, 360.0, 180.0) title=Featured
+id=40 pid=393 owner=Notification Center layer=-2147483601 frame=(188.0, 38.0, 180.0, 180.0) title=Forecast
+id=39 pid=393 owner=Notification Center layer=-2147483601 frame=(8.0, 38.0, 180.0, 180.0) title=Month

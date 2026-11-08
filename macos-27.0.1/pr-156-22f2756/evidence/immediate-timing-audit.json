@@ -1,0 +1,98 @@
+[
+  {
+    "trial": "c1-Compact-immediate-hid-1",
+    "mouse_hold_ms": 89.08486366271973,
+    "release_after_mouse_up_ms": 0.2129077911376953,
+    "down_epoch": 1794106630.1770191,
+    "up_epoch": 1794106630.266104,
+    "option_up_epoch": 1794106630.266317
+  },
+  {
+    "trial": "c1-Compact-immediate-hid-2",
+    "mouse_hold_ms": 95.29805183410645,
+    "release_after_mouse_up_ms": 0.45680999755859375,
+    "down_epoch": 1794106636.878967,
+    "up_epoch": 1794106636.974265,
+    "option_up_epoch": 1794106636.974722
+  },
+  {
+    "trial": "c1-Compact-immediate-hid-3",
+    "mouse_hold_ms": 100.79574584960938,
+    "release_after_mouse_up_ms": 0.4551410675048828,
+    "down_epoch": 1794106643.1028252,
+    "up_epoch": 1794106643.203621,
+    "option_up_epoch": 1794106643.204076
+  },
+  {
+    "trial": "c1-Compact-immediate-session-1",
+    "mouse_hold_ms": 92.66281127929688,
+    "release_after_mouse_up_ms": 0.4439353942871094,
+    "down_epoch": 1794106649.343995,
+    "up_epoch": 1794106649.436658,
+    "option_up_epoch": 1794106649.4371018
+  },
+  {
+    "trial": "c1-Compact-immediate-session-2",
+    "mouse_hold_ms": 88.98019790649414,
+    "release_after_mouse_up_ms": 0.29087066650390625,
+    "down_epoch": 1794106655.5795069,
+    "up_epoch": 1794106655.668487,
+    "option_up_epoch": 1794106655.668778
+  },
+  {
+    "trial": "c1-Compact-immediate-session-3",
+    "mouse_hold_ms": 97.66101837158203,
+    "release_after_mouse_up_ms": 0.4229545593261719,
+    "down_epoch": 1794106661.8311229,
+    "up_epoch": 1794106661.928784,
+    "option_up_epoch": 1794106661.9292068
+  },
+  {
+    "trial": "c1-Pills-immediate-hid-1",
+    "mouse_hold_ms": 92.73099899291992,
+    "release_after_mouse_up_ms": 0.1671314239501953,
+    "down_epoch": 1794106552.792609,
+    "up_epoch": 1794106552.88534,
+    "option_up_epoch": 1794106552.885507
+  },
+  {
+    "trial": "c1-Pills-immediate-hid-2",
+    "mouse_hold_ms": 97.06711769104004,
+    "release_after_mouse_up_ms": 0.4496574401855469,
+    "down_epoch": 1794106559.201019,
+    "up_epoch": 1794106559.2980862,
+    "option_up_epoch": 1794106559.2985358
+  },
+  {
+    "trial": "c1-Pills-immediate-hid-3",
+    "mouse_hold_ms": 90.56615829467773,
+    "release_after_mouse_up_ms": 0.2789497375488281,
+    "down_epoch": 1794106565.3481889,
+    "up_epoch": 1794106565.438755,
+    "option_up_epoch": 1794106565.439034
+  },
+  {
+    "trial": "c1-Pills-immediate-session-1",
+    "mouse_hold_ms": 96.56095504760742,
+    "release_after_mouse_up_ms": 0.44989585876464844,
+    "down_epoch": 1794106571.466788,
+    "up_epoch": 1794106571.563349,
+    "option_up_epoch": 1794106571.563799
+  },
+  {
+    "trial": "c1-Pills-immediate-session-2",
+    "mouse_hold_ms": 95.42584419250488,
+    "release_after_mouse_up_ms": 0.5021095275878906,
+    "down_epoch": 1794106577.636907,
+    "up_epoch": 1794106577.732333,
+    "option_up_epoch": 1794106577.732835
+  },
+  {
+    "trial": "c1-Pills-immediate-session-3",
+    "mouse_hold_ms": 92.05818176269531,
+    "release_after_mouse_up_ms": 0.4439353942871094,
+    "down_epoch": 1794106583.776517,
+    "up_epoch": 1794106583.868575,
+    "option_up_epoch": 1794106583.869019
+  }
+]

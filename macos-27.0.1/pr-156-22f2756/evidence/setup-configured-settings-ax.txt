@@ -1,0 +1,73 @@
+AXWindow|Insomnia Settings|standard window||475,30,490,794
+  AXGroup||group||475,62,490,762
+    AXScrollArea||scroll area||475,62,490,762
+      AXHeading||heading||505,-526,123,16
+      AXGroup||group||495,-500,450,154
+        AXStaticText|Turn off the display and keyboard backlight|text|Turn off the display and keyboard backlight|505,-490,262,16
+        AXCheckBox|Turn off the display and keyboard backlight|switch|1|899,-490,36,16
+        AXStaticText|Mute audio|text|Mute audio|505,-453,68,16
+        AXStaticText|On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic.|text|On Mac laptops with Apple silicon or a T2 chip, closing the lid disconnects the built-in microphone in hardware. Recording a meeting with the lid closed needs AirPods or an external mic.|505,-435,372,42
+        AXCheckBox|Mute audio|switch|1|899,-453,36,16
+        AXStaticText|Turn on Low Power Mode|text|Turn on Low Power Mode|505,-372,153,16
+        AXCheckBox|Turn on Low Power Mode|switch|1|899,-372,36,16
+      AXHeading||heading||505,-316,33,16
+      AXGroup||group||495,-290,450,150
+        AXStaticText|Keep running|text|Keep running|505,-280,81,16
+        AXStaticText|Terminal|text|Terminal|505,-262,45,14
+        AXStaticText|Freeze when lid closes|text|Freeze when lid closes|505,-227,138,16
+        AXStaticText|Slack|text|Slack|505,-209,29,14
+        AXButton||button||842,-174,93,24
+      AXHeading||heading||505,-110,47,16
+      AXGroup||group||495,-84,450,186
+        AXStaticText|Turn on Low Power Mode below|text|Turn on Low Power Mode below|505,-74,192,16
+        AXPopUpButton|Turn on Low Power Mode below|pop up button|40%|859,-77,76,24
+        AXStaticText|End the session below|text|End the session below|505,-35,135,16
+        AXStaticText|Stays below the Low Power Mode level. Moving one onto the other moves it along, and Never for Low Power Mode turns this off.|text|Stays below the Low Power Mode level. Moving one onto the other moves it along, and Never for Low Power Mode turns this off.|505,-17,333,42
+        AXPopUpButton|End the session below|pop up button|10%|861,-39,74,24
+        AXStaticText|Protect against overheating|text|Protect against overheating|505,45,167,16
+        AXStaticText|Turns on Low Power Mode when the Mac runs hot, and ends the session if it gets critically hot.|text|Turns on Low Power Mode when the Mac runs hot, and ends the session if it gets critically hot.|505,63,382,28
+        AXCheckBox|Protect against overheating|switch|1|899,46,36,16
+      AXHeading||heading||505,131,86,16
+      AXGroup||group||495,158,450,52
+        AXStaticText|Join an iPhone hotspot|text|Join an iPhone hotspot|505,167,139,16
+        AXStaticText|Not set up|text|Not set up|505,185,55,14
+        AXButton|Join an iPhone hotspot|button||859,164,76,24
+      AXHeading||heading||505,239,50,16
+      AXGroup||group||495,266,450,538
+        AXStaticText|Menu bar|text|Menu bar|505,275,58,16
+        AXStaticText|Duration pills and the countdown beside the eye.|text|Duration pills and the countdown beside the eye.|505,293,256,14
+        AXPopUpButton|Menu bar|pop up button|Pills|863,272,72,24
+        AXStaticText|Start a session with one click|text|Start a session with one click|505,328,176,16
+        AXStaticText|On: with no session running, a click starts the default length and Option-click opens the pills. Off: a click opens the pills.|text|On: with no session running, a click starts the default length and Option-click opens the pills. Off: a click opens the pills.|505,346,381,28
+        AXCheckBox|Start a session with one click|switch|1|899,329,36,16
+        AXStaticText|Default session length|text|Default session length|505,395,135,16
+        AXPopUpButton|Default session length|pop up button|10 minutes|822,392,113,24
+        AXStaticText|Default field|text|Default field|505,434,74,16
+        AXPopUpButton|Default field|pop up button|Hours|851,431,84,24
+        AXStaticText|Countdown|text|Countdown|505,472,70,16
+        AXPopUpButton|Countdown|pop up button|Time left|834,469,101,24
+        AXStaticText|Show the countdown in the menu bar|text|Show the countdown in the menu bar|505,511,226,16
+        AXStaticText|Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End session; click it to add time.|text|Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End session; click it to add time.|505,529,376,42
+        AXCheckBox|Show the countdown in the menu bar|switch|1|899,511,36,16
+        AXStaticText|Play a sound when you start or end a session|text|Play a sound when you start or end a session|505,592,273,16
+        AXStaticText|Only for a start or an end you ask for in the menu bar, and not while the displays sleep or the lid is closed.|text|Only for a start or an end you ask for in the menu bar, and not while the displays sleep or the lid is closed.|505,610,377,28
+        AXCheckBox|Play a sound when you start or end a session|switch|0|899,592,36,16
+        AXStaticText|Open at login|text|Open at login|505,659,81,16
+        AXCheckBox|Open at login|switch|0|899,659,36,16
+        AXStaticText|Version|text|Version|505,696,46,16
+        AXStaticText|0.1.0 (1)|text|0.1.0 (1)|897,699,38,13
+        AXButton||button||505,733,136,24
+        AXButton||button||649,733,145,24
+        AXStaticText|Asks GitHub when you click, and installs nothing. To upgrade, run the installer again.|text|Asks GitHub when you click, and installs nothing. To upgrade, run the installer again.|505,779,408,13
+      AXScrollBar||scroll bar|1|947,61,19,756
+        AXValueIndicator||value indicator|1|951,397,11,416
+        AXButton||increment arrow button||948,62,0,0
+        AXButton||decrement arrow button||948,62,0,0
+        AXButton||increment page button||951,813,11,0
+        AXButton||decrement page button||951,65,11,332
+  AXButton||close button||483,38,16,16
+  AXButton||zoom button||529,38,16,16
+    AXGroup||group||530,39,14,14
+      AXGroup||group||530,39,14,14
+  AXButton||minimize button||506,38,16,16
+  AXStaticText|Insomnia Settings|text|Insomnia Settings|557,38,121,16

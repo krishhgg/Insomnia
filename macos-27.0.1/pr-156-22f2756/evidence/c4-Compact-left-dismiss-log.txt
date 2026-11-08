@@ -1,0 +1,1 @@
+2026-11-08T03:04:57Z [error] insomnia: could not find a Wi-Fi port in networksetup -listallhardwareports

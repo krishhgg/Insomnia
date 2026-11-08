@@ -1,0 +1,2 @@
+epoch=1794107288.0338101 type=1 flags=0 option=false control=false target=355 window=5 point=(1237.0, 15.0)
+epoch=1794107288.6875591 type=2 flags=0 option=false control=false target=355 window=5 point=(1237.0, 15.0)

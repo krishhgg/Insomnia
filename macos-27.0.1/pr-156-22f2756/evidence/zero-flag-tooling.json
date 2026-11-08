@@ -1,0 +1,192 @@
+{
+  "required_valid_trials": 6,
+  "valid_trials": 0,
+  "diagnostic_attempts": [
+    {
+      "trial": "c4-Pills-control-noflags-1",
+      "posted_mouse_events": [
+        {
+          "before": "1794106794.957869053",
+          "after": "1794106794.957897902",
+          "type": "1",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        },
+        {
+          "before": "1794106795.053580999",
+          "after": "1794106795.053636074",
+          "type": "2",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "536870912",
+          "controlKeyBefore": "0"
+        }
+      ],
+      "delivered_mouse_events": [
+        "epoch=1794106794.959104 type=1 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)",
+        "epoch=1794106795.054792 type=2 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)"
+      ],
+      "app_mouse_events": [
+        "epoch=1794106794.966310024 stage=app-sendEvent type=1 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=1.369 window=4294967296",
+        "epoch=1794106794.967423916 stage=app-sendEvent type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=2.481 window=4294967296",
+        "epoch=1794106795.069403887 stage=app-sendEvent type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=0.010 window=4294967296"
+      ],
+      "valid_required_trial": false
+    },
+    {
+      "trial": "c4-Pills-control-noflags-2",
+      "posted_mouse_events": [
+        {
+          "before": "1794106810.443465948",
+          "after": "1794106810.443487883",
+          "type": "1",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        },
+        {
+          "before": "1794106810.539120913",
+          "after": "1794106810.539175987",
+          "type": "2",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "536870912",
+          "controlKeyBefore": "0"
+        }
+      ],
+      "delivered_mouse_events": [
+        "epoch=1794106810.448359 type=1 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)",
+        "epoch=1794106810.540236 type=2 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)"
+      ],
+      "app_mouse_events": [
+        "epoch=1794106810.456195116 stage=app-sendEvent type=1 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=0.180 window=4294967296",
+        "epoch=1794106810.457346916 stage=app-sendEvent type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=1.331 window=4294967296",
+        "epoch=1794106810.541825056 stage=app-sendEvent type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=0.007 window=4294967296"
+      ],
+      "valid_required_trial": false
+    },
+    {
+      "trial": "c4-Pills-control-noflags-annotated-diagnostic",
+      "posted_mouse_events": [
+        {
+          "before": "1794106903.860176086",
+          "after": "1794106903.860203028",
+          "type": "1",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        },
+        {
+          "before": "1794106903.952476025",
+          "after": "1794106903.952531099",
+          "type": "2",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        }
+      ],
+      "delivered_mouse_events": [
+        "epoch=1794106903.8604012 type=1 flags=536870912 option=false control=false target=362 window=0 point=(1232.0, 15.0)",
+        "epoch=1794106903.9529161 type=2 flags=536870912 option=false control=false target=362 window=0 point=(1232.0, 15.0)"
+      ],
+      "app_mouse_events": [],
+      "valid_required_trial": false
+    },
+    {
+      "trial": "c4-Pills-control-noflags-pid-diagnostic",
+      "posted_mouse_events": [
+        {
+          "before": "1794106981.631903887",
+          "after": "1794106981.631933928",
+          "type": "1",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        },
+        {
+          "before": "1794106981.727924109",
+          "after": "1794106981.727971077",
+          "type": "2",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        }
+      ],
+      "delivered_mouse_events": [
+        "epoch=1794106981.632165 type=1 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)",
+        "epoch=1794106981.728282 type=2 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)"
+      ],
+      "app_mouse_events": [],
+      "valid_required_trial": false
+    },
+    {
+      "trial": "c4-Pills-control-noflags-session-retry",
+      "posted_mouse_events": [
+        {
+          "before": "1794106853.578861952",
+          "after": "1794106853.578886986",
+          "type": "1",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        },
+        {
+          "before": "1794106853.673382998",
+          "after": "1794106853.673446894",
+          "type": "2",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "536870912",
+          "controlKeyBefore": "0"
+        }
+      ],
+      "delivered_mouse_events": [
+        "epoch=1794106853.579947 type=1 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)",
+        "epoch=1794106853.6746159 type=2 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)"
+      ],
+      "app_mouse_events": [
+        "epoch=1794106853.586086035 stage=app-sendEvent type=1 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=0.252 window=4294967296",
+        "epoch=1794106853.587194920 stage=app-sendEvent type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=1.359 window=4294967296",
+        "epoch=1794106853.688365936 stage=app-sendEvent type=2 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=0.007 window=4294967296"
+      ],
+      "valid_required_trial": false
+    },
+    {
+      "trial": "c4-Pills-control-noflags-targeted-diagnostic",
+      "posted_mouse_events": [
+        {
+          "before": "1794106953.499730110",
+          "after": "1794106953.499763966",
+          "type": "1",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        },
+        {
+          "before": "1794106953.597179890",
+          "after": "1794106953.597229004",
+          "type": "2",
+          "flags": "0",
+          "key": "0",
+          "combinedFlagsBefore": "537133056",
+          "controlKeyBefore": "1"
+        }
+      ],
+      "delivered_mouse_events": [
+        "epoch=1794106953.499998 type=1 flags=536870912 option=false control=false target=362 window=5 point=(1232.0, 15.0)",
+        "epoch=1794106953.5975451 type=2 flags=536870912 option=false control=false target=362 window=5 point=(1232.0, 15.0)"
+      ],
+      "app_mouse_events": [],
+      "valid_required_trial": false
+    }
+  ]
+}

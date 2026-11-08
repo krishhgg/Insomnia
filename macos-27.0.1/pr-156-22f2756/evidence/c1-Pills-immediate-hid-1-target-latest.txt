@@ -1,0 +1,3 @@
+id=2 pid=182 owner=Window Server layer=2147483630 frame=(1231.0, 10.0, 28.0, 40.0) title=Cursor
+id=5 pid=182 owner=Window Server layer=24 frame=(0.0, 0.0, 1440.0, 30.0) title=Menubar
+id=14 pid=358 owner=Dock layer=20 frame=(0.0, 0.0, 1440.0, 900.0) title=Dock

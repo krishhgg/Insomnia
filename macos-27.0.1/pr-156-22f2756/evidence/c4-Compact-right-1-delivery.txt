@@ -1,0 +1,4 @@
+epoch=1794107055.211849 type=3 flags=0 option=false control=false target=355 window=5 point=(1232.0, 15.0)
+epoch=1794107055.311576 type=4 flags=0 option=false control=false target=355 window=318 point=(1232.0, 15.0)
+epoch=1794107058.8498302 type=10 flags=0 option=false control=false target=18033 window=0 point=(1232.0, 15.0)
+epoch=1794107058.910249 type=11 flags=0 option=false control=false target=18033 window=0 point=(1232.0, 15.0)

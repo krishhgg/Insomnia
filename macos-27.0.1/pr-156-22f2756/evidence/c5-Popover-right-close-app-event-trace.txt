@@ -1,0 +1,4 @@
+epoch=1794107199.435034990 stage=app-sendEvent type=3 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=3.060 window=4294967296
+epoch=1794107199.435671091 stage=app-modifierFlags-read type=3 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=3.695 window=4294967296
+epoch=1794107199.436677933 stage=app-modifierFlags-read type=3 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=4.702 window=4294967296
+epoch=1794107199.438308001 stage=app-modifierFlags-read type=4 eventFlags=0 appHeldFlags=0 control=0 option=0 controlKey=0 optionKey=0 eventAgeMs=6.332 window=4294967296

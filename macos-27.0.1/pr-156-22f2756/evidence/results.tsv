@@ -1,0 +1,44 @@
+c1-Pills-immediate-hid-1	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-immediate-hid-2	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-immediate-hid-3	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-immediate-session-1	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-immediate-session-2	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-immediate-session-3	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-held	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Pills-flags	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c2-Pills-plain-after-option	PASS	duration 600, controls closed, SleepDisabled 1, starts 1
+c1-Compact-immediate-hid-1	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-immediate-hid-2	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-immediate-hid-3	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-immediate-session-1	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-immediate-session-2	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-immediate-session-3	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-held	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c1-Compact-flags	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c2-Compact-plain-after-option	PASS	duration 600, controls closed, SleepDisabled 1, starts 1
+c3-Popover-option-flags	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c3-Popover-option-keywrap	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c3-Popover-option-system	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c3-Popover-plain	PASS	duration 600, controls closed, SleepDisabled 1, starts 1
+c4-Pills-right-1	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Pills-right-2	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Pills-control	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Pills-left-dismiss	PASS	right-open menu count 1, left-dismiss menu count 0, session.json absent, SleepDisabled 0, starts 0
+c4-Compact-right-1	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Compact-right-2	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Compact-control	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Compact-left-dismiss	PASS	right-open menu count 1, left-dismiss menu count 0, session.json absent, SleepDisabled 0, starts 0
+c4-Minimal-right-1	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Minimal-right-2	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c4-Minimal-control	PASS	menu count before Esc 1, after Esc 0, session.json absent, SleepDisabled 0, starts 0
+c5-Popover-right-open	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c5-Popover-right-close	PASS	popover closed, session.json absent, SleepDisabled 0, starts 0
+c5-Popover-control-open	PASS	controls open, session.json absent, SleepDisabled 0, starts 0
+c5-Popover-control-close	PASS	popover closed, session.json absent, SleepDisabled 0, starts 0
+c6-Minimal-plain-hold	PASS	800 ms hold on confirmed 7200 s session; user ends 1, restorations 1, session.json absent, SleepDisabled 0
+c7-Pills-start	PASS	duration 600, controls closed, SleepDisabled 1, starts 1
+c7-Pills-hold-end	PASS	650 ms hold; user ends 1, restorations 1, session.json absent, SleepDisabled 0
+c7-Compact-start	PASS	duration 600, controls closed, SleepDisabled 1, starts 1
+c7-Compact-hold-end	PASS	650 ms hold; user ends 1, restorations 1, session.json absent, SleepDisabled 0
+c8-Pills-AXPress	KNOWN-GAP	AXPress returned success but had no visible effect; no session, SleepDisabled 0 and no controls. Same as prior run.
+c8-Compact-AXPress	KNOWN-GAP	AXPress returned success but had no visible effect; no session, SleepDisabled 0 and no controls. Same as prior run.

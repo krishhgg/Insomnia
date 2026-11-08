@@ -1,0 +1,627 @@
+epoch=1794106751.623987 poll-end left=false right=false
+epoch=1794106751.695228 poll-end left=false right=false
+epoch=1794106751.7588758 poll-end left=false right=false
+epoch=1794106751.81805 poll-end left=false right=false
+epoch=1794106751.880218 poll-end left=false right=false
+epoch=1794106751.936057 poll-end left=false right=false
+epoch=1794106751.991932 poll-end left=false right=false
+epoch=1794106752.0503201 poll-end left=false right=false
+epoch=1794106752.108698 poll-end left=false right=false
+epoch=1794106752.163645 poll-end left=false right=false
+epoch=1794106752.2210221 poll-end left=false right=false
+epoch=1794106752.277065 poll-end left=false right=false
+epoch=1794106752.3351278 poll-end left=false right=false
+epoch=1794106752.391519 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.391519 poll-end left=false right=true
+epoch=1794106752.448899 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.448899 poll-end left=false right=true
+epoch=1794106752.505539 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.505539 poll-end left=false right=false
+epoch=1794106752.561473 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.561473 poll-end left=false right=false
+epoch=1794106752.619916 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.619916 poll-end left=false right=false
+epoch=1794106752.682576 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.682576 poll-end left=false right=false
+epoch=1794106752.741149 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.741149 poll-end left=false right=false
+epoch=1794106752.800246 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.800246 poll-end left=false right=false
+epoch=1794106752.859329 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.859329 poll-end left=false right=false
+epoch=1794106752.915978 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.915978 poll-end left=false right=false
+epoch=1794106752.975879 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106752.975879 poll-end left=false right=false
+epoch=1794106753.041195 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.041195 poll-end left=false right=false
+epoch=1794106753.093148 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.093148 poll-end left=false right=false
+epoch=1794106753.151713 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.151713 poll-end left=false right=false
+epoch=1794106753.2112598 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.2112598 poll-end left=false right=false
+epoch=1794106753.27731 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.27731 poll-end left=false right=false
+epoch=1794106753.335088 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.335088 poll-end left=false right=false
+epoch=1794106753.392511 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.392511 poll-end left=false right=false
+epoch=1794106753.458853 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.458853 poll-end left=false right=false
+epoch=1794106753.51982 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.51982 poll-end left=false right=false
+epoch=1794106753.5825891 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.5825891 poll-end left=false right=false
+epoch=1794106753.642225 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.642225 poll-end left=false right=false
+epoch=1794106753.701159 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.701159 poll-end left=false right=false
+epoch=1794106753.765173 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.765173 poll-end left=false right=false
+epoch=1794106753.831661 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.831661 poll-end left=false right=false
+epoch=1794106753.894644 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.894644 poll-end left=false right=false
+epoch=1794106753.9571629 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106753.9571629 poll-end left=false right=false
+epoch=1794106754.0203109 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.0203109 poll-end left=false right=false
+epoch=1794106754.080316 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.080316 poll-end left=false right=false
+epoch=1794106754.138495 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.138495 poll-end left=false right=false
+epoch=1794106754.193894 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.193894 poll-end left=false right=false
+epoch=1794106754.254689 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.254689 poll-end left=false right=false
+epoch=1794106754.314626 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.314626 poll-end left=false right=false
+epoch=1794106754.376008 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.376008 poll-end left=false right=false
+epoch=1794106754.442096 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.442096 poll-end left=false right=false
+epoch=1794106754.501233 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.501233 poll-end left=false right=false
+epoch=1794106754.565162 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.565162 poll-end left=false right=false
+epoch=1794106754.629157 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.629157 poll-end left=false right=false
+epoch=1794106754.6938272 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.6938272 poll-end left=false right=false
+epoch=1794106754.756548 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.756548 poll-end left=false right=false
+epoch=1794106754.820516 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.820516 poll-end left=false right=false
+epoch=1794106754.872128 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.872128 poll-end left=false right=false
+epoch=1794106754.932585 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.932585 poll-end left=false right=false
+epoch=1794106754.989964 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106754.989964 poll-end left=false right=false
+epoch=1794106755.044955 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.044955 poll-end left=false right=false
+epoch=1794106755.101503 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.101503 poll-end left=false right=false
+epoch=1794106755.159761 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.159761 poll-end left=false right=false
+epoch=1794106755.213182 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.213182 poll-end left=false right=false
+epoch=1794106755.269171 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.269171 poll-end left=false right=false
+epoch=1794106755.334476 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.334476 poll-end left=false right=false
+epoch=1794106755.3991308 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.3991308 poll-end left=false right=false
+epoch=1794106755.461209 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.461209 poll-end left=false right=false
+epoch=1794106755.5202188 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.5202188 poll-end left=false right=false
+epoch=1794106755.579565 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.579565 poll-end left=false right=false
+epoch=1794106755.6407928 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.6407928 poll-end left=false right=false
+epoch=1794106755.698437 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.698437 poll-end left=false right=false
+epoch=1794106755.755001 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.755001 poll-end left=false right=false
+epoch=1794106755.811852 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.811852 poll-end left=false right=false
+epoch=1794106755.86719 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.86719 poll-end left=false right=false
+epoch=1794106755.928457 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.928457 poll-end left=false right=false
+epoch=1794106755.983988 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106755.983988 poll-end left=false right=false
+epoch=1794106756.0402188 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.0402188 poll-end left=false right=false
+epoch=1794106756.0918798 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.0918798 poll-end left=false right=false
+epoch=1794106756.153065 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.153065 poll-end left=false right=false
+epoch=1794106756.208399 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.208399 poll-end left=false right=false
+epoch=1794106756.267943 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.267943 poll-end left=false right=false
+epoch=1794106756.323451 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.323451 poll-end left=false right=false
+epoch=1794106756.378856 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.378856 poll-end left=false right=false
+epoch=1794106756.435632 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.435632 poll-end left=false right=false
+epoch=1794106756.495969 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.495969 poll-end left=false right=false
+epoch=1794106756.550575 id=297 layer=101 frame={
+    Height = 117;
+    Width = 292;
+    X = 944;
+    Y = 9;
+}
+epoch=1794106756.550575 poll-end left=false right=false
+epoch=1794106756.611609 poll-end left=false right=false
+epoch=1794106756.667571 poll-end left=false right=false
+epoch=1794106756.730612 poll-end left=false right=false
+epoch=1794106756.7860332 poll-end left=false right=false
+epoch=1794106756.841398 poll-end left=false right=false
+epoch=1794106756.898106 poll-end left=false right=false
+epoch=1794106756.950093 poll-end left=false right=false
+epoch=1794106757.01456 poll-end left=false right=false
+epoch=1794106757.06957 poll-end left=false right=false
+epoch=1794106757.1321359 poll-end left=false right=false
+epoch=1794106757.189221 poll-end left=false right=false
+epoch=1794106757.248568 poll-end left=false right=false
+epoch=1794106757.307733 poll-end left=false right=false
+epoch=1794106757.366849 poll-end left=false right=false
+epoch=1794106757.432598 poll-end left=false right=false
+epoch=1794106757.485927 poll-end left=false right=false
+epoch=1794106757.551836 poll-end left=false right=false
+epoch=1794106757.608169 poll-end left=false right=false
+epoch=1794106757.6715431 poll-end left=false right=false
+epoch=1794106757.728465 poll-end left=false right=false
+epoch=1794106757.786491 poll-end left=false right=false
+epoch=1794106757.848819 poll-end left=false right=false
+epoch=1794106757.903854 poll-end left=false right=false
+epoch=1794106757.9609032 poll-end left=false right=false
+epoch=1794106758.024941 poll-end left=false right=false
+epoch=1794106758.0874119 poll-end left=false right=false
+epoch=1794106758.149259 poll-end left=false right=false
+epoch=1794106758.207273 poll-end left=false right=false
+epoch=1794106758.263351 poll-end left=false right=false
+epoch=1794106758.319855 poll-end left=false right=false
+epoch=1794106758.382611 poll-end left=false right=false
+epoch=1794106758.444598 poll-end left=false right=false
+epoch=1794106758.501449 poll-end left=false right=false
+epoch=1794106758.554679 poll-end left=false right=false
+epoch=1794106758.6167321 poll-end left=false right=false
+epoch=1794106758.682502 poll-end left=false right=false
+epoch=1794106758.739665 poll-end left=false right=false
+epoch=1794106758.801929 poll-end left=false right=false
+epoch=1794106758.8599482 poll-end left=false right=false
+epoch=1794106758.9215379 poll-end left=false right=false
+epoch=1794106758.9818258 poll-end left=false right=false
+epoch=1794106759.0451741 poll-end left=false right=false
+epoch=1794106759.102141 poll-end left=false right=false
+epoch=1794106759.162508 poll-end left=false right=false
+epoch=1794106759.219168 poll-end left=false right=false
+epoch=1794106759.276686 poll-end left=false right=false
+epoch=1794106759.336065 poll-end left=false right=false
+epoch=1794106759.398974 poll-end left=false right=false
+epoch=1794106759.4600492 poll-end left=false right=false
+epoch=1794106759.5167398 poll-end left=false right=false
+epoch=1794106759.573639 poll-end left=false right=false
+epoch=1794106759.632471 poll-end left=false right=false
+epoch=1794106759.692208 poll-end left=false right=false
+epoch=1794106759.7493858 poll-end left=false right=false
+epoch=1794106759.807582 poll-end left=false right=false
+epoch=1794106759.8660169 poll-end left=false right=false
+epoch=1794106759.9185019 poll-end left=false right=false
+epoch=1794106759.980279 poll-end left=false right=false
+epoch=1794106760.036368 poll-end left=false right=false
+epoch=1794106760.0905209 poll-end left=false right=false
+epoch=1794106760.152635 poll-end left=false right=false
+epoch=1794106760.2079139 poll-end left=false right=false
+epoch=1794106760.27422 poll-end left=false right=false
+epoch=1794106760.336845 poll-end left=false right=false
+epoch=1794106760.401859 poll-end left=false right=false
+epoch=1794106760.46594 poll-end left=false right=false
+epoch=1794106760.525027 poll-end left=false right=false
+epoch=1794106760.58549 poll-end left=false right=false
+epoch=1794106760.645175 poll-end left=false right=false
+epoch=1794106760.71065 poll-end left=false right=false
+epoch=1794106760.775574 poll-end left=false right=false
+epoch=1794106760.837204 poll-end left=false right=false
+epoch=1794106760.900213 poll-end left=false right=false
+epoch=1794106760.959659 poll-end left=false right=false
+epoch=1794106761.024679 poll-end left=false right=false
+epoch=1794106761.089561 poll-end left=false right=false
+epoch=1794106761.146219 poll-end left=false right=false
+epoch=1794106761.2092218 poll-end left=false right=false
+epoch=1794106761.275261 poll-end left=false right=false
+epoch=1794106761.331598 poll-end left=false right=false
+epoch=1794106761.393157 poll-end left=false right=false
+epoch=1794106761.449296 poll-end left=false right=false
+epoch=1794106761.508332 poll-end left=false right=false
+epoch=1794106761.573174 poll-end left=false right=false
+epoch=1794106761.630118 poll-end left=false right=false
+epoch=1794106761.695609 poll-end left=false right=false
+epoch=1794106761.7526 poll-end left=false right=false
+epoch=1794106761.8185449 poll-end left=false right=false
+epoch=1794106761.879902 poll-end left=false right=false
+epoch=1794106761.945912 poll-end left=false right=false
+epoch=1794106762.002924 poll-end left=false right=false
+epoch=1794106762.068337 poll-end left=false right=false
+epoch=1794106762.127743 poll-end left=false right=false
+epoch=1794106762.179308 poll-end left=false right=false
+epoch=1794106762.241658 poll-end left=false right=false
+epoch=1794106762.297861 poll-end left=false right=false
+epoch=1794106762.3542938 poll-end left=false right=false
+epoch=1794106762.415957 poll-end left=false right=false
+epoch=1794106762.473225 poll-end left=false right=false
+epoch=1794106762.531297 poll-end left=false right=false
+epoch=1794106762.5901651 poll-end left=false right=false
+epoch=1794106762.650515 poll-end left=false right=false
+epoch=1794106762.715948 poll-end left=false right=false
+epoch=1794106762.7739658 poll-end left=false right=false
+epoch=1794106762.836911 poll-end left=false right=false
+epoch=1794106762.900433 poll-end left=false right=false
+epoch=1794106762.965952 poll-end left=false right=false
+epoch=1794106763.0236459 poll-end left=false right=false
+epoch=1794106763.08785 poll-end left=false right=false
+epoch=1794106763.1515079 poll-end left=false right=false
+epoch=1794106763.20815 poll-end left=false right=false
+epoch=1794106763.265959 poll-end left=false right=false
+epoch=1794106763.3293881 poll-end left=false right=false
+epoch=1794106763.3928308 poll-end left=false right=false
+epoch=1794106763.453229 poll-end left=false right=false
+epoch=1794106763.51012 poll-end left=false right=false
+epoch=1794106763.5761151 poll-end left=false right=false
