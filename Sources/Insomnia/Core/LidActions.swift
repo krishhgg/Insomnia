@@ -69,6 +69,7 @@ final class LidActions {
             Log.info("lid closed: no session, nothing to do")
             return
         }
+        if lidEvents == event { manager.cancelBrightnessReassert() }
         // One lifecycle transaction: journal writes and SIGSTOPs happen
         // under the recovery lock, after any end already in flight.
         let ran = await manager.runExclusive("lid close") { [self, manager] in
@@ -204,9 +205,11 @@ final class LidActions {
     /// closing lid. The entry is left undecided, as above, and the open
     /// does not take a 0 it reads as a level set since: only a reading
     /// above 0 decides that entry (`SessionManager.restoreDisplay`).
-    /// The keyboard reads 0 when suppressed by display sleep, so it takes
-    /// the current read if trusted now, else the last trusted sample, else
-    /// nothing, since restoring 0 would leave the backlight off for good.
+    /// A keyboard already at 0 is left alone unless a positive restore is
+    /// already owed. Both manual off and ambient auto-off can read 0, with
+    /// different suppression flags; neither needs another explicit off.
+    /// A positive current read is saved if trusted, otherwise a positive
+    /// sample is used. No zero becomes a new restore obligation.
     private func darkenSavingCurrent(_ manager: SessionManager) {
         do {
             let current = try display.readBrightness()
@@ -281,9 +284,12 @@ final class LidActions {
         do {
             if let current = try keyboard.readBrightness() {
                 let value: Float?
-                if sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed() {
+                if current == 0 {
+                    let owed = manager.effectiveState.savedKeyboardBrightness
+                    value = owed.flatMap { $0 > 0 ? $0 : nil }
+                } else if sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed() {
                     value = current
-                } else if let sampled = sampler?.last?.keyboard {
+                } else if let sampled = sampler?.last?.keyboard, sampled > 0 {
                     value = sampled
                     Log.info("keyboard backlight read while suppressed or dimmed (\(current)); journaling the last trusted sample \(sampled)")
                 } else {
@@ -304,7 +310,9 @@ final class LidActions {
                         Log.error("keyboard backlight off failed: \(error.localizedDescription)")
                     }
                 } else {
-                    Log.info("keyboard backlight suppressed by display sleep and no trusted sample; leaving it to macOS")
+                    Log.info(current == 0
+                        ? "keyboard backlight already reads zero; leaving its automatic or user-off state untouched"
+                        : "keyboard backlight has no positive restore value; leaving it to macOS")
                 }
             } else {
                 Log.info("no built-in keyboard backlight; skipped")
