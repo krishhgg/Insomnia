@@ -60,8 +60,8 @@ final class PlaceholderStatus: StatusSource {
 /// Pure formatting for the menu's status block, kept out of the views so
 /// it can be tested.
 enum StatusLines {
-    /// "Lid: closed · 4.1 W · Wi-Fi: iPhone". Unknown parts are omitted.
-    static func machine(lidClosed: Bool, watts: Double?, wifiSSID: String?, batteryPercent: Int?, isCharging: Bool) -> String {
+    /// "Lid: closed · 4.1 W · 82%". Unknown parts are omitted.
+    static func machine(lidClosed: Bool, watts: Double?, batteryPercent: Int?, isCharging: Bool) -> String {
         var parts: [String] = ["Lid: \(lidClosed ? "closed" : "open")"]
         if let w = watts {
             parts.append(String(format: "%.1f W", w))
@@ -69,10 +69,14 @@ enum StatusLines {
         if let p = batteryPercent {
             parts.append(isCharging ? "\(p)% charging" : "\(p)%")
         }
-        if let ssid = wifiSSID, !ssid.isEmpty {
-            parts.append("Wi-Fi: \(ssid)")
-        }
         return parts.joined(separator: " \u{00B7} ")
+    }
+
+    /// Wi-Fi gets its own row so a long network or permission status doesn't
+    /// widen the machine status line. Preserve the supplied display name.
+    static func network(wifiSSID: String?) -> String? {
+        guard let ssid = wifiSSID, !ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return "Wi-Fi: \(ssid)"
     }
 
     /// "3 apps frozen · Docker paused", or nil when nothing is held.

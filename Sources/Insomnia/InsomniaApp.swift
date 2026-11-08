@@ -1,17 +1,21 @@
 import AppKit
 import SwiftUI
 
-/// Menu bar app. The status item is an `NSStatusItem` hosting SwiftUI, and
-/// the settings window is an `NSWindow` this app opens itself (see
-/// `SettingsWindow`), so there is no SwiftUI scene with any content in it.
-/// `App` still requires one, hence the empty `Settings`. main.swift starts
-/// this app unless the command line asks for a one-shot mode first.
+/// One AppKit status item hosts every presentation. Compact opens an
+/// arrowless panel with the shared controls; mode changes never remove or
+/// replace the status item. Settings uses the app-owned SettingsWindow.
 struct InsomniaApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     var body: some Scene {
         Settings {
             EmptyView()
+        }
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings\u{2026}") { delegate.openSettings() }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
         }
     }
 }
@@ -30,6 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timeChange: TimeChangeObserver?
     private let sessionCommands = SessionCommandWatcher()
     private var terminating = false
+
+    func openSettings() {
+        statusItem?.menuOpenSettings()
+    }
 
     override init() {
         let manager = SessionManager.live()

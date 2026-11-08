@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import XCTest
 @testable import Insomnia
 
@@ -174,6 +175,52 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(after, fresh, "the changed frame must already read the new digits, not roll to them")
     }
 
+    /// The same for the countdown in the Compact panel, which shows the
+    /// running controls of the menu bar in a panel of its own.
+    @MainActor
+    func testTheCompactPanelCountdownChangesItsDigitsInOneStep() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let manager = h.makeManager()
+        manager.config.menuBarMode = .compact
+        await manager.start(duration: 4 * 3600)
+        let model = MenuBarModel()
+        model.phase = .running
+        let compact = CompactMenuModel()
+        compact.setPresented(true)
+
+        func makeHost() -> NSHostingView<CompactMenuView> {
+            let host = NSHostingView(rootView: CompactMenuView(
+                model: compact, menuBar: model, manager: manager,
+                onSubmit: {}, onEnd: {}, onDismiss: {}
+            ))
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            return host
+        }
+        func snapshot(_ host: NSHostingView<CompactMenuView>) -> Data {
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+                XCTFail("the countdown did not rasterise")
+                return Data()
+            }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            return rep.representation(using: .png, properties: [:]) ?? Data()
+        }
+
+        let host = makeHost()
+        let before = snapshot(host)
+        h.clock.advance(1)
+        manager.refreshCountdown()
+        XCTAssertEqual(manager.countdownText, "3:59:59")
+        let after = snapshot(host)
+        let fresh = snapshot(makeHost())
+
+        XCTAssertNotEqual(before, after, "the digits must change")
+        XCTAssertEqual(after, fresh, "the changed frame must already read the new digits, not roll to them")
+    }
+
     /// The blink was over in a handful of frames and barely read. It has to
     /// be slower than the baseline spring so the lid lift and the lash
     /// hand-over are seen, and slower than the Reduce Motion crossfade too.
@@ -284,17 +331,26 @@ final class UIStatusTests: XCTestCase {
 
     func testMachineLine() {
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: true, watts: 4.12, wifiSSID: "iPhone", batteryPercent: nil, isCharging: false),
-            "Lid: closed \u{00B7} 4.1 W \u{00B7} Wi-Fi: iPhone"
+            StatusLines.machine(lidClosed: true, watts: 4.12, batteryPercent: nil, isCharging: false),
+            "Lid: closed \u{00B7} 4.1 W"
         )
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: nil, batteryPercent: nil, isCharging: false),
+            StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: nil, isCharging: false),
             "Lid: open"
         )
         XCTAssertEqual(
-            StatusLines.machine(lidClosed: false, watts: nil, wifiSSID: "", batteryPercent: 82, isCharging: true),
+            StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: 82, isCharging: true),
             "Lid: open \u{00B7} 82% charging"
         )
+    }
+
+    func testNetworkLinePreservesStatusAndOmitsUnknownNames() {
+        XCTAssertEqual(StatusLines.network(wifiSSID: "iPhone"), "Wi-Fi: iPhone")
+        let hiddenName = WiFiStatusName.display(ssid: nil, locationAuthorized: false)
+        XCTAssertEqual(StatusLines.network(wifiSSID: hiddenName), "Wi-Fi: on (name hidden until Location is allowed)")
+        XCTAssertNil(StatusLines.network(wifiSSID: nil))
+        XCTAssertNil(StatusLines.network(wifiSSID: ""))
+        XCTAssertNil(StatusLines.network(wifiSSID: " \n "))
     }
 
     func testActionsLine() {
@@ -316,6 +372,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: true,
             sleepHeld: true,
             machine: "Lid: closed \u{00B7} 82%",
+            network: "Wi-Fi: iPhone",
             actions: "3 apps frozen",
             throttledBrowsers: [Self.chrome],
             error: nil
@@ -323,6 +380,7 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(items, [
             StatusMenu.Item(title: "Sleep held per journal \u{2014} not verified live", kind: .info),
             StatusMenu.Item(title: "Lid: closed \u{00B7} 82%", kind: .info),
+            StatusMenu.Item(title: "Wi-Fi: iPhone", kind: .info),
             StatusMenu.Item(title: "3 apps frozen", kind: .info),
             StatusMenu.Item(title: "\u{26A0} Chrome is throttled", kind: .warning),
             StatusMenu.Item(title: "Relaunch Chrome unthrottled", kind: .relaunchBrowser(Self.chrome)),
@@ -333,11 +391,92 @@ final class UIStatusTests: XCTestCase {
         ])
     }
 
+    @MainActor
+    func testScreenshotStatusUsesSeparateNativeMenuRows() throws {
+        let items = StatusMenu.items(
+            sessionActive: false,
+            sleepHeld: false,
+            machine: StatusLines.machine(lidClosed: false, watts: 0, batteryPercent: 100, isCharging: true),
+            network: StatusLines.network(wifiSSID: WiFiStatusName.display(ssid: nil, locationAuthorized: false)),
+            actions: nil,
+            throttledBrowsers: [ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome")],
+            error: nil
+        )
+        XCTAssertEqual(items, [
+            StatusMenu.Item(title: "Lid: open \u{00B7} 0.0 W \u{00B7} 100% charging", kind: .info),
+            StatusMenu.Item(title: "Wi-Fi: on (name hidden until Location is allowed)", kind: .info),
+            StatusMenu.Item(title: "\u{26A0} Google Chrome is throttled", kind: .warning),
+            StatusMenu.Item(title: "Relaunch Google Chrome unthrottled", kind: .relaunchBrowser(ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))),
+            StatusMenu.Item(title: "", kind: .separator),
+            StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
+            StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
+        ])
+
+        let menu = StatusMenu.menu(
+            items,
+            target: nil,
+            endSession: NSSelectorFromString("endSession"),
+            settings: NSSelectorFromString("settings"),
+            quit: NSSelectorFromString("quit"),
+            relaunchBrowser: NSSelectorFromString("relaunch:"),
+            stopWaitingForOutput: NSSelectorFromString("stopWaiting:")
+        )
+        XCTAssertEqual(menu.items.map { $0.accessibilityLabel() ?? $0.title }, items.map(\.title))
+        XCTAssertFalse(menu.autoenablesItems)
+        for entry in menu.items.prefix(2) {
+            XCTAssertFalse(entry.isEnabled)
+            XCTAssertNil(entry.action)
+            let row = try XCTUnwrap(entry.view as? StatusMenuLabel)
+            XCTAssertEqual(row.label.stringValue, entry.accessibilityLabel())
+            XCTAssertFalse(row.label.stringValue.contains("\n"))
+        }
+        XCTAssertEqual(menu.items[3].representedObject as? ThrottledBrowser, ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))
+        XCTAssertTrue(menu.items[3].isEnabled)
+        XCTAssertTrue(menu.items[4].isSeparatorItem)
+        XCTAssertEqual(menu.items[5].keyEquivalent, ",")
+        XCTAssertEqual(menu.items[6].keyEquivalent, "q")
+
+        let combined = StatusMenu.menu(
+            [StatusMenu.Item(title: items[0].title + " \u{00B7} " + items[1].title, kind: .info)] + Array(items.dropFirst(2)),
+            target: nil,
+            endSession: NSSelectorFromString("endSession"),
+            settings: NSSelectorFromString("settings"),
+            quit: NSSelectorFromString("quit"),
+            relaunchBrowser: NSSelectorFromString("relaunch:"),
+            stopWaitingForOutput: NSSelectorFromString("stopWaiting:")
+        )
+        menu.update()
+        combined.update()
+        XCTAssertLessThan(menu.size.width, combined.size.width, "Separate status rows reduce the native menu's width")
+    }
+
+    func testMenuOmitsAbsentOrEmptyNetworkRows() {
+        let networks: [String?] = [nil, "", " \n "]
+        for network in networks {
+            let items = StatusMenu.items(
+                sessionActive: false,
+                sleepHeld: false,
+                machine: "Lid: open",
+                network: network,
+                actions: nil,
+                throttledBrowsers: [],
+                error: nil
+            )
+            XCTAssertEqual(items, [
+                StatusMenu.Item(title: "Lid: open", kind: .info),
+                StatusMenu.Item(title: "", kind: .separator),
+                StatusMenu.Item(title: StatusMenu.settingsTitle, kind: .settings),
+                StatusMenu.Item(title: StatusMenu.quitTitle, kind: .quit),
+            ])
+        }
+    }
+
     func testIdleMenuIsJustSettingsAndQuitWithNoLeadingSeparator() {
         let items = StatusMenu.items(
             sessionActive: false,
             sleepHeld: false,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [],
             error: ""
@@ -354,6 +493,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: false,
             sleepHeld: false,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [],
             error: "sudo: a password is required"
@@ -462,6 +602,7 @@ final class UIStatusTests: XCTestCase {
             sessionActive: true,
             sleepHeld: true,
             machine: nil,
+            network: nil,
             actions: nil,
             throttledBrowsers: [Self.chrome, Self.arc],
             error: nil
@@ -643,6 +784,16 @@ final class UIStatusTests: XCTestCase {
         XCTAssertFalse(lab.model.slotsPresent)
     }
 
+    @MainActor
+    private func waitUntil(_ timeout: TimeInterval = 2, _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
     /// Opening puts the three slots in the layout before any pill shows
     /// (one relayout, one write); closing folds the pills with their
     /// stagger over an unchanged width and the slots leave once the last
@@ -678,11 +829,15 @@ final class UIStatusTests: XCTestCase {
         XCTAssertTrue(controller.model.slotsPresent, "the bar must not snap under a pill that is still visible")
         XCTAssertEqual(controller.widthTarget, pillsWidth)
         XCTAssertEqual(lab.probe.applied.count, written, "no width write before the slots leave")
-        try? await Task.sleep(for: .milliseconds(Int(Motion.retractSettleDuration * 1000) + 100))
-        XCTAssertFalse(controller.model.slotsPresent)
+        // The slots leave on a timer, and the native width lands a settle
+        // after the layout's report (StatusItemWidthMotion): wait for each,
+        // with a bound, since a loaded runner stretches both delays.
+        let left = await waitUntil { !controller.model.slotsPresent }
+        XCTAssertTrue(left, "the slots leave once the last pill has settled")
         XCTAssertFalse(controller.model.pillsCollapsing, "the fold ends with the slots")
         XCTAssertEqual(controller.model.phase, .idle)
-        try? await Task.sleep(for: .milliseconds(100))
+        let landed = await waitUntil { lab.probe.applied.count > written }
+        XCTAssertTrue(landed, "the width is written after the slots leave")
         XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .idle), "the width moves on the layout's report")
         XCTAssertEqual(lab.probe.applied.count, written + 1, "one write, after the slots left")
         XCTAssertEqual(lab.probe.applied.last, controller.widthTarget)
@@ -845,9 +1000,13 @@ final class UIStatusTests: XCTestCase {
             StatusRootView.countdownText(pending: controller.model.pendingCountdown, live: lab.manager.countdownText, phase: controller.model.phase),
             controller.model.pendingCountdown
         )
-        try? await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .starting), "the width snaps once, after the slots left")
+        // Removing the slots retargets the eye; its reserved native width
+        // remains until that return animation finishes, then releases once.
+        let widthSettle = Motion.itemResizeDuration + Motion.collapseSettleMargin
+        try? await Task.sleep(for: .seconds(widthSettle + 0.1))
+        XCTAssertEqual(controller.widthTarget, lab.widthWithoutSlots(phase: .starting), "the width retargets once, after the slots left")
         XCTAssertEqual(lab.probe.applied.count, written + 1)
+        XCTAssertEqual(lab.probe.applied.last, controller.widthTarget, "the native reservation releases after the eye arrives")
         XCTAssertEqual(lab.probe.writesWhileFolding, 0, lab.probe.foldingWrites.joined(separator: "; "))
 
         await gate.open()
@@ -1035,7 +1194,16 @@ final class UIStatusTests: XCTestCase {
         await lab.settleClose()
         XCTAssertFalse(controller.model.slotsPresent)
         XCTAssertNil(controller.model.startError, "cleared with the slots")
+        // The layout reports after the slots leave, then the eye's return
+        // animation releases its native reservation. Observe that write;
+        // the fold's fixed wait alone cannot prove both callbacks ran.
+        let widthBy = Date().addingTimeInterval(5)
+        while (lab.probe.applied.count == written || lab.probe.applied.last != controller.widthTarget), Date() < widthBy {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertEqual(lab.probe.applied.count, written + 1, "one write, after the slots left")
+        XCTAssertEqual(lab.probe.applied.last, controller.widthTarget, "the native reservation reached the reported width")
+        XCTAssertEqual(lab.probe.slotsAtWrite.last, false, "the write happened after the slots left")
         XCTAssertEqual(lab.probe.writesWhileFolding, 0, lab.probe.foldingWrites.joined(separator: "; "))
         let confirmBy = Date().addingTimeInterval(2)
         while controller.model.phase != .running, Date() < confirmBy {

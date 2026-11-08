@@ -4,9 +4,8 @@ import SwiftUI
 /// Owns the NSStatusItem and drives every state change of the menu bar UI.
 ///
 /// The status bar button hosts a SwiftUI view and the item's length is
-/// written once to whatever that view fits into (`StatusWidthWriter`); there is no
-/// popover, so the status item is the whole interface apart from a
-/// right-click NSMenu.
+/// written once to whatever that view fits into (`StatusWidthWriter`).
+/// Compact mode moves the same controls into an arrowless AppKit panel.
 /// Keyboard input never reaches a text field inside a status bar window, so
 /// a local key monitor routes digits / Tab / Enter / Esc / Delete to the
 /// focused pill while the pills are open.
@@ -19,6 +18,7 @@ final class StatusItemController: NSObject {
     let manager: SessionManager
     let status: any StatusSource
     let model = MenuBarModel()
+    let compactModel = CompactMenuModel()
     let reminder = ReminderScheduler()
     /// Opens the settings window. Injected because the window is owned by the
     /// app delegate, which outlives any one status item.
@@ -33,8 +33,23 @@ final class StatusItemController: NSObject {
     private let clock: @Sendable () -> Date
 
     private let statusItem: NSStatusItem
+    /// Stable identity across all modes, including Compact.
+    var nativeStatusItem: NSStatusItem { statusItem }
     private var hostingView: StatusHostingView?
     private var widthWriter: StatusWidthWriter?
+    private(set) var compactDropdown: CompactDropdownController?
+    private var appliedMenuBarMode: Config.MenuBarMode?
+    /// Keep clicks disabled through restoration even when the manager has
+    /// already cleared its session, including a mode change during the wait.
+    /// The Compact panel gets it as well, since a Pills end leaves the
+    /// panel's `isBusy` alone, together with the manager's own end
+    /// (`syncCompactEnding`).
+    private var sessionEndPending = false {
+        didSet {
+            model.isEnding = sessionEndPending
+            syncCompactEnding()
+        }
+    }
 
     private var keyMonitor: Any?
     private var localMouseMonitor: Any?
@@ -53,6 +68,8 @@ final class StatusItemController: NSObject {
     /// take and then jump on confirmation. The end time has nothing to tick.
     private var pendingTick: Timer?
     var pendingTickArmed: Bool { pendingTick != nil }
+    /// Redraw of Minimal's arc between session changes. See `syncMinimalTick`.
+    private(set) var minimalTick: Timer?
     /// Invalidates in-flight stagger steps when expand/collapse interleave.
     private var stageGeneration = 0
     /// Identifies the run whose completion is allowed to touch the UI. The
@@ -90,10 +107,245 @@ final class StatusItemController: NSObject {
         statusItem.autosaveName = Self.autosaveName
         statusItem.behavior = [.terminationOnRemoval]
         super.init()
+        statusItem.isVisible = true
         installHostingView()
         observeManager()
         observeCountdownStyle()
         observeDisplaySleep()
+        observePresentation()
+        observeMinimalProgress()
+        observeEnding()
+    }
+
+    /// Settings take effect immediately, independently of countdown updates.
+    private func observePresentation() {
+        withObservationTracking {
+            _ = manager.config.menuBarMode
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.observePresentation() }
+        }
+        synchronizePresentation()
+    }
+
+    /// Change presentation without cancelling session work already in flight.
+    func synchronizePresentation() {
+        let mode = manager.config.menuBarMode
+        let compact = mode == .compact
+        guard appliedMenuBarMode != mode else { return }
+        let previous = appliedMenuBarMode
+        appliedMenuBarMode = mode
+        // A presentation change must not leave a delayed Pills
+        // reservation to land after Compact or Minimal takes over.
+        model.widthMotion?.retarget(widthTarget, reduceMotion: true)
+        refreshMinimalProgress()
+        syncMinimalTick()
+        guard previous != nil else { return }
+        // Folding slots can outlive a successful submission; only transfer
+        // an unfinished entry or a request still awaiting confirmation.
+        if compact, model.phase.isEntering || model.phase == .starting || compactModel.isBusy {
+            compactModel.isEditing = model.phase.isEntering
+            compactModel.entry.input = model.input
+            compactModel.entry.focused = model.focused
+        }
+        closeCompactDropdown()
+        stageGeneration += 1
+        removeMonitors()
+        model.slotsPresent = false
+        model.visiblePills = 0
+        model.pillsCollapsing = false
+        model.focusVisible = false
+        model.startError = nil
+        if model.phase != .starting {
+            model.phase = Self.collapseTarget(sessionActive: manager.isActive)
+        }
+    }
+
+    // MARK: Compact dropdown
+
+    func makeCompactDropdown() -> CompactDropdownController {
+        if let compactDropdown { return compactDropdown }
+        let content = CompactMenuView(
+            model: compactModel, menuBar: model, manager: manager,
+            onSubmit: { [weak self] in self?.compactSubmit() },
+            onEnd: { [weak self] in self?.compactEnd() },
+            onDismiss: { [weak self] in self?.closeCompactDropdown() },
+            onContentSizeChange: { [weak self] size in self?.compactDropdown?.updateContentSize(size) }
+        )
+        let menu = CompactStatusMenu(
+            manager: manager, status: status,
+            performAction: { [weak self] in self?.performMenuAction($0) },
+            refresh: { [weak self] in self?.refreshMenuStatus() }
+        )
+        let dropdown = CompactDropdownController(content: AnyView(content.contextMenu { menu })) { [weak self] in
+            self?.compactModel.setPresented(false)
+            self?.button?.highlight(false)
+        }
+        compactDropdown = dropdown
+        return dropdown
+    }
+
+    func closeCompactDropdown(returnFocus: Bool = true) {
+        compactDropdown?.close(returnFocus: returnFocus)
+        compactModel.setPresented(false)
+        button?.highlight(false)
+    }
+
+    func compactSubmit() {
+        guard manager.config.compactMode, !compactModel.isBusy, !compactModel.isEnding, model.phase != .starting else { return }
+        let mode: MenuBarModel.Mode = manager.isActive ? .extend : .start
+        switch MenuBarModel.commitAction(mode: mode, typed: compactModel.entry.input.total, defaultPreset: manager.config.defaultPreset) {
+        case let .run(duration):
+            compactModel.error = nil
+            model.input = compactModel.entry.input
+            run(mode: mode, duration: duration)
+        case .reject:
+            compactModel.entry.rejectBounce += 1
+        }
+    }
+
+    func compactEnd() {
+        guard manager.config.compactMode, compactModel.endIsEnabled else { return }
+        endPresentedSession()
+    }
+
+    /// The panel shows every end, not only one this controller asked for:
+    /// the timer's, a floor's or `--session end`'s, and one the manager
+    /// left to its retry after it cleared the session.
+    private func observeEnding() {
+        withObservationTracking {
+            _ = manager.isEnding
+            _ = manager.endIsWaiting
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.observeEnding() }
+        }
+        syncCompactEnding()
+    }
+
+    private func syncCompactEnding() {
+        compactModel.isEnding = sessionEndPending || manager.isEnding
+        compactModel.endCanBeRetried = !sessionEndPending && manager.endIsWaiting
+    }
+
+    // MARK: Minimal mode
+
+    /// A short click starts or extends by the one duration chosen in Settings.
+    /// Repeated additions wait for confirmation; cancellation remains available.
+    private func minimalTap() {
+        guard manager.config.menuBarMode == .minimal,
+              !model.minimalBusy, !compactModel.isBusy, !sessionEndPending, model.phase != .starting else { return }
+        let duration = manager.config.defaultPreset
+        // The session manager records the requested seconds as an Int.
+        // Settings cannot produce this value, but a hand-edited config can.
+        guard duration.isFinite, duration > 0, duration < Double(Int.max) else { return }
+        // A mode change during startup can expose the retry pills. Keep
+        // those on the submitted preset rather than an older typed draft.
+        // Bound before converting to integer minutes, including a manually
+        // edited preset larger than DurationInput can represent.
+        let inputDuration = min(duration, TimeInterval(DurationInput.maxDays) * 86400)
+        model.input = DurationInput.from(seconds: inputDuration)
+        model.startError = nil
+        compactModel.error = nil
+        run(mode: manager.isActive ? .extend : .start, duration: duration)
+    }
+
+    /// The completed hold uses the same journal-backed end operation as the
+    /// other modes. A release after this hold must never add time or restart.
+    private func minimalEnd() {
+        guard manager.config.menuBarMode == .minimal else { return }
+        endPresentedSession()
+    }
+
+    /// Compact and Minimal expose cancellation as soon as a start is submitted.
+    /// The manager invalidates the pending transaction and restores its journal;
+    /// a second submission stays blocked until that operation returns.
+    private func endPresentedSession() {
+        guard !sessionEndPending, manager.isActive || model.phase == .starting else { return }
+        // Also invalidate a run whose Task has not entered the manager yet.
+        // Otherwise it could start after this end captured the lifecycle queue.
+        startGeneration += 1
+        sessionEndPending = true
+        model.minimalBusy = true
+        compactModel.isBusy = true
+        compactModel.error = nil
+        stopPendingTick()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await manager.end(reason: .user)
+            model.pendingCountdown = nil
+            model.pendingProjection = nil
+            model.phase = Self.collapseTarget(sessionActive: manager.isActive)
+            if !manager.isActive {
+                compactModel.isEditing = false
+                compactModel.entry.input = DurationInput()
+                compactModel.entry.focused = manager.config.defaultFocusField
+            }
+            // Update the settled presentation before reenabling interaction.
+            sessionEndPending = false
+            model.minimalBusy = false
+            compactModel.isBusy = false
+            refreshMinimalProgress()
+        }
+    }
+
+    /// The arc follows a start, an extension or an end at once, and its own
+    /// slow tick in between. It reads the session's times, not the countdown
+    /// text, which never changes between sessions with the end-time style.
+    private func observeMinimalProgress() {
+        withObservationTracking {
+            _ = manager.session
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.observeMinimalProgress() }
+        }
+        refreshMinimalProgress()
+        syncMinimalTick()
+    }
+
+    /// The arc is 300 degrees of a 20 pt ring: about 46 pt, so a second of an
+    /// hour-long session moves it far less than a pixel. It redraws about
+    /// every hundredth of the session instead, from 2 s up to 60 s. Runs
+    /// only in Minimal, with a session, while a display is awake, like the
+    /// tick of a pending start. A wake redraws at once (`observeDisplaySleep`).
+    private func syncMinimalTick() {
+        guard manager.config.menuBarMode == .minimal, let session = manager.session,
+              !manager.displaysAsleep else {
+            stopMinimalTick()
+            return
+        }
+        let interval = Self.minimalTickInterval(for: session)
+        // Keep a tick already running at this pace, so unrelated changes do
+        // not push its next redraw back.
+        if let minimalTick, minimalTick.timeInterval == interval { return }
+        stopMinimalTick()
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            MainActor.assumeIsolated { self.refreshMinimalProgress() }
+        }
+        timer.tolerance = interval / 10
+        RunLoop.main.add(timer, forMode: .common)
+        minimalTick = timer
+    }
+
+    private func stopMinimalTick() {
+        minimalTick?.invalidate()
+        minimalTick = nil
+    }
+
+    static func minimalTickInterval(for session: Session) -> TimeInterval {
+        let total = session.endsAt.timeIntervalSince(session.startedAt)
+        guard total.isFinite, total > 0 else { return 60 }
+        return min(max(total / 100, 2), 60)
+    }
+
+    private func refreshMinimalProgress() {
+        model.minimalProgress = manager.config.menuBarMode == .minimal
+            ? Self.minimalProgress(session: manager.session, now: clock()) : nil
+    }
+
+    static func minimalProgress(session: Session?, now: Date) -> Double? {
+        guard let session else { return nil }
+        let total = session.endsAt.timeIntervalSince(session.startedAt)
+        guard total.isFinite, total > 0 else { return 0 }
+        return min(1, max(0, session.remaining(at: now) / total))
     }
 
     // MARK: Status item
@@ -110,8 +362,11 @@ final class StatusItemController: NSObject {
 
     private func installHostingView() {
         guard let button = statusItem.button else { return }
-        let apply: (CGFloat) -> Void = { [statusItem] width in statusItem.length = width }
+        let apply: (CGFloat) -> Void = { [weak statusItem] width in statusItem?.length = width }
         widthWriter = makeWidthWriter?(apply) ?? StatusWidthWriter(apply: apply)
+        if let widthWriter {
+            model.widthMotion = StatusItemWidthMotion(writer: widthWriter)
+        }
         let root = StatusRootView(
             model: model,
             manager: manager,
@@ -122,14 +377,13 @@ final class StatusItemController: NSObject {
             onWidthChange: { [weak self] w in self?.widthChanged(w) }
         )
         let host = Self.makeHostingView(root)
-        host.onRightMouseDown = { [weak self] in self?.showMenu() }
+        host.onRightMouseDown = { [weak self] event in self?.showMenu(event: event) }
         host.translatesAutoresizingMaskIntoConstraints = true
         // The height follows the button; the width is set from the layout
         // (`retargetWidth`) and never from the button, whose width is the
         // item's length: the content is laid out once at its own width,
-        // anchored at the leading edge, and the item's window reveals or
-        // clips it.
-        host.autoresizingMask = [.height]
+        // anchored at the leading edge. The root compensates for the
+        // native window's move while its visible width animates.
         host.frame = NSRect(x: 0, y: 0, width: 0, height: button.bounds.height)
         button.addSubview(host)
         button.title = ""
@@ -152,6 +406,7 @@ final class StatusItemController: NSObject {
     static func makeHostingView(_ root: StatusRootView) -> StatusHostingView {
         let host = StatusHostingView(rootView: root)
         host.sizingOptions = [.intrinsicContentSize]
+        host.autoresizingMask = [.height]
         return host
     }
 
@@ -171,19 +426,19 @@ final class StatusItemController: NSObject {
         retargetWidth(width)
     }
 
-    /// Set the item's length to `width`, once; a repeat of the current
-    /// target is ignored. The host only ever grows: it is laid out at the
-    /// widest content it has held, so content on its way out always has
-    /// room to finish its transition when the length narrows over it.
+    /// Reserve native space once, then animate the Pills content inside it.
+    /// A shrink releases space only after the eye arrives. The host only
+    /// grows, preserving room for departing controls throughout the reveal.
     private func retargetWidth(_ width: CGFloat) {
         let w = max(width.rounded(.up), 24)
-        guard w != widthTarget else { return }
-        widthTarget = w
-        widthTargetChangeCount += 1
-        if let host = hostingView, host.frame.width < w {
-            host.frame.size.width = w
+        if w != widthTarget {
+            widthTarget = w
+            widthTargetChangeCount += 1
+            if let host = hostingView, host.frame.width < w {
+                host.frame.size.width = w
+            }
         }
-        widthWriter?.write(w)
+        model.widthMotion?.retarget(w, reduceMotion: reduceMotion || manager.config.menuBarMode != .pills)
     }
 
     /// Take the pills away and land on `landing()`'s layout, read when the
@@ -256,8 +511,12 @@ final class StatusItemController: NSObject {
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                if !self.manager.displaysAsleep { self.refreshPendingCountdown() }
+                if !self.manager.displaysAsleep {
+                    self.refreshPendingCountdown()
+                    self.refreshMinimalProgress()
+                }
                 self.syncPendingTick()
+                self.syncMinimalTick()
                 self.observeDisplaySleep()
             }
         }
@@ -323,6 +582,23 @@ final class StatusItemController: NSObject {
     // MARK: Clicks
 
     func iconTapped() {
+        if manager.config.compactMode {
+            guard let button else { return }
+            let dropdown = makeCompactDropdown()
+            if dropdown.isShown {
+                closeCompactDropdown()
+            } else {
+                compactModel.focusDefaultFieldIfUntouched(manager.config.defaultFocusField)
+                compactModel.setPresented(true)
+                dropdown.show(relativeTo: button)
+                button.highlight(dropdown.isShown)
+            }
+            return
+        }
+        if manager.config.menuBarMode == .minimal {
+            minimalTap()
+            return
+        }
         model.iconBounce += 1
         switch model.phase {
         case .idle:
@@ -350,6 +626,7 @@ final class StatusItemController: NSObject {
     // MARK: Expand / collapse
 
     func expand(mode: MenuBarModel.Mode) {
+        guard manager.config.menuBarMode == .pills, !sessionEndPending else { return }
         // Reopened under a fold (the generation bump in `stagePills` drops
         // its landing): end the fold first, before any state below can
         // change the layout. Clearing the error label, say, can make the
@@ -484,39 +761,7 @@ final class StatusItemController: NSObject {
     func focus(_ field: DurationInput.Field) {
         guard model.phase.isEntering else { return }
         keyCatcher?.takeFocus()
-        withAnimation(Motion.snappy(reduceMotion: reduceMotion)) {
-            model.focused = field
-            model.focusVisible = true
-        }
-        model.focusBounce += 1
-    }
-
-    private func typeDigit(_ digit: Int) {
-        let field = model.focused
-        withAnimation(Motion.base(reduceMotion: reduceMotion)) {
-            if model.input.append(digit: digit, to: field) {
-                if !model.input.canAcceptDigit(in: field), field != .minutes {
-                    focusAfterTyping(field.next)
-                }
-            } else {
-                model.rejectBounce += 1
-            }
-        }
-    }
-
-    private func focusAfterTyping(_ field: DurationInput.Field) {
-        model.focused = field
-        model.focusBounce += 1
-    }
-
-    private func backspace() {
-        let field = model.focused
-        withAnimation(Motion.base(reduceMotion: reduceMotion)) {
-            if !model.input.backspace(field), field != .days {
-                model.focused = field.previous
-                model.focusBounce += 1
-            }
-        }
+        model.applyInput(.focus(field), reduceMotion: reduceMotion)
     }
 
     // MARK: Commit
@@ -537,6 +782,11 @@ final class StatusItemController: NSObject {
     }
 
     private func run(mode: MenuBarModel.Mode, duration: TimeInterval) {
+        guard !sessionEndPending else { return }
+        let submittedFromCompact = manager.config.compactMode
+        compactModel.error = nil
+        compactModel.isBusy = true
+        model.minimalBusy = true
         removeMonitors()
         startGeneration += 1
         let generation = startGeneration
@@ -562,8 +812,8 @@ final class StatusItemController: NSObject {
             // No session yet: the manager has to arm the recovery agent and
             // disable sleep first, and either can take seconds or refuse. Show
             // the countdown the session will read the moment it is confirmed,
-            // ticking meanwhile; the phase stays pending, so nothing that acts
-            // on a session (the end ring) is drawn until then.
+            // ticking meanwhile. Pills waits for confirmation to
+            // show its end ring; Compact and Minimal can cancel this request.
             let projection = MenuBarModel.projectedStart(
                 now: now,
                 duration: duration,
@@ -583,14 +833,19 @@ final class StatusItemController: NSObject {
         withAnimation(Motion.base(reduceMotion: reduceMotion)) {
             model.focusVisible = false
         }
-        retract { [model] in model.phase }
+        if manager.config.menuBarMode == .pills {
+            retract { [model] in model.phase }
+        }
 
         Task { @MainActor in
+            guard generation == startGeneration else { return }
             switch mode {
             case .start: await manager.start(duration: duration)
             case .extend: await manager.extend(by: duration)
             }
             guard generation == startGeneration else { return }
+            compactModel.isBusy = false
+            model.minimalBusy = sessionEndPending
             stopPendingTick()
             model.pendingCountdown = nil
             model.pendingProjection = nil
@@ -601,10 +856,24 @@ final class StatusItemController: NSObject {
                 if model.phase == .starting {
                     model.phase = .running
                 }
+                if manager.lastError == nil {
+                    compactModel.isEditing = false
+                    compactModel.entry.input = DurationInput()
+                    compactModel.entry.focused = manager.config.defaultFocusField
+                } else if submittedFromCompact || manager.config.compactMode {
+                    compactModel.isEditing = true
+                }
             } else if model.phase == .starting {
                 // Start refused: bring the pills back with the value intact
                 // and say so. The full reason is in the right-click menu.
-                reopenAfterFailure(mode: .start)
+                if manager.config.menuBarMode != .pills {
+                    model.phase = .idle
+                    compactModel.error = manager.lastError == nil ? MenuBarModel.startFailedText : nil
+                } else {
+                    reopenAfterFailure(mode: .start)
+                }
+            } else if submittedFromCompact {
+                compactModel.error = manager.lastError == nil ? "The session ended before it could be extended." : nil
             }
         }
     }
@@ -679,14 +948,24 @@ final class StatusItemController: NSObject {
     // MARK: Session actions
 
     private func endNow() {
+        guard !sessionEndPending else { return }
+        sessionEndPending = true
+        model.minimalBusy = true
         Task { @MainActor in
             await manager.end(reason: .user)
+            sessionEndPending = false
+            model.minimalBusy = compactModel.isBusy
         }
     }
 
-    /// The status item's hold-to-end ring completed. Ignored while a start is
-    /// still in flight.
+    /// The status item's hold-to-end gesture completed. Minimal can cancel
+    /// startup; Pills keeps its confirmed-session behavior.
     func holdToEnd() {
+        guard !sessionEndPending else { return }
+        if manager.config.menuBarMode == .minimal {
+            minimalEnd()
+            return
+        }
         guard manager.isActive else { return }
         endNow()
     }
@@ -700,14 +979,23 @@ final class StatusItemController: NSObject {
 
     // MARK: Right-click menu
 
-    /// Right-click (or ctrl-click) on the status item. Not assigned to
-    /// `statusItem.menu`, which would swallow the left click the pills need.
-    private func showMenu() {
+    /// Secondary clicks use a contextual menu. Assigning `statusItem.menu`
+    /// instead selects the regular menu-bar presentation and its material.
+    private func showMenu(event: NSEvent) {
         guard let button else { return }
+        showMenu(from: button, event: event)
+    }
+
+    private func showMenu(from button: NSView, event: NSEvent) {
+        let dropdown = compactDropdown?.isShown == true ? compactDropdown : nil
+        closeCompactDropdown(returnFocus: false)
         let typingPanel = keyCatcher
         collapse(returnFocus: false)
         defer {
-            if NSApp.keyWindow == nil { typingPanel?.returnFocus() }
+            if NSApp.keyWindow == nil {
+                typingPanel?.returnFocus()
+                dropdown?.returnFocus()
+            }
         }
         // The lid, the battery and the watts are read right here, so the menu
         // opens on what the machine is doing now. The SSID and the throttled
@@ -715,15 +1003,7 @@ final class StatusItemController: NSObject {
         // awaited, and an open NSMenu blocks the main actor, so there is no
         // moment at which they could be filled into a menu that is already up.
         // Kick that scan off anyway, for the next opening.
-        status.refreshInstant()
-        status.refreshOnDemand()
-        // Same for the foreign-sleep line: re-read the bit now, and let the
-        // next opening drop the line if sleep is enabled again.
-        Task { await manager.recheckForeignSleep() }
-        // The time left is read now too: the redraw timer stops while the
-        // lid is closed, and the menu can open then on an external display.
-        // Nothing ticks it at all while the bar shows the end time.
-        manager.refreshCountdown()
+        refreshMenuStatus()
         let menu = StatusMenu.menu(
             Self.menuItems(manager: manager, status: status),
             target: self,
@@ -733,29 +1013,55 @@ final class StatusItemController: NSObject {
             relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
             stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:))
         )
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+        // Pass the original event so AppKit chooses contextual-menu chrome
+        // and placement, including Control-click and mirrored menu bars.
+        // The status item stays free to handle its ordinary primary click.
+        NSMenu.popUpContextMenu(menu, with: event, for: button)
+    }
+
+    /// Refresh both menu presentations through the same path, including
+    /// the upstream recovery status that may change outside Insomnia.
+    func refreshMenuStatus() {
+        status.refreshInstant()
+        status.refreshOnDemand()
+        // An open AppKit menu blocks the main actor; this scan updates the
+        // next opening if the foreign sleep setting has since been cleared.
+        Task { await manager.recheckForeignSleep() }
+        // The time left is read now too: the redraw timer stops while the
+        // lid is closed, and the menu can open then on an external display.
+        // Nothing ticks it at all while the bar shows the end time.
+        manager.refreshCountdown()
+    }
+
+    func menuItems() -> [StatusMenu.Item] {
+        Self.menuItems(manager: manager, status: status)
     }
 
     /// The menu's lines from what the session and the status source report
     /// now. Static, so a test can check them without a status item.
     /// The menu also carries the time left while a session runs and the bar
     /// does not show it: the countdown is off, so the bar shows only the eye,
-    /// or the countdown shows the end time.
+    /// or the countdown shows the end time, or the style is Compact or
+    /// Minimal, which have no countdown in the bar.
     static func menuItems(manager: SessionManager, status: any StatusSource) -> [StatusMenu.Item] {
         let inMenu = manager.isActive
-            && (!manager.config.showMenuBarCountdown || manager.config.countdownStyle == .endTime)
+            && (manager.config.menuBarMode != .pills
+                || !manager.config.showMenuBarCountdown
+                || manager.config.countdownStyle == .endTime)
         return StatusMenu.items(
             sessionActive: manager.isActive,
             sleepHeld: manager.state.sleepDisabledByUs,
             machine: StatusLines.machine(
                 lidClosed: status.lidClosed,
                 watts: status.instantWatts(),
+                batteryPercent: status.batteryPercent,
+                isCharging: status.isCharging
+            ),
+            network: StatusLines.network(
                 wifiSSID: WiFiStatusName.display(
                     ssid: status.wifiSSID,
                     locationAuthorized: (status as? LiveStatusSource)?.locationPermission.isAuthorized ?? true
-                ),
-                batteryPercent: status.batteryPercent,
-                isCharging: status.isCharging
+                )
             ),
             actions: StatusLines.actions(
                 frozenCount: status.frozenCount,
@@ -777,12 +1083,38 @@ final class StatusItemController: NSObject {
 
     @objc private func menuStopWaitingForOutput(_ sender: NSMenuItem) {
         guard let waiting = sender.representedObject as? SavedAudioOutput else { return }
-        Task { await manager.stopWaitingForOutput(waiting) }
+        performMenuAction(.stopWaitingForOutput(waiting))
     }
 
     @objc private func menuRelaunchBrowser(_ sender: NSMenuItem) {
         guard let browser = sender.representedObject as? ThrottledBrowser else { return }
-        relaunchBrowser(browser)
+        performMenuAction(.relaunchBrowser(browser))
+    }
+
+    /// Both the AppKit menu and compact SwiftUI menu dispatch here so a
+    /// presentation change cannot bypass confirmation or recovery actions.
+    func performMenuAction(_ kind: StatusMenu.Item.Kind) {
+        switch kind {
+        case .info, .warning, .separator:
+            break
+        case .endSession:
+            guard manager.isActive else { break }
+            // The same end as each style's hold control.
+            if manager.config.menuBarMode == .pills {
+                endNow()
+            } else {
+                endPresentedSession()
+            }
+        case .settings:
+            openSettings()
+            showSettings()
+        case .quit:
+            NSApplication.shared.terminate(nil)
+        case let .relaunchBrowser(browser):
+            relaunchBrowser(browser)
+        case let .stopWaitingForOutput(waiting):
+            Task { await manager.stopWaitingForOutput(waiting) }
+        }
     }
 
     /// The relaunch item: ask first, since the browser is quit and its
@@ -812,22 +1144,23 @@ final class StatusItemController: NSObject {
     /// A normal menu click ends through the same restoration path as the hold
     /// control. A menu kept open after timer expiry must not end an idle session.
     @objc func menuEndSession() {
-        guard manager.isActive else { return }
-        endNow()
+        performMenuAction(.endSession)
     }
 
-    @objc private func menuQuit() {
-        NSApplication.shared.terminate(nil)
+    @objc func menuQuit() {
+        performMenuAction(.quit)
     }
 
-    @objc private func menuOpenSettings() {
-        openSettings()
-        showSettings()
+    @objc func menuOpenSettings() {
+        performMenuAction(.settings)
     }
 
     // MARK: Settings
 
     private func openSettings() {
+        // Settings takes focus next; yielding it to another app first could
+        // leave the window behind that app.
+        closeCompactDropdown(returnFocus: false)
         if model.phase.isEntering {
             removeMonitors()
             withAnimation(Motion.base(reduceMotion: reduceMotion)) {
@@ -956,48 +1289,18 @@ final class StatusItemController: NSObject {
     }
 
     /// Returns true when the key was consumed.
-    private func handleKey(_ event: NSEvent) -> Bool {
-        guard model.phase.isEntering else { return false }
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if flags.contains(.command) || flags.contains(.control) || flags.contains(.option) {
-            return false
-        }
-        switch event.keyCode {
-        case 53: // esc
+    func handleKey(_ event: NSEvent) -> Bool {
+        guard manager.config.menuBarMode == .pills, model.phase.isEntering else { return false }
+        guard let command = DurationInputCommand(event) else { return false }
+        switch command {
+        case .cancel:
             collapse()
             return true
-        case 36, 76: // return, keypad enter
+        case .submit:
             commit()
             return true
-        case 48: // tab
-            focus(flags.contains(.shift) ? model.focused.previous : model.focused.next)
-            return true
-        case 51, 117: // delete, forward delete
-            backspace()
-            return true
-        case 123: // left
-            focus(model.focused.previous)
-            return true
-        case 124: // right
-            focus(model.focused.next)
-            return true
         default:
-            break
-        }
-        guard let chars = event.charactersIgnoringModifiers, chars.count == 1, let ch = chars.first else {
-            return false
-        }
-        if let digit = ch.wholeNumberValue, ch.isASCII {
-            typeDigit(digit)
-            return true
-        }
-        switch ch.lowercased() {
-        case "d": focus(.days); return true
-        case "h": focus(.hours); return true
-        case "m": focus(.minutes); return true
-        default:
-            // Swallow stray printable keys so nothing beeps while typing a time.
-            return ch.isLetter || ch.isPunctuation || ch == " "
+            return model.applyInput(command, reduceMotion: reduceMotion)
         }
     }
 }
@@ -1011,7 +1314,7 @@ private struct EventBox: @unchecked Sendable {
 }
 
 final class StatusHostingView: NSHostingView<StatusRootView> {
-    var onRightMouseDown: (() -> Void)?
+    var onRightMouseDown: ((NSEvent) -> Void)?
     /// Where the pointer really is, in the window's coordinates. A test
     /// replaces it; the app reads the live pointer.
     var pointerInWindow: (NSWindow) -> NSPoint = { $0.convertPoint(fromScreen: NSEvent.mouseLocation) }
@@ -1125,13 +1428,13 @@ final class StatusHostingView: NSHostingView<StatusRootView> {
 
     override func mouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
-            onRightMouseDown?()
+            onRightMouseDown?(event)
             return
         }
         super.mouseDown(with: event)
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        onRightMouseDown?()
+        onRightMouseDown?(event)
     }
 }
