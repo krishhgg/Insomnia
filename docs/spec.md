@@ -189,7 +189,10 @@ recovery; newly written journals use `frozenProcesses`.
   screen. With "Keep the screen on and unlocked" on (`keepScreenAwake`,
   default off), `SessionManager` holds a `PreventUserIdleDisplaySleep`
   assertion (`ScreenAwake`, the one `caffeinate -d` holds) while a session
-  is active, and Settings applies the toggle to a running session. An end
+  is active, and Settings applies the toggle to a running session. The
+  hold stops only the idle lock: with "Lock the screen"
+  (`lockScreenOnLidClose`) on, a lid close still locks the screen, and
+  LidActions then skips only the display sleep request. An end
   request releases it before the recovery lock or the journal can refuse
   the end, so a refused end never keeps the screen unlocked past the
   deadline. A release macOS refuses keeps the hold and says so in the

@@ -51,9 +51,11 @@ struct Config: Codable, Equatable, Sendable {
     /// Hard ceiling on a session, including extensions. 30 days.
     var maxDuration: TimeInterval = 30 * 24 * 3600
     /// Hold the display awake for the whole session (`ScreenAwake`), so it
-    /// never idles off and the screen never locks while agents drive it.
+    /// never idles off and the screen never locks while idle as agents
+    /// drive it. `lockScreenOnLidClose` still locks it at a lid close.
     /// Off by default (and for a config.json without the key): anyone who
-    /// opens the Mac during such a session finds it unlocked.
+    /// opens the Mac during such a session finds it unlocked, unless a lid
+    /// close locked it.
     var keepScreenAwake: Bool = false
 
     // Lid-close actions
