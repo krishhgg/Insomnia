@@ -31,6 +31,16 @@ app writes `NSAppSleepDisabled` into the preferences of each app on the agent
 list, after recording the previous value in its journal, and puts it back at
 session end.
 
+Hotspot usage tracking is opt in. During a session it reads the Wi-Fi
+interface's byte counters every five seconds while the network name matches
+the configured hotspot. Public SystemConfiguration network change events
+invalidate the baseline; monitoring needs no additional signing entitlement.
+It sends no traffic to measure usage. Totals and warning history live in an
+owner-only `hotspot-usage.json`, separate from the power restoration journal.
+Networks are keyed by SHA-256 of the SSID; this avoids raw names in that file
+but is not encryption or anonymity. Notifications contain totals, not network
+names. Normal uninstall keeps usage history; `--purge` removes it.
+
 The hotspot password is a generic-password item in the login Keychain
 (service `insomnia-hotspot`). Its access list names only the Insomnia build
 that saved it, so any other program asking for it gets the system Keychain

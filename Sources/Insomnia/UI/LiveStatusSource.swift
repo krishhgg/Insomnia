@@ -23,6 +23,7 @@ final class LiveStatusSource: StatusSource {
         services.status.relaunchProblems.sorted { $0.key < $1.key }.map(\.value)
     }
     var hotspotPasswordReport: HotspotPasswordReport? { services.status.hotspotPasswordReport }
+    var hotspotUsage: HotspotUsageStatus? { services.hotspotUsage.status }
     var locationPermission: LocationPermission { services.locationPermission }
 
     func refreshOnDemand() {

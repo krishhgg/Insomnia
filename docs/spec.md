@@ -786,6 +786,40 @@ provided by the standalone backstop. Performance effects depend on workload.
 
 ### 7. Network failover
 
+#### Hotspot usage and budget warnings
+
+`trackHotspotUsage` defaults off, including for old configurations.
+`hotspotBudgetBytes` defaults to 1,000,000,000 bytes (decimal GB); zero
+disables warnings without disabling tracking. The settings editor accepts
+0–1,000 GB. There is no automatic monthly reset or disconnection.
+
+During an active session, read 64-bit upload and download counters for the
+Wi-Fi interface every five seconds only when CoreWLAN confirms the configured
+SSID. SystemConfiguration watches interface AirPort, link and IP state;
+these events and a dynamic-store server restart invalidate readings in flight.
+Changes, unknown names, failed readings, counter
+resets, changed interfaces and gaps over 15 seconds break the baseline.
+Unmeasured intervals are marked incomplete, never charged to the hotspot.
+Nothing before the first reading, between sessions or while Insomnia is
+closed is included. Local Wi-Fi traffic is included; phone and other-device
+usage are excluded. This is an estimate, not a carrier meter.
+
+Save totals, period start and warning history per SSID digest in the versioned
+owner-only `hotspot-usage.json`; never save a counter baseline. Changing the
+hotspot selects separate history. Reset requires confirmation and clears only
+the selected history when the file is readable; an unreadable file requires
+explicit confirmation to replace all usage history. Read failures never
+silently erase totals. Save failures retain totals in memory and defer
+notifications until the save succeeds. The power journal is independent.
+
+Post a notification once at 80% and once at 100% for each budget and reset
+period; a jump past both posts only the 100% warning. Budget edits retain
+bytes and re-arm warnings for the new amount. Warning decisions are saved
+before notification submission; delivery is best effort under macOS
+notification permissions. The compact menu retains threshold warnings and
+paused/incomplete status even when notifications are unavailable. Its total
+opens Settings at the data budget section. Connections stay running.
+
 - `NWPathMonitor` on the Wi-Fi interface. Event-driven.
 - Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
   scan, then join with `associate(to:password:)`. The password is read from
@@ -1279,6 +1313,7 @@ older build is tightened when the app reads it:
 - `lowPowerFloor`, `endFloor`, thermal rules on/off
 - hotspot SSID, picked from the networks this Mac has joined or typed
   (password entered once, stored in Keychain), `nudgeThreshold`
+- `trackHotspotUsage` (default off), `hotspotBudgetBytes` (default 1 GB)
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
@@ -1787,6 +1822,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | countdown redraw | 1 Hz timer, stopped while lid closed or displays asleep; none with the end time | one wake per second while active and visible; none with the end time |
 | Minimal arc redraw | timer at a hundredth of the session, 2 to 60 s, only in Minimal with a session, stopped while displays asleep | one wake per 2 to 60 s |
 | displays asleep | `NSWorkspace` screensDidSleep / screensDidWake, and `CGDisplayIsAsleep` once at launch | none |
+| hotspot usage | SystemConfiguration change events and 5 s counter readings | one read per 5 s only while opted in, configured and a session runs |
 | hotspot retry | only during an outage | none otherwise |
 | update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |
 

@@ -6,13 +6,13 @@ import Foundation
 ///
 /// Default layout:
 ///   ~/Applications/Insomnia.app/Contents/Resources/backstop.sh
-///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,unfinished-command.json}
+///   ~/Library/Application Support/Insomnia/{session.json,state.json,config.json,hotspot-usage.json,unfinished-command.json}
 ///   ~/Library/Logs/Insomnia/{insomnia.log,handoffs.log}
 ///   ~/Library/LaunchAgents/com.insomnia.backstop.plist
 ///
 /// With INSOMNIA_HOME=/x:
 ///   /x/Insomnia.app/Contents/Resources/backstop.sh
-///   /x/{session.json,state.json,config.json,unfinished-command.json}
+///   /x/{session.json,state.json,config.json,hotspot-usage.json,unfinished-command.json}
 ///   /x/Logs/{insomnia.log,handoffs.log}
 ///   /x/LaunchAgents/com.insomnia.backstop.plist
 struct Paths: Sendable, Equatable {
@@ -70,6 +70,8 @@ struct Paths: Sendable, Equatable {
     static let unreadableSessionPrefix = "session.json.unreadable-"
     var stateFile: URL { appSupport.appendingPathComponent("state.json") }
     var configFile: URL { appSupport.appendingPathComponent("config.json") }
+    /// Read-only network accounting, separate from the power undo journal.
+    var hotspotUsageFile: URL { appSupport.appendingPathComponent("hotspot-usage.json") }
     /// scripts/backstop.sh as install.sh seals it into a bundle, under
     /// Contents/Resources, before the bundle is signed. The LaunchAgent
     /// verifies the bundle's signature before running it (LaunchdBackstop).

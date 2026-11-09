@@ -26,6 +26,7 @@ enum StatusMenu {
             /// the menu bar countdown off it stands in for the hold-to-end ring.
             case endSession
             case settings
+            case hotspotUsage
             case quit
             /// Relaunch this browser with the occlusion flags. Carries the
             /// bundle id and name, so the item still names the same browser
@@ -40,7 +41,7 @@ enum StatusMenu {
             var isAction: Bool {
                 switch self {
                 case .info, .warning, .separator: false
-                case .endSession, .settings, .quit, .relaunchBrowser, .stopWaitingForOutput: true
+                case .endSession, .settings, .hotspotUsage, .quit, .relaunchBrowser, .stopWaitingForOutput: true
                 }
             }
         }
@@ -109,7 +110,8 @@ enum StatusMenu {
         foreignSleep: String? = nil,
         outputsWaiting: [SavedAudioOutput] = [],
         lidSimulationBuild: Bool = false,
-        remaining: String? = nil
+        remaining: String? = nil,
+        hotspotUsage: HotspotUsageStatus? = nil
     ) -> [Item] {
         var out: [Item] = []
         if sessionActive, let remaining = present(remaining) {
@@ -123,6 +125,13 @@ enum StatusMenu {
         }
         if let network = present(network) {
             out.append(Item(title: network, kind: .info))
+        }
+        if let usage = hotspotUsage {
+            out.append(Item(title: usage.summary, kind: .hotspotUsage))
+            if let warning = usage.warning { out.append(Item(title: warning, kind: .warning)) }
+            if let detail = usage.detail {
+                out.append(Item(title: detail, kind: usage.problem == nil ? .info : .warning))
+            }
         }
         if let actions = present(actions) {
             out.append(Item(title: actions, kind: .info))
@@ -277,7 +286,8 @@ enum StatusMenu {
         settings: Selector,
         quit: Selector,
         relaunchBrowser: Selector,
-        stopWaitingForOutput: Selector
+        stopWaitingForOutput: Selector,
+        hotspotUsageSettings: Selector? = nil
     ) -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -299,6 +309,8 @@ enum StatusMenu {
                 menu.addItem(action(title: item.title, selector: endSession, key: "", target: target))
             case .settings:
                 menu.addItem(action(title: item.title, selector: settings, key: ",", target: target))
+            case .hotspotUsage:
+                menu.addItem(action(title: item.title, selector: hotspotUsageSettings ?? settings, key: "", target: target))
             case .quit:
                 menu.addItem(action(title: item.title, selector: quit, key: "q", target: target))
             case let .relaunchBrowser(browser):

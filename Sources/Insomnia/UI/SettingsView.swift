@@ -55,6 +55,7 @@ struct MinimalDurationSetting {
 /// Edit Apps and the hotspot in sheets. Every change is saved to
 /// config.json as it is made.
 struct SettingsView: View {
+    static let showHotspotUsage = Notification.Name("InsomniaShowHotspotUsage")
     let manager: SessionManager
     let secrets: any HotspotSecretStore
     let locationPermission: LocationPermission
@@ -69,36 +70,47 @@ struct SettingsView: View {
     @FocusState private var minimalDurationFocused: Bool
 
     var body: some View {
-        Form {
-            lidSection
-            agentSection
-            powerSection
-            networkSection
-            appSection
-        }
-        .formStyle(.grouped)
-        // One width, so a long notice wraps instead of widening the window.
-        // No height: on a screen shorter than the form, SettingsWindow's
-        // window fits the screen and the form scrolls.
-        .frame(width: 490)
-        // The user may have approved or removed the login item in System
-        // Settings since launch (LoginItem also re-reads whenever the app
-        // becomes active, for a window left open).
-        .onAppear {
-            loginItem.refresh()
-            minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
-        }
-        .sheet(isPresented: $editingApps) { AppsSheet(manager: manager) }
-        .sheet(isPresented: $editingHotspot) {
-            HotspotSheet(manager: manager, secrets: secrets, locationPermission: locationPermission)
-        }
-        .onChange(of: manager.config.defaultPreset) {
-            if !minimalDurationFocused {
+        ScrollViewReader { proxy in
+            Form {
+                lidSection
+                agentSection
+                powerSection
+                networkSection
+                Section("Hotspot data budget") {
+                    HotspotUsageSettings(
+                        config: Binding(get: { manager.config }, set: { edited in manager.updateConfig { $0 = edited } }),
+                        driver: manager.services?.hotspotUsage
+                    )
+                }.id("hotspot-usage")
+                appSection
+            }
+            .formStyle(.grouped)
+            // One width, so a long notice wraps instead of widening the window.
+            // No height: on a screen shorter than the form, SettingsWindow's
+            // window fits the screen and the form scrolls.
+            .frame(width: 490)
+            // The user may have approved or removed the login item in System
+            // Settings since launch (LoginItem also re-reads whenever the app
+            // becomes active, for a window left open).
+            .onAppear {
+                loginItem.refresh()
                 minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
             }
-        }
-        .onChange(of: minimalDurationFocused) {
-            if !minimalDurationFocused { commitMinimalDuration() }
+            .sheet(isPresented: $editingApps) { AppsSheet(manager: manager) }
+            .sheet(isPresented: $editingHotspot) {
+                HotspotSheet(manager: manager, secrets: secrets, locationPermission: locationPermission)
+            }
+            .onChange(of: manager.config.defaultPreset) {
+                if !minimalDurationFocused {
+                    minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
+                }
+            }
+            .onChange(of: minimalDurationFocused) {
+                if !minimalDurationFocused { commitMinimalDuration() }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: Self.showHotspotUsage)) { _ in
+                proxy.scrollTo("hotspot-usage", anchor: .top)
+            }
         }
     }
 

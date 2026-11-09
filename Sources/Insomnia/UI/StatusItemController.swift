@@ -2035,7 +2035,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             settings: #selector(menuOpenSettings),
             quit: #selector(menuQuit),
             relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
-            stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:))
+            stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:)),
+            hotspotUsageSettings: #selector(menuOpenHotspotUsage)
         )
         // Pass the original event so AppKit chooses contextual-menu chrome
         // and placement, including Control-click and mirrored menu bars.
@@ -2103,7 +2104,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             foreignSleep: manager.foreignSleepWarning,
             outputsWaiting: manager.outputsWaitingForRestore,
             lidSimulationBuild: LidSimulationBuild.isCompiledIn,
-            remaining: inMenu ? manager.remainingText : nil
+            remaining: inMenu ? manager.remainingText : nil,
+            hotspotUsage: manager.config.trackHotspotUsage ? status.hotspotUsage : nil
         )
     }
 
@@ -2131,6 +2133,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             } else {
                 endPresentedSession()
             }
+        case .hotspotUsage:
+            menuOpenHotspotUsage()
         case .settings:
             openSettings()
             showSettings()
@@ -2182,6 +2186,13 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
 
     @objc func menuOpenSettings() {
         performMenuAction(.settings)
+    }
+
+    @objc private func menuOpenHotspotUsage() {
+        menuOpenSettings()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: SettingsView.showHotspotUsage, object: nil)
+        }
     }
 
     // MARK: Settings

@@ -23,6 +23,7 @@ protocol StatusSource: AnyObject, Observable {
     /// Why a hotspot join was skipped this session, if one was, and for
     /// which SSID.
     var hotspotPasswordReport: HotspotPasswordReport? { get }
+    var hotspotUsage: HotspotUsageStatus? { get }
 
     /// Called when the menu or the popover opens; observers refresh
     /// anything not pushed.
@@ -41,6 +42,7 @@ protocol StatusSource: AnyObject, Observable {
 }
 
 extension StatusSource {
+    var hotspotUsage: HotspotUsageStatus? { nil }
     func batteryTimeRemaining() -> BatteryTimeRemaining? { nil }
 }
 
@@ -58,6 +60,7 @@ final class PlaceholderStatus: StatusSource {
     var throttledBrowsers: [ThrottledBrowser] = []
     var relaunchProblems: [String] = []
     var hotspotPasswordReport: HotspotPasswordReport? = nil
+    var hotspotUsage: HotspotUsageStatus? = nil
 
     init() {}
 

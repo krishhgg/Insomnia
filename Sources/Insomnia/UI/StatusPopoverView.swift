@@ -350,7 +350,7 @@ struct StatusPopoverView: View {
         case let .stopWaitingForOutput(waiting):
             Button(item.title) { actions.stopWaiting(waiting) }
                 .buttonStyle(PopoverButtonStyle(kind: .chip))
-        case .info, .warning, .separator, .endSession, .settings, .quit:
+        case .info, .warning, .separator, .endSession, .settings, .hotspotUsage, .quit:
             EmptyView()
         }
     }
