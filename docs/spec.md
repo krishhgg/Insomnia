@@ -526,8 +526,9 @@ does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
 is best effort. It is made only when a display or keyboard brightness is
 journaled, because the wake that undoes it on open, or on reconcile after
-a relaunch, runs only for such an entry. A keyboard that reads 0 is
-journaled as 0 for it when nothing else is, as described below. With "Keep the screen on and
+a relaunch, runs only for such an entry. A keyboard that can be read but
+journals no level is journaled as 0 for it when nothing else is, as
+described below. With "Keep the screen on and
 unlocked" on it is not made at all: a display that sleeps locks the screen,
 and Insomnia's own assertion would refuse it anyway. Display brightness 0 does not
 switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
@@ -570,14 +571,16 @@ kept value or after the mode, journals the restored level and not a 0
 sampled before it. A keyboard already reading 0 is left to macOS entirely
 (no new journal entry or write), unless a positive restore is already owed
 from an earlier close. One exception keeps the display sleep request: when
-nothing else is journaled at that close, as when the display is refused or
-unreadable, and "Keep the screen on and unlocked" is off, the close journals
-the 0 with no keyboard write, so the open still wakes the display it asked
-to sleep. The open discards that 0 as below. Ambient auto-off can read 0 with neither suppression
+a close reads the keyboard but journals no level for it, nothing else is
+journaled, as when the display is refused or unreadable, and "Keep the
+screen on and unlocked" is off, the close journals a 0 with no keyboard
+write, so the open still wakes the display it asked to sleep. The open
+discards that 0 as below. Ambient auto-off can read 0 with neither suppression
 nor dimming flagged, while manual off can set the suppression flag; neither
 is a reason to restore an older positive sample over it. For a positive
 current reading, the keyboard journals that reading if trusted now, else a
-positive last sample; without either, it is left alone. A positive value
+positive last sample; without either, it is left alone, apart from the 0
+journaled for the sleep request above. A positive value
 kept after a refused restore is decided only by a trusted reading, as for
 the display: a 0 keeps it and a level above 0 replaces it. A suppressed or
 dimmed reading leaves it journaled and undecided, and the last sample is no

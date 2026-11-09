@@ -283,10 +283,10 @@ final class LidActions {
             Log.error("display darken on lid close skipped: \(error.localizedDescription)")
         }
 
-        var keyboardReadZero = false
+        var keyboardRead = false
         do {
             if let current = try keyboard.readBrightness() {
-                keyboardReadZero = current == 0
+                keyboardRead = true
                 let state = manager.effectiveState
                 let trusted = sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed()
                 let value: Float?
@@ -353,19 +353,20 @@ final class LidActions {
         // With the owed edits applied: an entry this process already
         // settled is not restored, so the open would not wake for it.
         //
-        // A keyboard that read 0 journaled nothing above, so the 0 stays
-        // with macOS. When nothing else is journaled either, as when the
-        // display is refused or unreadable, that would also drop the sleep
-        // request, which is what locks a screen set to lock on display
-        // sleep. The 0 is journaled then, with no keyboard write: the open
-        // wakes the display for it and discards it without a write, as it
-        // does an older version's saved zero.
-        if !manager.effectiveState.brightnessJournaled, keyboardReadZero, !manager.config.keepScreenAwake {
+        // A keyboard read can journal no level above: a 0 stays with
+        // macOS, and so does a positive reading with neither a trusted
+        // read nor a positive sample. When nothing else is journaled
+        // either, as when the display is refused or unreadable, that would
+        // also drop the sleep request, which is what locks a screen set to
+        // lock on display sleep. A 0 is journaled then, with no keyboard
+        // write: the open wakes the display for it and discards it without
+        // a write, as it does an older version's saved zero.
+        if !manager.effectiveState.brightnessJournaled, keyboardRead, !manager.config.keepScreenAwake {
             do {
                 try manager.journal { s in
                     if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = 0 }
                 }
-                Log.info("keyboard backlight zero journaled with no write, so the open wakes the display this asks to sleep; the open discards the zero")
+                Log.info("keyboard backlight zero journaled with no write, so the open wakes the display this asks to sleep; the open discards the zero and leaves the backlight to macOS")
             } catch {
                 Log.error("keyboard backlight zero not journaled: \(error.localizedDescription)")
             }

@@ -221,7 +221,8 @@ final class RefusedDarkeningTests: XCTestCase {
     /// display's sleep and wake land on `h.display`.
     private func makeDarkeningOnly(
         display: any DisplayDimming,
-        keyboard: any KeyboardBacklighting
+        keyboard: any KeyboardBacklighting,
+        sampler: BrightnessSampler? = nil
     ) -> (SessionManager, LidActions) {
         let m = h.makeManager()
         m.config.muteOnLidClose = false
@@ -235,7 +236,7 @@ final class RefusedDarkeningTests: XCTestCase {
             audio: h.audio,
             display: display,
             keyboard: keyboard,
-            sampler: nil
+            sampler: sampler
         )
         return (m, actions)
     }
@@ -303,6 +304,34 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
         XCTAssertTrue(logText().contains("zero keyboard restore discarded without a brightness write"), logText())
         XCTAssertNil(m.lastError)
+    }
+
+    /// A positive keyboard reading macOS holds down is not trusted, and a
+    /// last sample of 0 is never restored, so the keyboard journals no
+    /// level. The 0 for the sleep request is journaled all the same.
+    func testARefusedDisplayAndAZeroSampleStillAskTheDisplayToSleep() async throws {
+        h.keyboard.brightness = 0
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 3 })
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard, sampler: sampler)
+        sampler.follow(m)
+        await m.start(duration: 3600)
+        sampler.sample()
+        XCTAssertEqual(sampler.last?.keyboard, 0)
+        h.keyboard.brightness = 0.3
+        h.keyboard.suppressedOrDimmed = true
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 1)
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(try XCTUnwrap(try h.store.loadState()).savedKeyboardBrightness, 0)
+
+        h.keyboard.suppressedOrDimmed = false
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 1)
+        XCTAssertEqual(h.keyboard.sets, [], "the 0 is discarded, and 0.3 stays as macOS has it")
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
     }
 
     /// With "Keep the screen on and unlocked" on, the close asks for no
