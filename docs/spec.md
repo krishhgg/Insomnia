@@ -394,7 +394,9 @@ keeps the earlier saved value while the device reads 0, and saves the new
 level when it reads above 0. For the keyboard the reading itself must be
 trusted: a suppressed or dimmed reading, 0 or above, leaves the entry
 flagged and the backlight as it is, and the last sample is no help, since
-none is taken while an entry is journaled. For the display that level must be trusted:
+none is taken while an entry is journaled. A kept keyboard 0 from an older
+version is obsolete: a close that reads 0 leaves it flagged, and the open
+discards it without a write. For the display that level must be trusted:
 the last sample, the value owed after the mode, or a current read taken
 with the panel awake and Insomnia's Low Power Mode not on at any point in
 the run, nor over the entry since the Mac last started. Without one, the close leaves the entry flagged and the panel as
@@ -570,11 +572,13 @@ from an earlier close. Ambient auto-off can read 0 with neither suppression
 nor dimming flagged, while manual off can set the suppression flag; neither
 is a reason to restore an older positive sample over it. For a positive
 current reading, the keyboard journals that reading if trusted now, else a
-positive last sample; without either, it is left alone. A value kept after
-a refused restore is decided only by a trusted reading, as for the display:
-a 0 keeps it and a level above 0 replaces it. A suppressed or dimmed
-reading leaves it journaled and undecided, and the last sample is no help,
-since none is taken while an entry is journaled.
+positive last sample; without either, it is left alone. A positive value
+kept after a refused restore is decided only by a trusted reading, as for
+the display: a 0 keeps it and a level above 0 replaces it. A suppressed or
+dimmed reading leaves it journaled and undecided, and the last sample is no
+help, since none is taken while an entry is journaled. A kept 0 is the
+older version's zero below: only a trusted level above 0 replaces it, and
+otherwise the open discards it.
 A saved zero from an
 older version is cleared without a keyboard write or reassertion, including
 when the private-call guard refuses; a failed clear stays owed for retry.

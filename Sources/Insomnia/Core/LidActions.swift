@@ -300,7 +300,8 @@ final class LidActions {
                     // sampler took no keyboard reading while the entry was
                     // journaled, so its sample is older than the refusal.
                     // The entry stays undecided and the open reads the
-                    // level again.
+                    // level again. A kept 0, saved by an older version, is
+                    // obsolete instead: the open discards it without a write.
                     value = nil
                     keptUndecided = kept
                 } else if current == 0 {
@@ -328,7 +329,9 @@ final class LidActions {
                         Log.error("keyboard backlight off failed: \(error.localizedDescription)")
                     }
                 } else if let kept = keptUndecided {
-                    Log.info("keyboard backlight reads \(current) at the close; the value kept after a refused restore, \(kept), stays journaled and undecided, and the backlight is left alone, so the open reads it again")
+                    Log.info(kept > 0
+                        ? "keyboard backlight reads \(current) at the close; the value kept after a refused restore, \(kept), stays journaled and undecided, and the backlight is left alone, so the open reads it again"
+                        : "keyboard backlight reads \(current) at the close; the zero kept after a refused restore is obsolete, and the backlight is left alone, so the open discards it without a write")
                 } else {
                     Log.info(current == 0
                         ? "keyboard backlight already reads zero; leaving its automatic or user-off state untouched"

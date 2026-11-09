@@ -230,6 +230,57 @@ final class KeyboardBrightnessRestoreTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [0])
     }
 
+    /// A trusted 0 is the backlight still dark as the earlier close left
+    /// it, so the kept value stays and the refusal clears, as on main. Here
+    /// the sampler decides the trust: input is recent and the backlight is
+    /// neither suppressed nor dimmed.
+    func testATrustedZeroKeepsARefusedRestoreWithASampler() async throws {
+        try m.journal {
+            $0.savedKeyboardBrightness = 0.6
+            $0.keyboardRestoreRefused = true
+        }
+        h.keyboard.brightness = 0
+        XCTAssertTrue(sampler.keyboardReadIsTrusted)
+
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0.6)
+        XCTAssertFalse(closed.keyboardRestoreRefused)
+        XCTAssertEqual(h.keyboard.sets, [0])
+    }
+
+    /// A refused zero saved by an older version is obsolete: the close
+    /// leaves it alone and says so, and the open discards it without a
+    /// keyboard write.
+    func testARefusedLegacyZeroIsDiscardedAtTheOpen() async throws {
+        try m.journal {
+            $0.savedKeyboardBrightness = 0
+            $0.keyboardRestoreRefused = true
+        }
+        h.keyboard.brightness = 0
+        h.keyboard.suppressedOrDimmed = true
+
+        await actions.onClose()
+
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0)
+        XCTAssertTrue(closed.keyboardRestoreRefused)
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertTrue(logText().contains("keyboard backlight reads 0.0 at the close; the zero kept after a refused restore is obsolete, and the backlight is left alone, so the open discards it without a write"), logText())
+        XCTAssertFalse(logText().contains("stays journaled and undecided, and the backlight is left alone, so the open reads it again"), logText())
+
+        h.keyboard.suppressedOrDimmed = false
+        h.keyboard.brightness = 0.3
+        await actions.onOpen()
+
+        XCTAssertEqual(h.keyboard.sets, [])
+        let opened = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(opened.savedKeyboardBrightness)
+        XCTAssertFalse(opened.keyboardRestoreRefused)
+        XCTAssertTrue(logText().contains("zero keyboard restore discarded without a brightness write"), logText())
+    }
+
     private func logText() -> String {
         (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
     }
