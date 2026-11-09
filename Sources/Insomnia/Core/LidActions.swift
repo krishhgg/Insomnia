@@ -206,7 +206,7 @@ final class LidActions {
     /// does not take a 0 it reads as a level set since: only a reading
     /// above 0 decides that entry (`SessionManager.restoreDisplay`).
     /// A keyboard value kept after a refused restore stays undecided unless
-    /// a trusted reading above 0 replaces it, as for the display.
+    /// the close reads the keyboard trusted, as for the display.
     /// A keyboard already at 0 is left alone unless a positive restore is
     /// already owed. Both manual off and ambient auto-off can read 0, with
     /// different suppression flags; neither needs another explicit off.
@@ -286,18 +286,21 @@ final class LidActions {
         do {
             if let current = try keyboard.readBrightness() {
                 let state = manager.effectiveState
-                let trusted = current > 0 && (sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed())
+                let trusted = sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed()
                 let value: Float?
                 var keptUndecided: Float?
                 if state.keyboardRestoreRefused, let kept = state.savedKeyboardBrightness, !trusted {
                     // As for the display above: after a refused restore the
-                    // user was told to set the level by hand, and only a
-                    // trusted reading above 0 shows that level. A 0 under
-                    // the closing lid or a held-down reading shows none,
-                    // and the sampler took no keyboard reading while the
-                    // entry was journaled, so its sample is older than the
-                    // refusal. The entry stays undecided and the open reads
-                    // the level again.
+                    // user was told to set the level by hand. A trusted 0
+                    // is the backlight still dark as the earlier close left
+                    // it, and a trusted level above 0 is the user's; both
+                    // decide the entry below. A suppressed or dimmed
+                    // reading, such as the 0 a real close reads once macOS
+                    // has turned the backlight off, shows neither, and the
+                    // sampler took no keyboard reading while the entry was
+                    // journaled, so its sample is older than the refusal.
+                    // The entry stays undecided and the open reads the
+                    // level again.
                     value = nil
                     keptUndecided = kept
                 } else if current == 0 {
