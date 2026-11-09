@@ -158,6 +158,8 @@ file and explains how upgrades replace them.
    `Info.plist` first.
 
 You don't have to close the lid, and opening it doesn't end the session.
+When the timer or a battery or heat rule ends a session with the lid closed,
+Insomnia puts the Mac to sleep.
 
 Insomnia stops system sleep, not display sleep, so the display still turns
 off when idle. If your Mac then asks for a password, agents that drive the
