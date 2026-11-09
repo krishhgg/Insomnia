@@ -283,8 +283,10 @@ final class LidActions {
             Log.error("display darken on lid close skipped: \(error.localizedDescription)")
         }
 
+        var keyboardReadZero = false
         do {
             if let current = try keyboard.readBrightness() {
+                keyboardReadZero = current == 0
                 let state = manager.effectiveState
                 let trusted = sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed()
                 let value: Float?
@@ -350,6 +352,24 @@ final class LidActions {
         // a panel this put to sleep, so it is not asked to sleep.
         // With the owed edits applied: an entry this process already
         // settled is not restored, so the open would not wake for it.
+        //
+        // A keyboard that read 0 journaled nothing above, so the 0 stays
+        // with macOS. When nothing else is journaled either, as when the
+        // display is refused or unreadable, that would also drop the sleep
+        // request, which is what locks a screen set to lock on display
+        // sleep. The 0 is journaled then, with no keyboard write: the open
+        // wakes the display for it and discards it without a write, as it
+        // does an older version's saved zero.
+        if !manager.effectiveState.brightnessJournaled, keyboardReadZero, !manager.config.keepScreenAwake {
+            do {
+                try manager.journal { s in
+                    if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = 0 }
+                }
+                Log.info("keyboard backlight zero journaled with no write, so the open wakes the display this asks to sleep; the open discards the zero")
+            } catch {
+                Log.error("keyboard backlight zero not journaled: \(error.localizedDescription)")
+            }
+        }
         guard manager.effectiveState.brightnessJournaled else {
             Log.info("display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open")
             return

@@ -276,6 +276,50 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
     }
 
+    /// A refused display journals nothing, and a keyboard that reads 0 is
+    /// left to macOS. The 0 is journaled anyway, with no keyboard write, so
+    /// the close still asks the display to sleep, which locks a screen set
+    /// to lock on display sleep. The open wakes the display and discards
+    /// the 0 without a write.
+    func testARefusedDisplayAndAZeroKeyboardStillAskTheDisplayToSleep() async throws {
+        h.keyboard.brightness = 0
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 1)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [], "the 0 stays with macOS")
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(closed.savedDisplayBrightness)
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0)
+        XCTAssertTrue(logText().contains("keyboard backlight zero journaled with no write, so the open wakes the display this asks to sleep"), logText())
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 1, "the display the close asked to sleep is woken")
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+        XCTAssertTrue(logText().contains("zero keyboard restore discarded without a brightness write"), logText())
+        XCTAssertNil(m.lastError)
+    }
+
+    /// With "Keep the screen on and unlocked" on, the close asks for no
+    /// display sleep, so a keyboard that reads 0 journals nothing.
+    func testKeepScreenAwakeJournalsNoZeroForTheSleepRequest() async throws {
+        h.keyboard.brightness = 0
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard)
+        m.config.keepScreenAwake = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).brightnessJournaled)
+    }
+
     /// Both devices refused: nothing is darkened or journaled, so nothing
     /// on open would wake the display. The close does not ask it to sleep,
     /// and the open has nothing to wake.

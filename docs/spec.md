@@ -526,7 +526,8 @@ does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
 is best effort. It is made only when a display or keyboard brightness is
 journaled, because the wake that undoes it on open, or on reconcile after
-a relaunch, runs only for such an entry. With "Keep the screen on and
+a relaunch, runs only for such an entry. A keyboard that reads 0 is
+journaled as 0 for it when nothing else is, as described below. With "Keep the screen on and
 unlocked" on it is not made at all: a display that sleeps locks the screen,
 and Insomnia's own assertion would refuse it anyway. Display brightness 0 does not
 switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
@@ -568,7 +569,11 @@ so a close soon after a restore that came late, from the re-read of a
 kept value or after the mode, journals the restored level and not a 0
 sampled before it. A keyboard already reading 0 is left to macOS entirely
 (no new journal entry or write), unless a positive restore is already owed
-from an earlier close. Ambient auto-off can read 0 with neither suppression
+from an earlier close. One exception keeps the display sleep request: when
+nothing else is journaled at that close, as when the display is refused or
+unreadable, and "Keep the screen on and unlocked" is off, the close journals
+the 0 with no keyboard write, so the open still wakes the display it asked
+to sleep. The open discards that 0 as below. Ambient auto-off can read 0 with neither suppression
 nor dimming flagged, while manual off can set the suppression flag; neither
 is a reason to restore an older positive sample over it. For a positive
 current reading, the keyboard journals that reading if trusted now, else a
@@ -579,8 +584,9 @@ dimmed reading leaves it journaled and undecided, and the last sample is no
 help, since none is taken while an entry is journaled. A kept 0 is the
 older version's zero below: only a trusted level above 0 replaces it, and
 otherwise the open discards it.
-A saved zero from an
-older version is cleared without a keyboard write or reassertion, including
+A saved zero, from an
+older version or journaled for the sleep request, is cleared without a
+keyboard write or reassertion, including
 when the private-call guard refuses; a failed clear stays owed for retry.
 This avoids committing automatic zero as a permanent off setting. It leaves
 macOS free to relight a keyboard that was already off, even while the lid is
