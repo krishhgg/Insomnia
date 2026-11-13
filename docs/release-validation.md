@@ -5,6 +5,46 @@ behind the safety fixes. It is not a certification that unattended or
 lid-closed use is safe. The checks to run before the next release are in
 [Releasing](releasing.md#real-mac-checks-before-a-release).
 
+## v0.2.0
+
+The maintainer ran these checks on November 12 and 13, 2026, on two Macs:
+
+- A MacBook with an Apple M5 (Mac17,2) on macOS 26.2 (25C56).
+- A macOS 27.0.1 (26A434) VM on the maintainer's Mac mini.
+
+Most checks ran on a local build of the release candidate, commit `8a7191c` (CDHash `0e660cf2c11d07d5735a7dc937a9e1275aa35b3d`), installed with its own `scripts/install.sh --app`. Its tree is the same as this release's, apart from the version in `Resources/Info.plist` and the Settings check in `docs/releasing.md`. The release is the tag `v0.2.0` at that tree's commit, `7b00449`. Before tagging, the Release workflow's manual run on `7b00449` built a zip that passed `shasum -a 256 -c SHA256SUMS`, installed with its own `install.sh --allow-unverified-origin --app`, and ran a session. After publishing, the release's `Insomnia-0.2.0-macos.zip` (SHA-256 `a497c330a790fe0ab290f73212bc986c0b373483445ea282a88c0990ead843e8`) passed the checksum and the `gh attestation verify` command in its notes, and installed with the commands in its notes. The installed binary matches the zip's. The app reports 0.2.0 (2), CDHash `893a0de9e3c504eb0bc947cff543d6967ef08096`. `Insomnia --session start 120` set `SleepDisabled` to 1, `--session end` set it back to 0, and the recovery agent exited 0.
+
+The session, recovery, Login Items, lid and network rows ran on the MacBook only.
+
+| Check | Result |
+| --- | --- |
+| Menu bar styles: start, extend, end by holding, one-click start on and off, sounds on and off, and focus kept by the app in front, in Pills, Compact, Minimal and Popover | Passed in the macOS 27 VM, except the rows below. On macOS 26 every part that ran passed; some pending-start, style-change and VoiceOver parts were not run |
+| Right-click and Control-click menus, in Pills, Compact and Minimal | Failed on macOS 26 and 27. The menu opens at the pointer, over the menu bar, not beneath the icon as in 0.1.0. Every row and shortcut works. Known issue, [#174](https://github.com/krishhgg/Insomnia/issues/174) |
+| Compact: a second click on the eye closes the panel and gives focus back | Passed on macOS 26. In the macOS 27 VM the panel stayed open, with simulated clicks; not checked on macOS 27 hardware |
+| Popover: a right-click outside during a hold closes the popover and keeps the session | Passed on macOS 26. In the macOS 27 VM a stale popover window stayed visible and the session continued; not checked on macOS 27 hardware |
+| Compact and Popover stay open through display sleep | Not run on hardware, since display sleep locks an unattended Mac. In the VM both closed across display sleep, and reopening showed the right time left |
+| Menu bar CPU | Mean 0.85% with time left and 0.08% with End time on macOS 26; 0.85% and 0.0075% on macOS 27 |
+| Settings: in front of the active app, light and dark, window controls, and scrolling to Open at login | Passed in the VM. On the MacBook the window opened in light and dark, no taller than the screen, and scrolled to Open at login. The old check said a 1440p display fits the page; at about 1,790 pt it scrolls there too, and the check now says so |
+| Settings: Terminal and App Nap, battery floor pickers, and 30 tmux targets in the hotspot sheet | Passed. The 30-target sheet ran in the VM only |
+| Normal end, timer expiry and repeated Quit restore sleep | Passed |
+| `Insomnia --session` start, extend and end; the sleep guard reads its setting back | Passed |
+| Force-quit, then recovery by the launchd agent at the deadline, and retry after a failed restore | Passed |
+| An unreadable or malformed session file is moved aside and not resumed | Passed |
+| A `SleepDisabled` set by something else is left alone and reported | Passed |
+| The agent finishes a journal clear the app could not | Passed |
+| Loose permissions on an existing install are tightened at launch | Passed |
+| Frozen process recovery, and restoring an existing Low Power Mode or App Nap setting | Passed in part. The installed agent resumed a frozen test process and cleared its entry. An existing Low Power Mode, on and then off, was kept through normal sessions. A Terminal App Nap setting that was absent, off or on came back at a normal end, and off came back through the agent after a force-quit. Not run: recovery with a missing bundle, restoring saved audio, and restoring at uninstall |
+| Login Items & Extensions lists the recovery agent as Insomnia with its app icon | Failed on the release candidate before a logout: the row reads Insomnia, "Item from unidentified developer", with a generic icon instead of the app icon. Not yet rechecked after a login |
+| A timed end with the lid closed puts the Mac to sleep (#138) | Passed, real lid on the MacBook |
+| A lid closed on an external display counts as open, and unplugging that display counts as a close (#135) | Passed, real lid on the MacBook |
+| Lock the screen on lid close, on and off (#71) | Passed, real lid on the MacBook |
+| A battery floor ending a session with the lid closed | Not run: the battery stayed at 100% |
+| Hotspot failover joins the configured hotspot when Wi-Fi drops (#101) | Passed, with a real Wi-Fi drop and an iPhone hotspot. The typographic apostrophe case is covered by unit tests only |
+| A tmux pane back at its shell prompt gets no nudge (#68) | Passed, with a real Wi-Fi drop |
+| Mute on lid close skips an output with no mute control (#157) | Passed with a simulated lid close. An output with mute but no volume control is covered by unit tests only |
+
+Not run for this release: an install with SIP disabled; reboot or login with an active or dirty journal; macOS 27 power modes; battery and thermal events, including the heat hold; the privileged command edge cases; uninstall; VoiceOver; a second display; and Spaces. The Gatekeeper prompt on first launch was not seen, because a download with `gh` carries no quarantine flag.
+
 ## v0.1.0
 
 The maintainer ran these checks on a MacBook with an Apple M5 (Mac17,2) and
