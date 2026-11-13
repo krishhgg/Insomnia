@@ -1,6 +1,56 @@
 import AppKit
 import SwiftUI
 
+/// A draft of the shared default preset. Invalid edits stay in the field;
+/// they never replace the duration used by the menu bar's next click.
+struct MinimalDurationSetting {
+    var text: String
+    var error: String?
+    private var originalText: String
+
+    init(seconds: TimeInterval) {
+        text = Self.label(for: seconds)
+        originalText = text
+    }
+
+    /// Returns true only when a valid edit changed the config and needs saving.
+    mutating func apply(to config: inout Config) -> Bool {
+        guard text != originalText else {
+            error = nil
+            return false
+        }
+        guard let duration = DurationParser.seconds(from: text) else {
+            error = "Enter a duration greater than zero, such as 30m or 1h30m."
+            return false
+        }
+        guard duration <= config.maxDuration else {
+            error = "The duration cannot exceed \(Self.label(for: config.maxDuration))."
+            return false
+        }
+        error = nil
+        text = Self.label(for: duration)
+        originalText = text
+        guard config.defaultPreset != duration else { return false }
+        config.defaultPreset = duration
+        return true
+    }
+
+    /// Unlike a short countdown label, preserve the minutes of multi-day
+    /// durations. Merely focusing an existing value never rewrites it.
+    static func label(for seconds: TimeInterval) -> String {
+        guard seconds.isFinite, seconds >= 0, seconds / 60 < Double(Int.max) else { return "" }
+        let totalMinutes = Int((seconds / 60).rounded(.up))
+        let days = totalMinutes / 1440
+        let hours = totalMinutes % 1440 / 60
+        let minutes = totalMinutes % 60
+        var parts: [String] = []
+        if days > 0 { parts.append("\(days)d") }
+        if hours > 0 { parts.append("\(hours)h") }
+        if minutes > 0 { parts.append("\(minutes)m") }
+        return parts.isEmpty ? "0m" : parts.joined(separator: " ")
+    }
+}
+
 /// The settings window (spec 10): one page grouped by what happens, with
 /// Edit Apps and the hotspot in sheets. Every change is saved to
 /// config.json as it is made.
@@ -15,6 +65,8 @@ struct SettingsView: View {
 
     @State private var editingApps = false
     @State private var editingHotspot = false
+    @State private var minimalDuration = MinimalDurationSetting(seconds: Config().defaultPreset)
+    @FocusState private var minimalDurationFocused: Bool
 
     var body: some View {
         Form {
@@ -32,12 +84,30 @@ struct SettingsView: View {
         // The user may have approved or removed the login item in System
         // Settings since launch (LoginItem also re-reads whenever the app
         // becomes active, for a window left open).
-        .onAppear { loginItem.refresh() }
+        .onAppear {
+            loginItem.refresh()
+            minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
+        }
         .sheet(isPresented: $editingApps) { AppsSheet(manager: manager) }
         .sheet(isPresented: $editingHotspot) {
             HotspotSheet(manager: manager, secrets: secrets, locationPermission: locationPermission)
         }
+        .onChange(of: manager.config.defaultPreset) {
+            if !minimalDurationFocused {
+                minimalDuration = MinimalDurationSetting(seconds: manager.config.defaultPreset)
+            }
+        }
+        .onChange(of: minimalDurationFocused) {
+            if !minimalDurationFocused { commitMinimalDuration() }
+        }
     }
+
+    private func commitMinimalDuration() {
+        manager.updateConfig { config in _ = minimalDuration.apply(to: &config) }
+    }
+
+    /// Under the keep-awake toggle.
+    static let keepScreenAwakeNote = "Off by default. When on, the display never turns off on its own during a session, so the screen saver never starts and the screen never locks, and agents that drive the screen keep working. With the lid closed the display goes to brightness 0 instead of sleeping. When the session ends, idle display sleep and the lock come back. Anyone who opens the Mac during the session finds it unlocked."
 
     /// Under the mute toggle and in the README. Apple Platform Security,
     /// "Hardware microphone disconnect".
@@ -172,9 +242,37 @@ struct SettingsView: View {
 
     private var appSection: some View {
         Section("General") {
-            Picker("Default session length", selection: manager.binding(\.defaultPreset)) {
-                ForEach(lengths, id: \.self) { length in
-                    Text(Self.lengthLabel(length)).tag(length)
+            Picker(selection: manager.binding(\.menuBarMode)) {
+                ForEach(Config.MenuBarMode.allCases, id: \.self) { style in
+                    Text(Self.styleName(style)).tag(style)
+                }
+            } label: {
+                Text("Menu bar")
+                Text(Self.styleDescription(manager.config.menuBarMode))
+            }
+            Toggle(isOn: manager.binding(\.oneClickStart)) {
+                Text("Start a session with one click")
+                Text(Self.oneClickDescription(manager.config.menuBarMode))
+            }
+            .disabled(manager.config.menuBarMode == .minimal)
+            if manager.config.menuBarMode == .minimal {
+                // Every Minimal click adds this length, so any length can be
+                // typed, not only a preset.
+                TextField("Default session length", text: $minimalDuration.text, prompt: Text("1d 2h 30m"))
+                    .textFieldStyle(.roundedBorder)
+                    .focused($minimalDurationFocused)
+                    .onSubmit(commitMinimalDuration)
+                    .onChange(of: minimalDuration.text) { minimalDuration.error = nil }
+                    .onDisappear(perform: commitMinimalDuration)
+                    .help("Days, hours and minutes, such as 1d 2h 30m. Press Return to save.")
+                if let error = minimalDuration.error {
+                    Text(error).font(.caption).foregroundStyle(.red)
+                }
+            } else {
+                Picker("Default session length", selection: manager.binding(\.defaultPreset)) {
+                    ForEach(lengths, id: \.self) { length in
+                        Text(Self.lengthLabel(length)).tag(length)
+                    }
                 }
             }
             Picker("Default field", selection: manager.binding(\.defaultFocusField)) {
@@ -194,6 +292,15 @@ struct SettingsView: View {
                 Text("Show the countdown in the menu bar")
                 Text("Off: the eye alone shows a session, open while one runs and closed when none does. Right-click it for the time left and End session; click it to add time.")
             }
+            Toggle("Keep the screen on and unlocked", isOn: manager.binding(\.keepScreenAwake))
+                .onChange(of: manager.config.keepScreenAwake) { manager.syncScreenAwake() }
+            Text(Self.keepScreenAwakeNote)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Toggle(isOn: manager.binding(\.sessionSounds)) {
+                Text("Play a sound when you start or end a session")
+                Text("Only for a start or an end you ask for in the menu bar, and not while the displays sleep or the lid is closed.")
+            }
             Toggle("Open at login", isOn: launchAtLogin)
             loginItemNote
             LabeledContent("Version") {
@@ -208,6 +315,41 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+        }
+    }
+
+    /// What Settings calls each menu bar style.
+    static func styleName(_ style: Config.MenuBarMode) -> String {
+        switch style {
+        case .pills: "Pills"
+        case .compact: "Compact"
+        case .minimal: "Minimal"
+        case .popover: "Popover"
+        }
+    }
+
+    /// One line under the menu bar picker on what the chosen style does.
+    static func styleDescription(_ style: Config.MenuBarMode) -> String {
+        switch style {
+        case .pills: "Duration pills and the countdown beside the eye."
+        case .compact: "Only the eye. A click opens the pills in a panel."
+        case .minimal: "A ring for the time left. Click adds, hold ends."
+        case .popover: "The eye and its countdown. Any click opens a popover."
+        }
+    }
+
+    /// One line under the one-click switch on what a click does with it on
+    /// and off in the chosen style.
+    static func oneClickDescription(_ style: Config.MenuBarMode) -> String {
+        switch style {
+        case .pills:
+            "On: with no session running, a click starts the default length and Option-click opens the pills. Off: a click opens the pills."
+        case .compact:
+            "On: with no session running, a click starts the default length and Option-click opens the panel. Off: a click opens the panel."
+        case .popover:
+            "On: with no session running, a click starts the default length, and Option-click or right-click opens the popover. Off: a click opens the popover."
+        case .minimal:
+            "Minimal adds the default length on every click, so this switch does nothing in Minimal."
         }
     }
 

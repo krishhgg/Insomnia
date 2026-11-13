@@ -14,6 +14,7 @@ final class ConfigTests: XCTestCase {
 
     func testDefaults() {
         let c = Config()
+        XCTAssertFalse(c.compactMode)
         XCTAssertEqual(c.presets, [1800, 3600, 7200, 14400, 28800, 43200, 86400, 259200])
         XCTAssertEqual(c.lowPowerFloor, 40)
         XCTAssertEqual(c.endFloor, 10)
@@ -43,6 +44,21 @@ final class ConfigTests: XCTestCase {
 
     /// Enter after `continue` is opt-in: a config.json written before the
     /// key existed, or without it, keeps it off; an explicit true is honoured.
+    /// Keeping the screen awake leaves the Mac unlocked, so it is opt-in: a
+    /// config.json without the key keeps it off; an explicit true is honoured.
+    func testKeepScreenAwakeDecodesAndDefaultsOff() throws {
+        XCTAssertFalse(Config().keepScreenAwake)
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"tmuxTargets": ["agents:0.0"]}"#.utf8))
+        XCTAssertFalse(legacy.keepScreenAwake)
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"keepScreenAwake": true}"#.utf8))
+        XCTAssertTrue(on.keepScreenAwake)
+        var expected = earlierBuild()
+        expected.keepScreenAwake = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+    }
+
     func testTmuxNudgePressesEnterDecodesAndDefaultsOff() throws {
         let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"tmuxTargets": ["agents:0.0"]}"#.utf8))
         XCTAssertFalse(legacy.tmuxNudgePressesEnter)
@@ -370,6 +386,32 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(freeze.settingsLine, "This update changed a lid-close setting: \"All other apps\" now keep running when the lid closes. All other apps is behind the Edit Apps\u{2026} button.")
     }
 
+    func testCompactModeDefaultsOffForOlderConfigs() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"presets": [600], "defaultPreset": 600}"#.utf8))
+        XCTAssertFalse(legacy.compactMode)
+        XCTAssertEqual(legacy.presets, [600])
+        XCTAssertEqual(legacy.defaultPreset, 600)
+    }
+
+    func testCompactModePersistsAcrossReloadAndCanBeTurnedOff() throws {
+        let home = TempHome()
+        defer { home.destroy() }
+        let store = Store(paths: home.paths)
+        var config = Config()
+        config.compactMode = true
+        config.hotspotSSID = "iPhone"
+        config.presets = [600]
+        try store.saveConfig(config)
+
+        let reloaded = try XCTUnwrap(Store(paths: home.paths).loadConfig())
+        XCTAssertTrue(reloaded.compactMode)
+        XCTAssertEqual(reloaded, config, "Changing presentation mode preserves the other settings")
+
+        config.compactMode = false
+        try store.saveConfig(config)
+        XCTAssertEqual(try Store(paths: home.paths).loadConfig(), config)
+    }
+
     /// A config.json written before the display toggle existed keeps the
     /// default (on); an explicit false is honoured.
     func testDarkenDisplayDecodesTolerantly() throws {
@@ -412,6 +454,37 @@ final class ConfigTests: XCTestCase {
         XCTAssertTrue(on.disableAppNapForAgents)
         var expected = earlierBuild()
         expected.disableAppNapForAgents = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+    }
+
+    /// One-click start is opt-in: a config.json without the key keeps it
+    /// off; an explicit true is honoured and round-trips.
+    func testOneClickStartDecodesAndDefaultsOff() throws {
+        XCTAssertFalse(Config().oneClickStart)
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"menuBarMode": "compact"}"#.utf8))
+        XCTAssertFalse(legacy.oneClickStart)
+        XCTAssertEqual(legacy.menuBarMode, .compact)
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"oneClickStart": true}"#.utf8))
+        XCTAssertTrue(on.oneClickStart)
+        var expected = earlierBuild()
+        expected.oneClickStart = true
+        XCTAssertEqual(on, expected)
+        let data = try Store.makeEncoder().encode(on)
+        XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)
+    }
+
+    /// The start and end sounds are opt-in: a config.json without the key
+    /// keeps them off; an explicit true is honoured and round-trips.
+    func testSessionSoundsDecodeAndDefaultOff() throws {
+        XCTAssertFalse(Config().sessionSounds)
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"launchAtLogin": true}"#.utf8))
+        XCTAssertFalse(legacy.sessionSounds)
+        let on = try Store.makeDecoder().decode(Config.self, from: Data(#"{"sessionSounds": true}"#.utf8))
+        XCTAssertTrue(on.sessionSounds)
+        var expected = earlierBuild()
+        expected.sessionSounds = true
         XCTAssertEqual(on, expected)
         let data = try Store.makeEncoder().encode(on)
         XCTAssertEqual(try Store.makeDecoder().decode(Config.self, from: data), on)

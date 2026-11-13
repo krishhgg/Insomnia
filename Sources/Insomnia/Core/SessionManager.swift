@@ -130,6 +130,11 @@ final class SessionManager {
     /// visible beside it. Cleared by a session start, or by
     /// `recheckForeignSleep()` once the bit reads 0 again.
     private(set) var foreignSleepWarning: String?
+    /// The live check found SleepDisabled 0 during this session and could
+    /// not set it again (`checkSleepHeld()`): closing the lid would sleep
+    /// this Mac. Cleared by a check that finds it held again, a start, or
+    /// an end.
+    private(set) var sleepNotHeld = false
     /// The sudo pmset left running (`unfinishedCommand`), what it holds up
     /// and the pid to stop it by hand. Kept apart from `lastError` so the
     /// command's exit removes it without touching a newer failure: the task
@@ -156,6 +161,20 @@ final class SessionManager {
     }
 
     var isActive: Bool { session != nil }
+
+    /// An end runs now or is owed (`pendingEnd`), whoever asked for it: the
+    /// user, the timer, a floor, `--session end`, a reconcile or a failed
+    /// start. True from the request until the end restores sleep or leaves
+    /// what is left to the recovery agent, through every retry. The Compact
+    /// panel and the popover show Ending… while it lasts.
+    var isEnding: Bool { endsRunning > 0 || pendingEnd != nil }
+
+    /// The end owed changed nothing and nothing runs it now: the session is
+    /// still active, after a busy lock (retried in `recoveryRetryDelay`),
+    /// an unreadable state.json (waits for a person) or a command holding
+    /// the lock (retried when it exits). Asking for the end again tries it
+    /// at once.
+    var endIsWaiting: Bool { endsRunning == 0 && pendingEnd != nil && session != nil }
 
     /// Journal edits owed by a freeze that `LidActions` undid because the
     /// write confirming it failed (`clearUndoneFreeze`).
@@ -189,10 +208,14 @@ final class SessionManager {
         /// failed restore, retried like any other and counted as dirty by
         /// backstop.sh and uninstall.sh.
         case unflag(Float)
+        /// An old keyboard zero needs no hardware undo, even if the
+        /// private-call guard refuses. Its clear still has to reach disk.
+        case discardedZero
 
         var saved: Float {
             switch self {
             case .clear(let value), .restored(let value, _), .unflag(let value): value
+            case .discardedZero: 0
             }
         }
 
@@ -205,10 +228,18 @@ final class SessionManager {
         /// `s` still holds the entry with that value and its flag. Lost, it
         /// leaves that entry for the next launch to read again.
         func clearsEntry(in s: RuntimeState, saved: KeyPath<RuntimeState, Float?>, flag: KeyPath<RuntimeState, Bool>) -> Bool {
-            !isUnflag && s[keyPath: flag] && s[keyPath: saved] == self.saved
+            if case .discardedZero = self { return s[keyPath: saved] == 0 }
+            return !isUnflag && s[keyPath: flag] && s[keyPath: saved] == self.saved
         }
 
         func apply(to s: inout RuntimeState, saved: WritableKeyPath<RuntimeState, Float?>, flag: WritableKeyPath<RuntimeState, Bool>, restoredUnderLowPower: WritableKeyPath<RuntimeState, Float?>? = nil) {
+            if case .discardedZero = self {
+                if s[keyPath: saved] == 0 {
+                    s[keyPath: saved] = nil
+                    s[keyPath: flag] = false
+                }
+                return
+            }
             guard s[keyPath: flag], s[keyPath: saved] == self.saved else { return }
             if !isUnflag { s[keyPath: saved] = nil }
             s[keyPath: flag] = false
@@ -223,6 +254,7 @@ final class SessionManager {
             case .clear(let value): "\(what) \(value), set since its refused restore, cleared from the journal"
             case .restored(let value, _): "\(what) \(value), restored, cleared from the journal"
             case .unflag(let value): "\(what) \(value), whose restore failed, marked in the journal for retry"
+            case .discardedZero: "\(what) zero restore discarded without a brightness write"
             }
         }
     }
@@ -279,6 +311,7 @@ final class SessionManager {
                 switch edit {
                 case .clear(let value)?: "\(what) \(value), set since its refused restore, still to be cleared from the journal"
                 case .restored(let value, _)?: "\(what) \(value), restored, still to be cleared from the journal"
+                case .discardedZero?: "\(what) zero restore still to be cleared from the journal"
                 case .unflag?, nil: nil
                 }
             }
@@ -381,6 +414,10 @@ final class SessionManager {
     private let processLookup: @Sendable (Int32) -> ProcessLookup
     private let recoveryLock: RecoveryLock
     private let recoveryLockTimeout: TimeInterval
+    /// How a transaction waits for the recovery lock, for at most the
+    /// timeout: `RecoveryLock.acquire` in the app. Tests hold a wait to
+    /// choose when it gives up and when it takes the lock.
+    private let acquireRecoveryLock: @Sendable (RecoveryLock, TimeInterval) async throws -> RecoveryLockHandle
     private let recoveryRetryDelay: TimeInterval
     /// How long after a display/keyboard restore the same values are
     /// written once more. powerd re-applies its own remembered brightness
@@ -439,6 +476,13 @@ final class SessionManager {
     /// nil in tests. Started after a session starts, stopped when it ends.
     @ObservationIgnored var services: AppServices?
 
+    /// The display hold behind `Config.keepScreenAwake` (`ScreenAwake`).
+    @ObservationIgnored private let screenAwake: ScreenAwake
+    /// Set by an end request, cleared when a session starts. From the
+    /// request on the display is not held, even while a refused end (busy
+    /// lock, unreadable journal) leaves the session active.
+    @ObservationIgnored private var endRequestedSinceStart = false
+
     @ObservationIgnored private var deadlineTimer: Timer?
     @ObservationIgnored private var countdownTimer: Timer?
     @ObservationIgnored private var retryTimer: Timer?
@@ -446,6 +490,11 @@ final class SessionManager {
     /// across sessions: it is the displays' state, not the session's. The
     /// status item watches it to stop its own tick for a pending start.
     private(set) var displaysAsleep = false
+    /// Why the last session ended: the reason of the end that found it
+    /// running. An end that found none (one queued behind the timer's,
+    /// say) leaves it alone. The status item plays its end sound only
+    /// when this is `.user`.
+    @ObservationIgnored private(set) var lastEndReason: EndReason?
     /// Whether the 1 Hz redraw is currently on the run loop. Tests assert on
     /// this to prove an idle session leaves no repeating wakeup behind.
     var countdownTimerArmed: Bool { countdownTimer != nil }
@@ -464,8 +513,14 @@ final class SessionManager {
     /// Set by a quit request; new sessions are refused from then on.
     @ObservationIgnored private(set) var quitRequested = false
     /// An end that could not complete (lock busy, or dirty with no agent to
-    /// retry). Retried in process; new starts wait until it is resolved.
-    @ObservationIgnored private(set) var pendingEnd: EndReason?
+    /// retry). Retried in process; new starts and extends are refused until
+    /// it is resolved.
+    /// Observed, for `isEnding`.
+    private(set) var pendingEnd: EndReason?
+    /// Ends running now: `end` from the request until it returns, and
+    /// `performEnd` for the callers that run it directly. Observed, for
+    /// `isEnding`.
+    private var endsRunning = 0
     /// Tail of the lifecycle queue.
     @ObservationIgnored private var lifecycleTail: Task<Void, Never>?
     /// Detail of the last unreadable-journal notification, so a journal
@@ -490,6 +545,9 @@ final class SessionManager {
     /// a journal write has that entry cleared, if it is still the one
     /// shown: it says the clear will be retried (`persistState`).
     @ObservationIgnored private var uncleared: (message: String, clear: (inout RuntimeState) -> Void)?
+    /// That line while it is up, or nil. It says why a clear is owed, not
+    /// why a start was refused, so the popover doesn't copy it as one.
+    var unclearedEntryLine: String? { uncleared?.message }
     /// A lid close or open refused while `unfinishedCommand` ran. Replayed
     /// for the lid's latest state once it has exited; cleared then, or by
     /// a session end, which undoes every lid action in the journal.
@@ -511,6 +569,8 @@ final class SessionManager {
     /// bit Insomnia did not set (reconcile step 3), so a bit that stays set
     /// is announced once, not on every reconcile.
     @ObservationIgnored private var announcedForeignSleep = false
+    /// `sleepNotHeld` has been posted as a notification this session.
+    @ObservationIgnored private var announcedSleepNotHeld = false
     /// Set by reconcile when session.json could not be read, or was not a
     /// session, and could not be moved aside either. The file is evidence,
     /// never deleted. Left under its own name, every later launch and the
@@ -544,11 +604,13 @@ final class SessionManager {
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
         appNap: any AppNapPreferencing = NoopAppNapPreferences(),
+        displayAssertions: any DisplayAssertionHolding = NoopDisplayAssertions(),
         notifier: any Notifying = RecordingNotifier(),
         clamshell: @escaping @Sendable () -> Bool? = { LidObserver.readClamshellState() },
         clock: @escaping @Sendable () -> Date = { Date() },
         processLookup: @escaping @Sendable (Int32) -> ProcessLookup = { SignalProcessControl.processTableState(pid: $0) },
         recoveryLockTimeout: TimeInterval = 10,
+        acquireRecoveryLock: @escaping @Sendable (RecoveryLock, TimeInterval) async throws -> RecoveryLockHandle = { try await $0.acquire(timeout: $1) },
         recoveryRetryDelay: TimeInterval = 30,
         reassertDelay: Duration = .seconds(2),
         keptRecheckDelay: Duration = .seconds(3),
@@ -565,12 +627,14 @@ final class SessionManager {
         self.display = display
         self.keyboard = keyboard
         self.appNap = appNap
+        self.screenAwake = ScreenAwake(assertions: displayAssertions)
         self.notifier = notifier
         self.clamshell = clamshell
         self.clock = clock
         self.processLookup = processLookup
         self.recoveryLock = RecoveryLock(url: paths.recoveryLock)
         self.recoveryLockTimeout = recoveryLockTimeout
+        self.acquireRecoveryLock = acquireRecoveryLock
         self.recoveryRetryDelay = recoveryRetryDelay
         self.reassertDelay = reassertDelay
         self.keptRecheckDelay = keptRecheckDelay
@@ -647,6 +711,7 @@ final class SessionManager {
             display: display,
             keyboard: keyboard,
             appNap: CFAppNapPreferences(),
+            displayAssertions: IOPMDisplayAssertions(),
             notifier: notifier
         )
         let services = AppServices(
@@ -661,6 +726,56 @@ final class SessionManager {
         services.logStartupSnapshot()
         return m
     }
+
+    // MARK: Screen awake
+
+    /// Whether the display is held awake right now.
+    var screenAwakeHeld: Bool { screenAwake.isHeld }
+
+    /// Holds the display awake while a session is active with
+    /// `Config.keepScreenAwake` on and no end requested since it started,
+    /// and releases it otherwise. The hold times out at the session's
+    /// deadline, so a hung process can't keep the screen unlocked past it,
+    /// and each new deadline moves the timeout. Settings calls it when the
+    /// toggle changes. A hold or a move of its timeout that macOS refuses
+    /// goes to the menu, and so does a refused release, which stays held;
+    /// quitting Insomnia releases it, since the assertion belongs to the
+    /// process. A retry that fails the same way leaves a newer line about
+    /// anything else in place. Once the hold matches again, that menu line
+    /// goes if it is still the line shown; a newer failure stays.
+    func syncScreenAwake() {
+        if isActive, config.keepScreenAwake, !endRequestedSinceStart, let endsAt = session?.endsAt {
+            if screenAwake.hold(until: endsAt, now: clock()) {
+                clearScreenAwakeFailure()
+            } else {
+                reportScreenAwakeFailure(Self.screenAwakeHoldFailure)
+            }
+        } else if screenAwake.release() {
+            clearScreenAwakeFailure()
+        } else {
+            reportScreenAwakeFailure(Self.screenAwakeReleaseFailure)
+        }
+    }
+
+    /// The screen awake failure last put in the menu, until a hold or a
+    /// release works again.
+    @ObservationIgnored private var screenAwakeFailure: String?
+
+    /// Shows `message` unless it is the failure already reported and the
+    /// menu now shows something else, which came after it.
+    private func reportScreenAwakeFailure(_ message: String) {
+        if screenAwakeFailure == message, lastError != nil { return }
+        screenAwakeFailure = message
+        fail(message)
+    }
+
+    private func clearScreenAwakeFailure() {
+        if let shown = screenAwakeFailure, lastError == shown { lastError = nil }
+        screenAwakeFailure = nil
+    }
+
+    private static let screenAwakeHoldFailure = "could not hold the display on until the session ends, so the display can sleep and lock the screen; turn \"Keep the screen on and unlocked\" off and on in Settings to try again"
+    private static let screenAwakeReleaseFailure = "could not release the display hold, so the display stays on and the screen does not lock on its own; quit Insomnia to release it"
 
     // MARK: Lifecycle queue
 
@@ -723,7 +838,7 @@ final class SessionManager {
             }
             let handle: RecoveryLockHandle
             do {
-                handle = try await self.recoveryLock.acquire(timeout: self.recoveryLockTimeout)
+                handle = try await self.acquireRecoveryLock(self.recoveryLock, self.recoveryLockTimeout)
             } catch {
                 let line = "\(what) skipped, nothing changed: \(error.localizedDescription)\(self.recordedLockHolder(error))"
                 self.fail(line)
@@ -774,6 +889,26 @@ final class SessionManager {
     private func loadJournal() throws {
         state = try store.loadState() ?? .clean
         if claimsLowPowerInThisBoot(state) { lowPowerWasOurs = true }
+        dropUnclearedLine(ifSettledIn: state, writtenHere: false)
+    }
+
+    /// Re-read the journal while a failed clear's line is up, and drop the
+    /// line once its entry is gone from disk, as when the backstop cleared
+    /// it after this process could not (issue #124). The menu calls this
+    /// before it opens. The read takes no lock; a journal that does not
+    /// read keeps the line. When the line goes, the journal just read
+    /// becomes `state`, so the menu's other lines (such as sleep held with
+    /// no session) go with it. Only a lock holder writes the journal, and
+    /// `state` is always what this process last read or wrote, so outside
+    /// a transaction this only brings it up to date, and inside one the
+    /// two are the same.
+    func recheckUnclearedEntry() {
+        guard uncleared != nil else { return }
+        guard let s = try? store.loadState() ?? .clean else { return }
+        dropUnclearedLine(ifSettledIn: s, writtenHere: false)
+        guard uncleared == nil else { return }
+        state = s
+        if claimsLowPowerInThisBoot(s) { lowPowerWasOurs = true }
     }
 
     /// `s` journals Insomnia's Low Power Mode, by a claim not read from
@@ -1285,9 +1420,13 @@ final class SessionManager {
         lastError = nil
         countdownPaused = clamshell() == true
         foreignSleepWarning = nil
+        sleepNotHeld = false
+        announcedSleepNotHeld = false
         Log.info("session started until \(iso(new.endsAt)) (\(Int(duration))s requested)")
         await armDeadline(new.endsAt)
         applyAppNapInJournal()
+        endRequestedSinceStart = false
+        syncScreenAwake()
         // Every observer lives in AppServices.
         services?.start(for: self)
         // PR3: schedule "5 minutes left" notification.
@@ -1299,8 +1438,14 @@ final class SessionManager {
     }
 
     /// `extend`, returning whether this call moved the deadline out.
+    /// Refused while an end is pending, as a start is: the end's retry
+    /// would end the session the time was added to.
     func tryExtend(by extra: TimeInterval) async -> Bool {
         guard session != nil else { return false }
+        guard pendingEnd == nil else {
+            fail(Self.extendEndPendingRefusal)
+            return false
+        }
         let ticket = endTicket
         let extended = await exclusive("extend") { await self.performExtend(by: extra, ticket: ticket) }
         if case .success(true) = extended { return true }
@@ -1309,6 +1454,13 @@ final class SessionManager {
 
     private func performExtend(by extra: TimeInterval, ticket: Int) async -> Bool {
         guard let current = session, endTicket == ticket else { return false }
+        // An end queued ahead of this extend may have changed nothing and
+        // left itself to its retry, which would end the session extended
+        // now. Its request came before this extend's, so the ticket matches.
+        guard pendingEnd == nil else {
+            fail(Self.extendEndPendingRefusal)
+            return false
+        }
         let updated = SessionMath.extended(current, by: extra, now: clock(), maxDuration: config.maxDuration)
         // The agent enforces whatever deadline is on disk; confirm it is
         // still loaded before moving that deadline out.
@@ -1332,6 +1484,7 @@ final class SessionManager {
         lastError = nil
         Log.info("session extended by \(Int(extra))s until \(iso(updated.endsAt))")
         await armDeadline(updated.endsAt)
+        syncScreenAwake()
         // The cap is now + maxDuration, so at the cap the end only creeps out
         // by the time since the last extend, and after a lower maxDuration
         // it moves earlier. Neither is an extension to report. A request is
@@ -1349,7 +1502,14 @@ final class SessionManager {
     /// be read the end changes nothing and waits for a person.
     @discardableResult
     func end(reason: EndReason) async -> EndOutcome {
+        endsRunning += 1
+        defer { endsRunning -= 1 }
         endTicket += 1
+        // Before the lock or the journal can refuse the end: a refused end
+        // leaves the session active, and the display must not stay held
+        // past the deadline or the user's end.
+        endRequestedSinceStart = true
+        syncScreenAwake()
         if reason == .quit { quitRequested = true }
         retryTimer?.invalidate()
         retryTimer = nil
@@ -1363,6 +1523,10 @@ final class SessionManager {
         switch outcome {
         case .restored, .incomplete(agentArmed: true):
             pendingEnd = nil
+            // A start or extend refused for this end said it is retried,
+            // and it no longer is. A newer line, this end's own failure
+            // included, stays.
+            if let line = lastError, Self.endPendingRefusals.contains(line) { lastError = nil }
         case .locked:
             notifier.post(
                 title: Self.notEndedTitle,
@@ -1390,11 +1554,19 @@ final class SessionManager {
     }
 
     private func performEnd(reason: EndReason) async -> EndOutcome {
+        endsRunning += 1
+        defer { endsRunning -= 1 }
         let had = session != nil
+        if had { lastEndReason = reason }
         Log.info("session end (\(reason.rawValue))")
         stopTimers()
         countdownPaused = false
         session = nil
+        sleepNotHeld = false
+        // The display hold goes with the session, before the restore below
+        // waits on any command. A reconcile or a failed start ends here
+        // without `end()`, which releases it first otherwise.
+        syncScreenAwake()
         // Every lid action is undone from the journal below, or by the
         // retry of this end, and Low Power Mode restored from it: a lid
         // event refused earlier, a settle pass waiting to run again and
@@ -1421,6 +1593,7 @@ final class SessionManager {
         }
         let stuck = await restoreAll()
         services?.stop()
+        syncScreenAwake()
 
         if let stuck {
             // restoreAll stopped at a sudo pmset that did not stop on SIGTERM
@@ -2159,7 +2332,7 @@ final class SessionManager {
         } else if let saved = kept.savedDisplayBrightness {
             restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
         }
-        if let saved = kept.savedKeyboardBrightness, let why = keyboard.refusal() {
+        if let saved = kept.savedKeyboardBrightness, saved != 0, let why = keyboard.refusal() {
             refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
         } else if let saved = kept.savedKeyboardBrightness {
             restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
@@ -2264,6 +2437,19 @@ final class SessionManager {
 
     /// As restoreDisplay, for the keyboard backlight.
     private func restoreKeyboard(saved: Float, waiting: inout [String], errors: inout [String]) -> Float? {
+        if saved == 0 {
+            do {
+                try journal { s in
+                    s.savedKeyboardBrightness = nil
+                    s.keyboardRestoreRefused = false
+                }
+            } catch {
+                owedEdits.keyboard = .discardedZero
+                errors.append("could not clear the obsolete zero keyboard restore: \(error.localizedDescription); it will be retried")
+            }
+            Log.info("zero keyboard restore discarded without a brightness write")
+            return nil
+        }
         if effectiveState.keyboardRestoreRefused {
             switch keptLevel(read: { try keyboard.readBrightness() },
                              untrusted: { keyboard.isSuppressedOrDimmed() ? "macOS has the backlight suppressed or dimmed" : nil }) {
@@ -2341,7 +2527,7 @@ final class SessionManager {
     private func recheckKeptBrightness() async {
         let kept = effectiveState
         let rereadDisplay = kept.savedDisplayBrightness != nil && kept.displayRestoreRefused && display.refusal() == nil
-        let rereadKeyboard = kept.savedKeyboardBrightness != nil && kept.keyboardRestoreRefused && keyboard.refusal() == nil
+        let rereadKeyboard = kept.savedKeyboardBrightness != nil && kept.keyboardRestoreRefused && (kept.savedKeyboardBrightness == 0 || keyboard.refusal() == nil)
         guard rereadDisplay || rereadKeyboard || !owedEdits.clearsWaiting.isEmpty else { return }
         guard clamshell() == false || !(rereadDisplay || rereadKeyboard) else {
             if !keptRecheckSawLidClosed {
@@ -2457,6 +2643,14 @@ final class SessionManager {
             }
             Log.error("could not clear the display write owed after low power mode from the journal: \(error.localizedDescription); it is not made, and the next journal write or transaction clears it")
         }
+    }
+
+    func cancelBrightnessReassert() {
+        if pendingReassert.display != nil || pendingReassert.keyboard != nil {
+            Log.info("pending brightness re-assert canceled: lid closed again")
+        }
+        reassertTask?.cancel()
+        pendingReassert = (nil, nil)
     }
 
     /// The second write of a restore, `reassertDelay` later. Best effort:
@@ -2674,8 +2868,11 @@ final class SessionManager {
                 lastError = nil
             } catch let still as CommandStillRunningError {
                 // Not surfaced: the session file and journal stay for the end
-                // that runs once the command has exited.
+                // that runs once the command has exited. A display hold that
+                // the Settings toggle took during the awaits above goes with
+                // the session.
                 session = nil
+                syncScreenAwake()
                 stopTransaction(for: still, thenEnd: .recoveryUnavailable)
                 return
             } catch {
@@ -2699,6 +2896,7 @@ final class SessionManager {
             countdownPaused = lidClosed == true
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
+            syncScreenAwake()
             services?.start(for: self)
             return
         }
@@ -2873,6 +3071,145 @@ final class SessionManager {
         notifier.post(
             title: Self.foreignSleepTitle,
             body: "pmset reports SleepDisabled 1, but Insomnia has no session and did not set it, so it is left alone. To re-enable sleep: \(Self.foreignSleepCommand). Ending an Insomnia session also sets it to 0."
+        )
+    }
+
+    /// The live check behind a running session. A start reads SleepDisabled
+    /// back once, `PmsetSleepGuard.settle` after setting it; powerd or
+    /// another tool can still set it back to 0 later, and a closed lid then
+    /// sleeps the Mac. Run every 30 s during a session (`AppServices`) and
+    /// on popover open. The read takes no lock, so it never waits behind a
+    /// start or an end; only a 0 takes the transaction, which reads again
+    /// under the lock and sets the bit again. A set that holds is logged
+    /// and says nothing else; one that fails puts up `sleepNotHeld` and
+    /// posts once per session, and the next check tries again.
+    ///
+    /// Nothing is read or set unless a session holds sleep and nothing is
+    /// ending it (`mayHoldSleepAgain`). The transaction asks again after
+    /// the lock, with the journal just read from disk, and once more after
+    /// its own read, right before the journal write: an end or a quit
+    /// requested while the check waited or while that read ran, a backstop
+    /// restore that cleared the journal or removed session.json, and a
+    /// deadline that passed all leave the bit at 0. The journal write
+    /// after that last check is synchronous, but `setSleepDisabled` waits
+    /// before sudo starts (the runner launches it from a dispatch queue),
+    /// and nothing checks again. An end or a quit asked for in that wait
+    /// or while pmset runs does not stop the set: it queues behind this
+    /// transaction, so `disablesleep 1` runs and the end's
+    /// `disablesleep 0` then restores sleep. A set that does not exit holds
+    /// that end up, as it would an end asked for just after the launch.
+    /// The journal entry is written again before pmset, so a crash right
+    /// after the set leaves the backstop an entry to undo.
+    ///
+    /// Once a read has found 0, a check that cannot set the bit again for
+    /// any other reason puts up the warning too: a transaction refused (the
+    /// recovery lock busy, a command still running, an unreadable journal)
+    /// or a read under the lock that fails. No failure warns when an end,
+    /// a quit or the deadline came meanwhile, a failed set included, since
+    /// sleep goes back on then.
+    /// A failed first read knows nothing new and changes nothing; only a
+    /// read of 1 or a set that holds takes the warning down.
+    func checkSleepHeld() async {
+        guard mayHoldSleepAgain else { return }
+        do {
+            if try await sleepGuard.isSleepDisabled() {
+                markSleepHeld()
+                return
+            }
+        } catch {
+            Log.error("sleep check failed: \(error.localizedDescription)")
+            return
+        }
+        let ticket = endTicket
+        let checked = await exclusive("sleep check") {
+            guard self.maySetSleepAgain(since: ticket) else { return }
+            do {
+                if try await self.sleepGuard.isSleepDisabled() {
+                    self.markSleepHeld()
+                    return
+                }
+            } catch {
+                // An end, a quit or the deadline that came while the
+                // read ran puts sleep back on anyway; nothing to warn of.
+                guard self.maySetSleepAgain(since: ticket) else { return }
+                self.reportSleepNotHeld("SleepDisabled read 0, then could not be read again: \(error.localizedDescription)")
+                return
+            }
+            // End or Quit can be asked for, and the deadline can pass,
+            // while the read above runs. The last check: an end asked for
+            // after it waits for the set below and then restores sleep.
+            guard self.maySetSleepAgain(since: ticket) else { return }
+            do {
+                try self.journal { $0.sleepDisabledByUs = true }
+            } catch {
+                self.reportSleepNotHeld("could not journal sleep guard: \(error.localizedDescription)")
+                return
+            }
+            Log.info("sleep check: SleepDisabled reads 0 during the session; setting it again")
+            do {
+                try await self.sleepGuard.setSleepDisabled(true)
+                Log.info("sleep check: SleepDisabled set again")
+                self.markSleepHeld()
+            } catch let still as CommandStillRunningError {
+                // The session goes on; the command's exit settles the rest.
+                // An end, a quit or the deadline that came while the set
+                // ran puts sleep back on anyway; nothing to warn of.
+                let warn = self.maySetSleepAgain(since: ticket)
+                self.stopTransaction(for: still, thenEnd: nil)
+                if warn { self.reportSleepNotHeld(still.localizedDescription) }
+            } catch {
+                guard self.maySetSleepAgain(since: ticket) else { return }
+                self.reportSleepNotHeld(error.localizedDescription)
+            }
+        }
+        // Refused before the read under the lock. An end asked for
+        // meanwhile, or a backstop restore, leaves the bit at 0 anyway.
+        guard case let .failure(refusal) = checked, maySetSleepAgain(since: ticket) else { return }
+        switch refusal {
+        case let .lockBusy(line), let .journalUnreadable(line):
+            reportSleepNotHeld("SleepDisabled reads 0: \(line)")
+        case let .commandRunning(pid):
+            reportSleepNotHeld("SleepDisabled reads 0: sudo pmset (pid \(pid)) still holds the recovery lock")
+        }
+    }
+
+    /// A session holds sleep by the journal and nothing is ending it: no
+    /// end waiting to be retried, no quit, and the end time not reached
+    /// (the deadline timer or the backstop is ending it).
+    private var mayHoldSleepAgain: Bool {
+        guard let s = session, state.sleepDisabledByUs, pendingEnd == nil, !quitRequested else { return false }
+        return s.endsAt > clock()
+    }
+
+    /// The sleep check's transaction may go on: no end asked for since the
+    /// check took `ticket`, the session still holds sleep with nothing
+    /// ending it, and session.json is still live.
+    private func maySetSleepAgain(since ticket: Int) -> Bool {
+        endTicket == ticket && mayHoldSleepAgain && sessionFileIsLive()
+    }
+
+    /// session.json is on disk and has not reached its end. The backstop
+    /// removes it when it ends a session (`backstop.sh`), so a check that
+    /// finds it gone or ended leaves the bit to the backstop.
+    private func sessionFileIsLive() -> Bool {
+        guard keptSessionFile == nil, let saved = try? store.loadSession() else { return false }
+        return saved.endsAt > clock()
+    }
+
+    private func markSleepHeld() {
+        guard sleepNotHeld else { return }
+        sleepNotHeld = false
+        Log.info("sleep check: SleepDisabled reads 1 again")
+    }
+
+    private func reportSleepNotHeld(_ detail: String) {
+        sleepNotHeld = true
+        Log.error("sleep check: could not set SleepDisabled again: \(detail)")
+        guard !announcedSleepNotHeld else { return }
+        announcedSleepNotHeld = true
+        notifier.post(
+            title: Self.sleepNotHeldTitle,
+            body: "Sleep was turned back on during this session and Insomnia could not turn it off again, so closing the lid will sleep this Mac. Insomnia tries again every 30 seconds."
         )
     }
 
@@ -3054,19 +3391,25 @@ final class SessionManager {
         try store.saveState(s)
         state = s
         if claimsLowPowerInThisBoot(s) { lowPowerWasOurs = true }
-        // The entry a failed clear left is gone once its clear changes no
-        // undo entry of what was written, or nothing is left to undo,
-        // whichever write did it. The display write owed after Low Power
-        // Mode is left out: a retry made once the mode is off owes none,
-        // where the failed clear did.
-        if let (message, clear) = uncleared {
-            var cleared = s
-            clear(&cleared)
-            if cleared.undoEntries == s.undoEntries || !s.isDirty {
-                if lastError == message { lastError = nil }
-                uncleared = nil
-            }
-        }
+        dropUnclearedLine(ifSettledIn: s, writtenHere: true)
+    }
+
+    /// The entry a failed clear left is gone once its clear changes no
+    /// undo entry of `s`, whoever wrote it. When this process wrote `s`,
+    /// it is also gone once nothing is left to undo. A read alone doesn't
+    /// show that: an entry kept after a refused restore doesn't count as
+    /// something to undo, but after a later restore whose clear failed it
+    /// is still on disk, and quit waits for that clear. The display write
+    /// owed after Low Power Mode is left out: a retry made once the mode
+    /// is off owes none, where the failed clear did. A newer error in the
+    /// menu stays.
+    private func dropUnclearedLine(ifSettledIn s: RuntimeState, writtenHere: Bool) {
+        guard let (message, clear) = uncleared else { return }
+        var cleared = s
+        clear(&cleared)
+        guard cleared.undoEntries == s.undoEntries || (writtenHere && !s.isDirty) else { return }
+        if lastError == message { lastError = nil }
+        uncleared = nil
     }
 
     /// Logs `message` and shows it in the status menu until the next
@@ -3219,7 +3562,12 @@ final class SessionManager {
     static let commandRunningTitle = "Power command still running"
     static let sessionFileTitle = "Session file unreadable"
     static let endPendingRefusal = "start refused: the previous session is still being ended; retrying shortly"
+    static let extendEndPendingRefusal = "extend refused: the session is still being ended; retrying the end shortly"
+    /// Taken down when the end they wait for finishes or is handed to the
+    /// recovery agent.
+    static let endPendingRefusals: Set<String> = [endPendingRefusal, extendEndPendingRefusal]
     static let foreignSleepTitle = "Sleep is disabled by something else"
+    static let sleepNotHeldTitle = "Sleep is back on"
     static let foreignSleepCommand = "sudo pmset -a disablesleep 0"
     static let foreignSleepLine = "Sleep is disabled by something other than Insomnia; to re-enable it: \(foreignSleepCommand)"
 

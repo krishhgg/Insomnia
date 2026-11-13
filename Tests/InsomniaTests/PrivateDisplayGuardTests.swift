@@ -221,7 +221,8 @@ final class RefusedDarkeningTests: XCTestCase {
     /// display's sleep and wake land on `h.display`.
     private func makeDarkeningOnly(
         display: any DisplayDimming,
-        keyboard: any KeyboardBacklighting
+        keyboard: any KeyboardBacklighting,
+        sampler: BrightnessSampler? = nil
     ) -> (SessionManager, LidActions) {
         let m = h.makeManager()
         m.config.muteOnLidClose = false
@@ -235,7 +236,7 @@ final class RefusedDarkeningTests: XCTestCase {
             audio: h.audio,
             display: display,
             keyboard: keyboard,
-            sampler: nil
+            sampler: sampler
         )
         return (m, actions)
     }
@@ -274,6 +275,78 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertEqual(h.display.wakes, 1, "the display the close put to sleep is woken")
         XCTAssertEqual(h.keyboard.sets, [0, 0.5])
         XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+    }
+
+    /// A refused display journals nothing, and a keyboard that reads 0 is
+    /// left to macOS. The 0 is journaled anyway, with no keyboard write, so
+    /// the close still asks the display to sleep, which locks a screen set
+    /// to lock on display sleep. The open wakes the display and discards
+    /// the 0 without a write.
+    func testARefusedDisplayAndAZeroKeyboardStillAskTheDisplayToSleep() async throws {
+        h.keyboard.brightness = 0
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard)
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 1)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [], "the 0 stays with macOS")
+        let closed = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(closed.savedDisplayBrightness)
+        XCTAssertEqual(closed.savedKeyboardBrightness, 0)
+        XCTAssertTrue(logText().contains("keyboard backlight zero journaled with no write, so the open wakes the display this asks to sleep"), logText())
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 1, "the display the close asked to sleep is woken")
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+        XCTAssertTrue(logText().contains("zero keyboard restore discarded without a brightness write"), logText())
+        XCTAssertNil(m.lastError)
+    }
+
+    /// A positive keyboard reading macOS holds down is not trusted, and a
+    /// last sample of 0 is never restored, so the keyboard journals no
+    /// level. The 0 for the sleep request is journaled all the same.
+    func testARefusedDisplayAndAZeroSampleStillAskTheDisplayToSleep() async throws {
+        h.keyboard.brightness = 0
+        let sampler = BrightnessSampler(display: h.display, keyboard: h.keyboard, idleSeconds: { 3 })
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard, sampler: sampler)
+        sampler.follow(m)
+        await m.start(duration: 3600)
+        sampler.sample()
+        XCTAssertEqual(sampler.last?.keyboard, 0)
+        h.keyboard.brightness = 0.3
+        h.keyboard.suppressedOrDimmed = true
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 1)
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(try XCTUnwrap(try h.store.loadState()).savedKeyboardBrightness, 0)
+
+        h.keyboard.suppressedOrDimmed = false
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.wakes, 1)
+        XCTAssertEqual(h.keyboard.sets, [], "the 0 is discarded, and 0.3 stays as macOS has it")
+        XCTAssertNil(try h.store.loadState()?.savedKeyboardBrightness)
+    }
+
+    /// With "Keep the screen on and unlocked" on, the close asks for no
+    /// display sleep, so a keyboard that reads 0 journals nothing.
+    func testKeepScreenAwakeJournalsNoZeroForTheSleepRequest() async throws {
+        h.keyboard.brightness = 0
+        let (m, actions) = makeDarkeningOnly(display: refusedDisplay, keyboard: h.keyboard)
+        m.config.keepScreenAwake = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertFalse(try XCTUnwrap(try h.store.loadState()).brightnessJournaled)
     }
 
     /// Both devices refused: nothing is darkened or journaled, so nothing
@@ -608,8 +681,8 @@ final class RefusedDarkeningTests: XCTestCase {
     /// both come back, still at the 0 the old close left, the sampler takes
     /// no reading of them while they are journaled, and the re-read's
     /// restore becomes its sample. A lid close soon after, with the panel
-    /// pulled down by auto-brightness and the backlight suppressed again,
-    /// journals 0.8 and 0.3, not 0, and the open restores them.
+    /// pulled down by auto-brightness and a positive but suppressed keyboard
+    /// reading, journals 0.8 and 0.3, not the dimmed reads, and restores them.
     func testADelayedRestoreIsTheSampleTheNextCloseJournals() async throws {
         try seedSavedBrightness(sessionValid: false, refused: true)
         h.clamshell.closed = false
@@ -653,7 +726,7 @@ final class RefusedDarkeningTests: XCTestCase {
 
         h.clamshell.closed = true
         h.display.brightness = 0.335
-        h.keyboard.brightness = 0
+        h.keyboard.brightness = 0.01
         h.keyboard.suppressedOrDimmed = true
         await actions.onClose()
 
@@ -964,6 +1037,40 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertTrue(logText().contains("display brightness 0.8, restored, cleared from the journal"), logText())
     }
 
+    /// The same restore whose clear the journal refuses. The entry left on
+    /// disk is still flagged as refused, so it reads as nothing to undo,
+    /// but it is still there and quit still waits for its clear. A menu
+    /// opening reads it and keeps the line (issue #124's recheck).
+    func testAMenuOpeningKeepsTheLineOfAKeptValueWhoseClearTheJournalRefused() async throws {
+        let now = h.clock.now
+        try h.store.saveSession(Session(startedAt: now.addingTimeInterval(-7200), endsAt: now.addingTimeInterval(-60)))
+        var st = RuntimeState()
+        st.savedDisplayBrightness = 0.8
+        st.displayRestoreRefused = true
+        try h.store.saveState(st)
+        h.clamshell.closed = false
+        h.display.brightness = 0
+        h.display.throwOnSet = true
+        let m = h.makeManager(retryDelay: 3600)
+        let file = h.home.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: file)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: file) }
+        await m.reconcile()
+        h.display.throwOnSet = false
+        h.display.asleep = true
+        _ = await m.end(reason: .quit)
+        let line = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(line.contains("could not be cleared"), line)
+        let onDisk = try XCTUnwrap(try h.store.loadState())
+        XCTAssertEqual(onDisk.savedDisplayBrightness, 0.8)
+        XCTAssertFalse(onDisk.isDirty, "the flag hides the entry from isDirty")
+
+        m.recheckUnclearedEntry()
+
+        XCTAssertEqual(m.lastError, line, "the entry is still on disk")
+        XCTAssertEqual(m.pendingEnd, .quit)
+    }
+
     /// A launch with no session retries a kept keyboard value, and both
     /// the write and the clearing of its flag fail. Nothing else would
     /// retry it, and the agent cannot see it, so the launch ends as for a
@@ -1039,8 +1146,8 @@ final class RefusedDarkeningTests: XCTestCase {
     /// read-only writes nothing, and the sampler, no longer held by the
     /// settled entries, takes the new levels. Once the journal takes writes
     /// again, the lid close clears the old entries first and journals the
-    /// levels the user chose, so the open brings back 0.2 and 0, never the
-    /// old 0.8 and 0.3.
+    /// display level the user chose and leaves the zero keyboard alone, so
+    /// the open brings back 0.2 without writing the old 0.8 or 0.3.
     func testACloseAfterAClearTheJournalRefusedJournalsTheLevelChosenSince() async throws {
         try seedSavedBrightness(sessionValid: false, refused: true)
         h.clamshell.closed = false
@@ -1095,7 +1202,7 @@ final class RefusedDarkeningTests: XCTestCase {
 
         let closed = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(closed.savedDisplayBrightness, 0.2)
-        XCTAssertEqual(closed.savedKeyboardBrightness, 0)
+        XCTAssertNil(closed.savedKeyboardBrightness)
         XCTAssertFalse(closed.displayRestoreRefused)
         XCTAssertFalse(closed.keyboardRestoreRefused)
         XCTAssertTrue(logText().contains("keyboard backlight 0.3, set since its refused restore, cleared from the journal"), logText())
@@ -1107,6 +1214,7 @@ final class RefusedDarkeningTests: XCTestCase {
         XCTAssertFalse(h.keyboard.sets.contains(0.3), "\(h.keyboard.sets)")
         XCTAssertEqual(h.display.brightness, 0.2)
         XCTAssertEqual(h.keyboard.brightness, 0)
+        XCTAssertEqual(h.keyboard.sets, [])
     }
 
     /// The display refused, the keyboard's write failing: the report keeps
