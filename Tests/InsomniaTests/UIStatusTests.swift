@@ -5,6 +5,27 @@ import XCTest
 @testable import Insomnia
 
 final class UIStatusTests: XCTestCase {
+    /// The right-click menu opens at its event's location, so the event is
+    /// moved to the icon's lower leading corner (#174).
+    @MainActor
+    func testMenuEventMovesBeneathTheIcon() throws {
+        let window = NSWindow(contentRect: NSRect(x: 300, y: 500, width: 120, height: 24), styleMask: [.borderless], backing: .buffered, defer: false)
+        let icon = NSView(frame: NSRect(x: 10, y: 2, width: 60, height: 20))
+        window.contentView?.addSubview(icon)
+        let click = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .rightMouseDown, location: NSPoint(x: 50, y: 12), modifierFlags: [], timestamp: 1,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 7, clickCount: 1, pressure: 1
+        ))
+
+        let moved = try XCTUnwrap(StatusItemController.event(click, movedBeneath: icon))
+        XCTAssertEqual(moved.type, .rightMouseDown)
+        XCTAssertEqual(moved.locationInWindow, NSPoint(x: 10, y: 2))
+        XCTAssertEqual(moved.windowNumber, window.windowNumber)
+
+        icon.userInterfaceLayoutDirection = .rightToLeft
+        XCTAssertEqual(StatusItemController.event(click, movedBeneath: icon)?.locationInWindow, NSPoint(x: 70, y: 2))
+    }
+
     @MainActor
     func testPrimaryClickStartsFourHoursWithoutOpeningInputAndIgnoresPendingClicks() async throws {
         let lab = Lab()

@@ -2043,10 +2043,28 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             relaunchBrowser: #selector(menuRelaunchBrowser(_:)),
             stopWaitingForOutput: #selector(menuStopWaitingForOutput(_:))
         )
-        // Pass the original event so AppKit chooses contextual-menu chrome
-        // and placement, including Control-click and mirrored menu bars.
-        // The status item stays free to handle its ordinary primary click.
-        NSMenu.popUpContextMenu(menu, with: event, for: button)
+        // A contextual menu keeps its chrome and leaves the status item free
+        // for its ordinary primary click, but opens at the event's location.
+        // The event is moved to the icon's lower leading corner, so the menu
+        // opens beneath the icon rather than at the pointer.
+        NSMenu.popUpContextMenu(menu, with: Self.event(event, movedBeneath: button) ?? event, for: button)
+    }
+
+    static func event(_ event: NSEvent, movedBeneath view: NSView) -> NSEvent? {
+        guard let window = view.window else { return nil }
+        let frame = view.convert(view.bounds, to: nil)
+        let x = view.userInterfaceLayoutDirection == .rightToLeft ? frame.maxX : frame.minX
+        return NSEvent.mouseEvent(
+            with: event.type,
+            location: NSPoint(x: x, y: frame.minY),
+            modifierFlags: event.modifierFlags,
+            timestamp: event.timestamp,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: event.eventNumber,
+            clickCount: event.clickCount,
+            pressure: event.pressure
+        )
     }
 
     /// Refresh both menu presentations through the same path, including
