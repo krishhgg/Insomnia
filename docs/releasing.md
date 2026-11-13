@@ -368,6 +368,7 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 ### Hotspot
 
 - Hotspot permission, association, cancellation, and reconnect
+- An iPhone hotspot named `Name’s iPhone` (U+2019), with the SSID typed in Settings with a straight apostrophe: the outage join finds it on the first attempt and insomnia.log has "found as" with the typographic name
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
 

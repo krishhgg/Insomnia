@@ -22,6 +22,44 @@ final class RecordingHotspotJoiner: HotspotJoining, @unchecked Sendable {
 final class FailoverMachineTests: XCTestCase {
     let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
+    /// iOS names a Personal Hotspot `Name’s iPhone` (U+2019) and a Mac
+    /// keyboard types U+0027. The directed scan tries the name as
+    /// configured, then with its apostrophes swapped; a name without one is
+    /// scanned once (#87).
+    func testHotspotScanTriesTheNameWithTheOtherApostrophe() {
+        XCTAssertEqual(HotspotSSID.scanCandidates("Name's iPhone"), ["Name's iPhone", "Name\u{2019}s iPhone"])
+        XCTAssertEqual(HotspotSSID.scanCandidates("Name\u{2019}s iPhone"), ["Name\u{2019}s iPhone", "Name's iPhone"])
+        XCTAssertEqual(HotspotSSID.scanCandidates("Office 5G"), ["Office 5G"])
+
+        var scanned: [String] = []
+        let found = HotspotSSID.firstFound("Name's iPhone") { name -> Int? in
+            scanned.append(name)
+            return name == "Name\u{2019}s iPhone" ? 7 : nil
+        }
+        XCTAssertEqual(found?.name, "Name\u{2019}s iPhone")
+        XCTAssertEqual(found?.network, 7)
+        XCTAssertEqual(scanned, ["Name's iPhone", "Name\u{2019}s iPhone"])
+
+        scanned = []
+        XCTAssertNil(HotspotSSID.firstFound("Office 5G") { name -> Int? in
+            scanned.append(name)
+            return nil
+        })
+        XCTAssertEqual(scanned, ["Office 5G"], "a name with no apostrophe was scanned more than once")
+
+        // Found as typed: the search stops at the first scan.
+        scanned = []
+        let asTyped = HotspotSSID.firstFound("Name\u{2019}s iPhone") { name -> Int? in
+            scanned.append(name)
+            return 1
+        }
+        XCTAssertEqual(asTyped?.name, "Name\u{2019}s iPhone")
+        XCTAssertEqual(scanned, ["Name\u{2019}s iPhone"], "a name found as typed was scanned again")
+
+        // Both apostrophes in one name: each swap is its own candidate.
+        XCTAssertEqual(HotspotSSID.scanCandidates("A's B\u{2019}s"), ["A's B\u{2019}s", "A\u{2019}s B\u{2019}s", "A's B's"])
+    }
+
     func testShortBlipDoesNotJoin() {
         var m = FailoverMachine()
         XCTAssertEqual(m.pathUnsatisfied(at: t0), [.scheduleRetry(after: 5)])
