@@ -25,7 +25,7 @@ The session, recovery, Login Items, lid and network rows ran on the MacBook only
 | Compact and Popover stay open through display sleep | Not run on hardware, since display sleep locks an unattended Mac. In the VM both closed across display sleep, and reopening showed the right time left |
 | Menu bar CPU | Mean 0.85% with time left and 0.08% with End time on macOS 26; 0.85% and 0.0075% on macOS 27 |
 | Settings: in front of the active app, light and dark, window controls, and scrolling to Open at login | Passed in the VM. On the MacBook the window opened in light and dark, no taller than the screen, and scrolled to Open at login. The old check said a 1440p display fits the page; at about 1,790 pt it scrolls there too, and the check now says so |
-| Settings: Terminal and App Nap, battery floor pickers, and 30 tmux targets in the hotspot sheet (VM only) | Passed |
+| Settings: Terminal and App Nap, battery floor pickers, and 30 tmux targets in the hotspot sheet | Passed. The 30-target sheet ran in the VM only |
 | Normal end, timer expiry and repeated Quit restore sleep | Passed |
 | `Insomnia --session` start, extend and end; the sleep guard reads its setting back | Passed |
 | Force-quit, then recovery by the launchd agent at the deadline, and retry after a failed restore | Passed |
