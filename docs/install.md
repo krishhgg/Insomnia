@@ -293,7 +293,9 @@ uninstaller runs the `scripts/backstop.sh` in the same folder.
 
 The uninstaller requests cleanup before removing the app, agent, and sudoers
 rule. If recovery is incomplete or the app refuses to quit, it stops; resolve
-the reported problem and retry. With the app it removes what an interrupted
+the reported problem and retry. It then reads `SleepDisabled` from `pmset -g`: if
+Insomnia had disabled sleep and it still reads 1, it stops; if something else
+disabled it, it is left alone and the uninstaller says how to turn it off. With the app it removes what an interrupted
 install left beside it: `~/Applications/.Insomnia.app.previous`, and
 `.Insomnia.app.staging.*` directories of installs that are no longer running.
 Nothing else in `~/Applications` is touched. Purge removes owned files, not arbitrary
