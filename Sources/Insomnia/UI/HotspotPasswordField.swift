@@ -179,3 +179,116 @@ struct HotspotPasswordField: Equatable {
         }
     }
 }
+
+/// The keychain reads and writes behind the field, kept apart from the
+/// sheet so their ordering rules are tested without a window.
+@MainActor
+extension HotspotPasswordField {
+    /// Loads the saved password into the field, without a keychain prompt.
+    /// An item this build may not read leaves the field empty and says
+    /// why, so the user re-enters it; saving then replaces the item (see
+    /// `KeychainStore`). The read can wait behind a save, so a field
+    /// edited meanwhile is kept, even one typed in and emptied again, and
+    /// a password read for an SSID edited away meanwhile is not shown: the
+    /// SSID configured now is read instead. That read is a peek: the
+    /// account a later save moves the password from stays the one the
+    /// sheet loaded, as it does for any SSID edit, so the old SSID's item
+    /// is still removed.
+    static func loadForField(
+        _ request: HotspotPasswordField.Read,
+        secrets: any HotspotSecretStore,
+        finish: @MainActor (HotspotPasswordField.Read, (password: String, notice: String?))
+            -> HotspotPasswordField.ReadAnswer
+    ) async {
+        await readForField(
+            request,
+            first: { await loadedPassword(secrets.load) },
+            again: { await loadedPassword(secrets.peek) },
+            finish: finish
+        )
+    }
+
+    /// Runs a load or recheck for the field: `first` reads, and `finish`
+    /// takes the answer. While the SSID was edited during the read,
+    /// `finish` drops the answer, and `again` reads the SSID configured
+    /// now, until an answer is used or dropped.
+    static func readForField(
+        _ request: HotspotPasswordField.Read,
+        first: @MainActor () async -> (password: String, notice: String?),
+        again: @MainActor () async -> (password: String, notice: String?),
+        finish: @MainActor (HotspotPasswordField.Read, (password: String, notice: String?))
+            -> HotspotPasswordField.ReadAnswer
+    ) async {
+        var answer = await first()
+        var request = request
+        while case .readAgain(let next) = finish(request, answer) {
+            request = next
+            answer = await again()
+        }
+    }
+
+    /// A prompt-free load: the password for the field, or an empty field
+    /// and a notice saying why it cannot be shown.
+    static func loadedPassword(
+        _ load: () async throws -> String?
+    ) async -> (password: String, notice: String?) {
+        do {
+            return (try await load() ?? "", nil)
+        } catch let error as KeychainError {
+            return ("", error.problem.settingsNotice)
+        } catch {
+            return ("", HotspotPasswordProblem.error(error.localizedDescription).settingsNotice)
+        }
+    }
+
+    /// The notice under the password field for the hotspot `ssid`
+    /// configured now. A problem the failover reports about that hotspot
+    /// shows as it is. A report about another SSID, one edited away since,
+    /// does not apply, and a cleared report is not taken as "readable": it
+    /// also clears when the session ends. Then the keychain is read again,
+    /// without a prompt, and the notice says what that read finds. The
+    /// field is left as the user has it, and the reread is a peek: a load
+    /// would make an SSID typed since then the account a save moves the
+    /// password from, and the old SSID's item would stay behind.
+    static func hotspotNotice(
+        reported: HotspotPasswordReport?, ssid: String, reread: () async throws -> String?
+    ) async -> String? {
+        if let problem = reported?.problem(for: ssid) { return problem.settingsNotice }
+        return await loadedPassword(reread).notice
+    }
+
+    /// A save or clear answered. The failover's report goes, and the next
+    /// outage notifies afresh, unless the report is about the hotspot
+    /// configured now and the save neither stored for it nor removed its
+    /// item (`HotspotPasswordReport.stands`).
+    static func passwordStored(
+        _ outcome: HotspotStoreOutcome, configuredSSID: String, services: AppServices?
+    ) {
+        guard case .stored(let stored) = outcome else { return }
+        services?.hotspotPasswordChanged(stored.change, configuredSSID: configuredSSID)
+    }
+
+    /// Saves `password`, or clears the saved one when it is empty, and
+    /// returns what was stored under which SSID and which loaded account
+    /// it removed, or the notice for a failure. The store does the
+    /// keychain work on `KeychainQueue`, so a save waiting on a keychain
+    /// dialog waits there while the main actor (the battery floor, the
+    /// deadline timer, End) carries on.
+    static func storePassword(
+        _ password: String, in secrets: any HotspotSecretStore
+    ) async -> HotspotStoreOutcome {
+        do {
+            let change =
+                if password.isEmpty {
+                    try await secrets.delete()
+                } else {
+                    try await secrets.save(password)
+                }
+            return .stored(.init(ssid: change.ssid, password: password, removed: change.removed))
+        } catch {
+            Log.error("could not save hotspot password: \(error.localizedDescription)")
+            return .failed(
+                notice: "Could not save the hotspot password: \(error.localizedDescription)")
+        }
+    }
+}

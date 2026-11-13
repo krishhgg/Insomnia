@@ -13,6 +13,16 @@ starts right away. **The timer keeps counting down while the lid is
 closed**; only its on-screen redraw pauses, also for a session started with
 the lid already closed.
 
+A MacBook used closed on an external display is in use at a desk, so
+Insomnia does not act on that lid: the countdown keeps running and nothing
+is paused, muted or darkened. Unplug the display and the lid actions run
+then, apart from the darkening, which macOS already does under that lid;
+plug it in again and they are undone. A lid that closed in a bag stays
+closed for Insomnia when you plug in a display, until you open it. If macOS
+cannot list the displays when the lid closes, Insomnia does not act on the
+lid yet: it checks the list again every 2 seconds and decides once it can tell
+whether a display is connected.
+
 ## Display and keyboard backlight
 
 The display step exists because the sleep guard stops macOS from doing it:
@@ -46,26 +56,47 @@ Insomnia's own Low Power Mode was on while the lid was closed the value is
 written once more when the mode ends. If Insomnia is not running when you open
 the lid, press the brightness-up key.
 
+## Lock the screen
+
+"Lock the screen" in Settings, under When the lid closes, locks the screen when
+the lid closes during a session, so opening the lid asks for your login
+password. It is off by default, and a config.json from an earlier build keeps
+it off. The Mac stays awake and apps keep running, but agents that work
+through the screen, such as computer use, wait until you sign in: while the
+screen is locked, screenshots come back black and posted clicks and keypresses
+reach no app. Browser automation over the Chrome DevTools Protocol keeps
+working. Off, the Mac stays signed in with the lid closed. A lid closed on an
+external display counts as open (see above), so it does not lock; unplugging
+the display runs the lid actions, the lock with them, and plugging it in again
+does not unlock.
+
+The lock calls `SACLockScreenImmediate` in Apple's private login framework,
+the call behind Ctrl+Cmd+Q. A private API can change or disappear with a macOS
+update. If the call cannot be loaded or returns an error, Insomnia logs it and
+shows a line in the menu, and the rest of the lid close still runs. The lock is
+not journaled and has no undo: opening the lid does not unlock anything, you
+sign in.
+
 ## Defaults
 
 The defaults are worth knowing:
 
 - **Selected apps:** Slack, WhatsApp, and Discord are on the freeze list.
   Configured agent apps are excluded from this ordinary list.
-- **Every other app:** "Freeze every other app while the lid is closed" is
-  off, so a fresh install pauses the freeze list only. Turn it on to also pause
+- **Every other app:** "All other apps" in Edit Apps is set to keep running,
+  so a fresh install pauses the freeze list only. Set it to freeze to also pause
   every Dock app that is not an agent app, an Apple app, Docker Desktop or a
   built-in protected app (editors, terminals, browsers, AI apps, password
   managers, local databases, Tailscale, local model servers; JetBrains IDEs by
   bundle-id prefix), so only agents keep running with the lid shut. Menu-bar
-  apps are never picked up automatically; add them to the freeze list if you
-  want them paused. Settings shows a "Would freeze now" line listing what the
-  automatic scope would pause at that moment.
-- **Meeting, recording and dictation apps:** never frozen by "Freeze every
-  other app", with their helper apps: Zoom, Microsoft Teams (new and classic),
+  apps are never picked up automatically; add them in Edit Apps and set them
+  to freeze if you want them paused. Edit Apps then shows a "Would freeze now"
+  line listing what the automatic scope would pause at that moment.
+- **Meeting, recording and dictation apps:** never frozen by "All other
+  apps", with their helper apps: Zoom, Microsoft Teams (new and classic),
   Webex (and the older Webex Meetings app), FaceTime, Wispr Flow, Granola,
   Otter, OBS and Loom. Freezing one ends the call, the recording or the
-  meeting notes when the lid closes. Putting one on the freeze list by hand
+  meeting notes when the lid closes. Setting one to freeze in Edit Apps
   still freezes it, except FaceTime, which is an Apple app.
 - **Docker rule:** off. Turn it on to pause Docker Desktop on lid close when
   no container is running. The local Desktop socket is asked once to pick
@@ -89,7 +120,8 @@ The defaults are worth knowing:
 - **Display and keyboard backlight:** on ("Turn off the display and keyboard
   backlight" in Settings). Both values are saved to the journal before they
   are changed.
-- **Low Power Mode while the lid is closed:** on. With sleep disabled a closed
+- **Low Power Mode while the lid is closed:** on ("Turn on Low Power Mode" in
+  Settings). With sleep disabled a closed
   Mac otherwise keeps running at full speed; the mode is switched off again
   when the lid opens, unless a battery or thermal rule still wants it.
 - **Battery rules:** below 40% on battery, request Low Power Mode; below 10%,
@@ -99,21 +131,33 @@ The defaults are worth knowing:
   read. One failed read is tolerated, and the level is re-read every 30 s
   until it is readable again. A desktop has no battery and no floor. Serious
   thermal state requests Low Power Mode; critical thermal state ends the
-  session. These rules require the app to be running.
-  Setting the end floor to 0 turns the battery end off. Otherwise the end
-  floor stays below the Low Power Mode floor. The Settings steppers move the
+  session. When one of these rules, or the timer, ends a session with the
+  lid closed, Insomnia also puts the Mac to sleep, unless macOS keeps it
+  awake closed (an external display in clamshell mode). These rules require
+  the app to be running.
+  Setting the end floor to Never turns the battery end off. Otherwise the
+  end floor stays below the Low Power Mode floor. The Settings menus move the
   other floor when the two would cross, and a hand-edited `config.json` with
   the floors out of order is corrected at launch, and logged, by raising the
   Low Power Mode floor.
+- **Heat:** Low Power Mode turned on for a serious thermal state stays on
+  until the state is back to nominal, or until the session ends if it stays
+  at fair. Switched off at fair, it would bring back the load that made the
+  Mac serious, and go on and off as the Mac heats up again. Settings can
+  turn this hold off ("Keep Low Power Mode on until the Mac fully cools"):
+  the mode then goes off at fair and full speed comes back sooner. During a
+  session, a floor, the thermal rules or the hold changed in Settings apply
+  at once.
 
 ## Upgrading from an earlier build
 
 Upgrading from an earlier build changes two of these once. On the first
-launch of this version, a config.json saved by an earlier build gets "Freeze
-every other app" turned off and "Mute audio on lid close" turned on, and
-Insomnia posts a notification naming what changed. Settings shows the same
-line at the top of Lid-close actions until you dismiss it, for anyone with
-notifications off. The toggles are right below it. config.json records that
+launch of this version, a config.json saved by an earlier build gets "All
+other apps" set to keep running and "Mute audio" turned on, and Insomnia
+posts a notification naming what changed and where. Settings shows the same
+line at the top of When the lid closes until you dismiss it, for anyone with
+notifications off. Mute audio is right below it, and All other apps is in
+Edit Apps. config.json records that
 the update ran (`lidCloseDefaultsApplied`), so a setting you turn back stays
 the way you set it. A fresh install starts with the new defaults and no
 notice.

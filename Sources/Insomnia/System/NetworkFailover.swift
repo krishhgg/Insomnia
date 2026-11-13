@@ -155,11 +155,58 @@ struct KeychainError: Error, LocalizedError, Sendable {
 }
 
 /// The configured hotspot SSID as the keychain account: what the failover
-/// joins and Settings saves under. One rule for both, so a check that the
-/// SSID is still the same after a keychain wait compares like with like.
+/// reads the password under and Settings saves under. One rule for both, so
+/// a check that the SSID is still the same after a keychain wait compares
+/// like with like. The failover's scan also tries the name with its
+/// apostrophes swapped (`scanCandidates`).
 enum HotspotSSID {
     static func normalized(_ configured: String) -> String {
         configured.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The names from `known` that Settings offers while `typed` is in the
+    /// hotspot field: each once, in order, matching what was typed with
+    /// case, accents and apostrophes ignored. An iPhone names its hotspot
+    /// with a curly apostrophe (U+2019) and a keyboard types a straight
+    /// one, and the join scan matches exact bytes, so `Avery's` offers
+    /// `Avery’s iPhone` and choosing it fills in the exact name.
+    static func suggestions(for typed: String, among known: [String]) -> [String] {
+        let key = matchKey(typed)
+        var seen = Set<String>()
+        return known.filter { name in
+            !normalized(name).isEmpty && seen.insert(name).inserted && (key.isEmpty || matchKey(name).contains(key))
+        }
+    }
+
+    private static func matchKey(_ name: String) -> String {
+        normalized(name)
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{2018}", with: "'")
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+
+    /// The names the directed scan looks for, in order: `ssid` as
+    /// configured, then with every straight apostrophe (U+0027) made
+    /// typographic (U+2019), then the other way round. iOS names a Personal
+    /// Hotspot `Name’s iPhone` with U+2019, a Mac keyboard types U+0027,
+    /// and a directed scan matches the SSID's exact bytes (#87).
+    static func scanCandidates(_ ssid: String) -> [String] {
+        var names = [ssid]
+        for (straight, curly) in [("'", "\u{2019}"), ("\u{2019}", "'")] {
+            let swapped = ssid.replacingOccurrences(of: straight, with: curly)
+            if !names.contains(swapped) { names.append(swapped) }
+        }
+        return names
+    }
+
+    /// Scans for each of `scanCandidates(ssid)` in turn and returns the
+    /// first network found, with the name it was found under; nil when no
+    /// scan finds one. A scan that throws ends the search.
+    static func firstFound<Found>(_ ssid: String, scan: (String) throws -> Found?) rethrows -> (name: String, network: Found)? {
+        for name in scanCandidates(ssid) {
+            if let network = try scan(name) { return (name, network) }
+        }
+        return nil
     }
 }
 
@@ -188,15 +235,17 @@ enum HotspotPasswordProblem: Equatable, Sendable {
         }
     }
 
-    /// The right-click menu's warning line.
+    /// The warning line in the right-click menu and the popover. No
+    /// warning sign: the popover's row draws one, and the menu adds it to
+    /// the line (`StatusMenu.items`).
     var menuLine: String {
         switch self {
         case .missing:
-            "\u{26A0} Hotspot password not saved: enter it in Settings"
+            "Hotspot password not saved: enter it in Settings"
         case .unreadable:
-            "\u{26A0} Hotspot password unreadable by this build: enter it again in Settings"
+            "Hotspot password unreadable by this build: enter it again in Settings"
         case let .error(message):
-            "\u{26A0} Hotspot password unreadable: \(message)"
+            "Hotspot password unreadable: \(message)"
         }
     }
 

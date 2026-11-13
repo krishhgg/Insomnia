@@ -35,6 +35,33 @@ final class RecoveryScriptTests: XCTestCase {
 
     // MARK: - backstop.sh
 
+    func testBundledBackstopResumesWithItsSiblingBinaryAfterAppRelocation() throws {
+        let bundle = fx.root.appendingPathComponent("Shared Applications/Insomnia.app")
+        let script = Paths.backstopScript(inBundle: bundle)
+        let binary = bundle.appendingPathComponent("Contents/MacOS/Insomnia")
+        let fm = FileManager.default
+        try fm.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.copyItem(at: fx.backstop, to: script)
+        try fm.copyItem(at: fx.fakeInsomnia, to: binary)
+        try fm.copyItem(at: fx.appInfo, to: bundle.appendingPathComponent("Contents/Info.plist"))
+        try fm.removeItem(at: fx.fakeInsomnia)
+        try fm.removeItem(at: fx.appInfo)
+        let started = 1_789_388_423
+        try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
+        try fx.writeState("""
+        {"sleepDisabledByUs":false,"lowPowerSetByUs":false,"dockerFrozen":false,
+         "frozenProcesses":[{"pid":4242,"startedAt":\(started),"startedAtMicros":17,"bootSession":"\(fx.bootUUID)"}]}
+        """)
+
+        let result = try fx.run(script)
+
+        XCTAssertEqual(result.status, 0, result.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["Insomnia --resume-frozen 2 < 4242 \(started) 17 \(fx.bootUUID)"])
+        XCTAssertEqual((try fx.stateJSON()["frozenProcesses"] as? [Any])?.count, 0)
+        XCTAssertFalse(fx.exists(fx.session))
+    }
+
     func testPrivilegedCommandFailureExitsNonzeroAndKeepsJournal() throws {
         try fx.writeSession(endsAt: Date(timeIntervalSinceNow: -60))
         try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":true,"frozenProcesses":[],"dockerFrozen":false,"extra":"keep"}"#)
@@ -4432,7 +4459,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(plist["StartInterval"] as? Int, 60)
         // The plist must be exactly what the app builds for the same bundle
         // and requirement, or the app reloads the agent at every start.
-        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement, nativeExecutable: fx.app.appendingPathComponent("Contents/MacOS/Insomnia")))
         XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "install.sh wrote \(plist), the app builds \(expected)")
         XCTAssertTrue(calls.contains { $0.hasPrefix("codesign --verify --strict -R=\(fx.requirement) \(fx.appsDir.path)/.Insomnia.app.staging.") && $0.hasSuffix("/Insomnia.app") }, "the installer runs the agent's own check once, on the staged bundle: \(calls)")
         XCTAssertEqual(try fx.installedBinaryFirstLine(), "#!/bin/bash", "the new bundle is installed")
@@ -4502,9 +4529,41 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(fx.exists(fx.installedBackstop))
         XCTAssertTrue(fx.exists(prebuilt), "the source bundle is copied, not moved")
         let plist = try fx.plistOnDisk()
-        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement))
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: fx.requirement, nativeExecutable: fx.app.appendingPathComponent("Contents/MacOS/Insomnia")))
         XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "same agent as a source install: \(plist)")
         XCTAssertTrue(r.stdout.contains("Uninstall:"), r.stdout)
+    }
+
+    func testInstallKeepsTheShellLauncherForABundleWithoutTheBackstopMode() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        let info = prebuilt.appendingPathComponent("Contents/Info.plist")
+        let text = try String(contentsOf: info, encoding: .utf8)
+        try text.replacingOccurrences(of: "<key>InsomniaBackstopCommand</key><string>--backstop</string>", with: "")
+            .write(to: info, atomically: true, encoding: .utf8)
+        fx.setMode("launchctl", "loaded")
+
+        let result = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+
+        XCTAssertEqual(result.status, 0, result.stderr + result.stdout)
+        let plist = try fx.plistOnDisk()
+        XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", fx.requirement, fx.app.path])
+        XCTAssertNil(plist["AssociatedBundleIdentifiers"], "a system shell cannot be attributed to our signer")
+    }
+
+    func testInstallKeepsTheExternalVerifierUnlessSIPIsKnownEnabled() throws {
+        try fx.prepareInstall()
+        let prebuilt = try fx.writePrebuiltApp()
+        fx.setMode("launchctl", "loaded")
+        for mode in ["disabled", "unknown", "fail"] {
+            fx.setMode("csrutil", mode)
+            let result = try fx.run(fx.installRedirected, ["--allow-unverified-origin", "--app", prebuilt.path], extraEnvironment: ["USER": "tester"])
+            XCTAssertEqual(result.status, 0, result.stderr + result.stdout)
+            let plist = try fx.plistOnDisk()
+            XCTAssertEqual(plist["ProgramArguments"] as? [String], ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", fx.requirement, fx.app.path])
+            XCTAssertNil(plist["SpawnConstraint"])
+            XCTAssertNil(plist["AssociatedBundleIdentifiers"])
+        }
     }
 
     /// The checks run on a private copy, and that copy is what gets staged
@@ -4689,7 +4748,7 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(installed.status, 0, "the ditto copy at the installed path verifies: \(installed.output)")
         XCTAssertNoThrow(try CodeRequirement.verify(codeAt: fx.app, satisfies: requirement))
         let plist = try fx.plistOnDisk()
-        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: requirement))
+        let expected = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: fx.app, requirement: requirement, nativeExecutable: fx.app.appendingPathComponent("Contents/MacOS/Insomnia")))
         XCTAssertTrue(NSDictionary(dictionary: plist).isEqual(to: expected), "the agent pins the real requirement: \(plist)")
         XCTAssertTrue(fx.calls().contains { $0.hasPrefix("launchctl bootstrap") }, "\(fx.calls())")
 
@@ -5005,6 +5064,24 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertEqual(try fx.contents(of: fx.appsDir), ["Insomnia.app"], "the set-aside copy is removed")
         XCTAssertTrue(fx.calls().contains("rm -rf \(previous.path)"), "removed through $RM: \(fx.calls())")
         XCTAssertTrue(pinsCurrent.stdout.contains("removed the bundle an interrupted run had set aside"), pinsCurrent.stdout)
+    }
+
+    func testInstallRepairsAnInterruptedSwapUsingTheLegacyShellPlist() throws {
+        try fx.prepareInstall()
+        let previous = fx.appsDir.appendingPathComponent(".Insomnia.app.previous", isDirectory: true)
+        try fx.writeBundle(at: previous, marker: "previous")
+        try fx.writeBundle(at: fx.app, marker: "interrupted")
+        let plist: [String: Any] = [
+            "Label": "com.insomnia.backstop",
+            "ProgramArguments": ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", fx.requirement, fx.app.path],
+            "RunAtLoad": true, "StartInterval": 60,
+        ]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: fx.plist)
+        try fx.rejectSignature(of: fx.app)
+        let result = try fx.run(fx.installRedirected, extraEnvironment: ["USER": "tester"])
+        XCTAssertEqual(result.status, 1, result.stderr + result.stdout)
+        XCTAssertEqual(try fx.installedBinaryFirstLine(), "previous")
+        XCTAssertTrue(fx.calls().contains("codesign --verify --strict -R=\(fx.requirement) \(previous.path)"))
     }
 
     /// The interrupted run may have left its own job loaded (killed after
@@ -6714,7 +6791,9 @@ private final class ScriptFixture {
         try """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kgarg.insomnia</string></dict></plist>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kgarg.insomnia</string>
+        <key>CFBundleExecutable</key><string>Insomnia</string>
+        <key>InsomniaBackstopCommand</key><string>--backstop</string></dict></plist>
         """.write(to: resources.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
         try "icns".write(to: resources.appendingPathComponent("AppIcon.icns"), atomically: true, encoding: .utf8)
         let binroot = root.appendingPathComponent("binroot", isDirectory: true)
@@ -6835,6 +6914,7 @@ private final class ScriptFixture {
             "LAUNCHCTL": bin.appendingPathComponent("launchctl").path,
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
+            "CSRUTIL": bin.appendingPathComponent("csrutil").path,
             "SYSCTL": bin.appendingPathComponent("sysctl").path,
             "MV": bin.appendingPathComponent("mv").path,
             "RM": bin.appendingPathComponent("rm").path,
@@ -6871,6 +6951,7 @@ private final class ScriptFixture {
         <key>CFBundleIdentifier</key><string>\(bundleID)</string>
         <key>CFBundlePackageType</key><string>APPL</string>
         <key>CFBundleShortVersionString</key><string>\(version)</string>
+        <key>InsomniaBackstopCommand</key><string>--backstop</string>
         </dict></plist>
         """.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
         if machO {
@@ -7090,6 +7171,14 @@ private final class ScriptFixture {
             exec \(real) "$@"
             """)
         }
+        try writeFake("csrutil", """
+        mode="$(cat "\(r)/csrutil.mode" 2>/dev/null || echo enabled)"
+        case "$mode" in
+          fail) echo 'System Integrity Protection status: enabled.'; exit 1 ;;
+          unknown) echo 'System Integrity Protection status: unknown (Custom Configuration).' ;;
+          *) echo "System Integrity Protection status: $mode." ;;
+        esac
+        """)
         // codesign: signing is recorded and succeeds. `-d -r-` prints a
         // fixed designated requirement the way codesign does (on stderr,
         // with the "# " an implicit requirement carries). `-dvv` describes
@@ -7485,7 +7574,7 @@ private final class ScriptFixture {
     /// The agent plist an install writes for the bundle at $APP, pinning
     /// the fake codesign's requirement.
     func writeAgentPlist() throws {
-        let dict = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: app, requirement: requirement))
+        let dict = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: BackstopTarget(bundle: app, requirement: requirement, nativeExecutable: app.appendingPathComponent("Contents/MacOS/Insomnia")))
         let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
         try data.write(to: plist)
     }

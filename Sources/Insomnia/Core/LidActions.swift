@@ -4,7 +4,8 @@ import Foundation
 /// undone on lid open. Every step is journaled to state.json *before* the
 /// side effect; undo reads state.json, never memory.
 ///
-/// Order on close: darken (save display brightness and keyboard backlight
+/// Order on close: lock the screen (when on; not journaled, never undone),
+/// darken (save display brightness and keyboard backlight
 /// first, then set both to 0 and ask the display to sleep), mute (save
 /// volume + mute state first), freeze scope (the freeze list plus every
 /// other Dock app when `freezeAllApps` is on; one journal write per app),
@@ -18,6 +19,7 @@ final class LidActions {
     private let audio: any AudioControlling
     private let display: any DisplayDimming
     private let keyboard: any KeyboardBacklighting
+    private let screenLock: any ScreenLocking
     /// Last trusted brightness values, kept by AppServices while the lid is
     /// open. nil (tests) means the device's own asleep/suppressed reading
     /// decides alone.
@@ -37,6 +39,7 @@ final class LidActions {
         audio: any AudioControlling,
         display: any DisplayDimming = NoopDisplayDimmer(),
         keyboard: any KeyboardBacklighting = NoopKeyboardBacklight(),
+        screenLock: any ScreenLocking = NoopScreenLocker(),
         sampler: BrightnessSampler? = nil
     ) {
         self.manager = manager
@@ -45,6 +48,7 @@ final class LidActions {
         self.audio = audio
         self.display = display
         self.keyboard = keyboard
+        self.screenLock = screenLock
         self.sampler = sampler
     }
 
@@ -69,6 +73,7 @@ final class LidActions {
             Log.info("lid closed: no session, nothing to do")
             return
         }
+        if lidEvents == event { manager.cancelBrightnessReassert() }
         // One lifecycle transaction: journal writes and SIGSTOPs happen
         // under the recovery lock, after any end already in flight.
         let ran = await manager.runExclusive("lid close") { [self, manager] in
@@ -86,7 +91,25 @@ final class LidActions {
                 manager.isActive && manager.endTicket == ticket && lidEvents == event && !Task.isCancelled
             }
 
-            if config.darkenDisplayOnLidClose {
+            // Not journaled and not undone: the lid opening does nothing for
+            // it, the login password does. A failure is shown in the menu
+            // (the private call can break with an OS update) and the rest
+            // of the close still runs.
+            if config.lockScreenOnLidClose {
+                do {
+                    try screenLock.lockNow()
+                    Log.info("screen locked on lid close")
+                } catch {
+                    manager.fail("lid close: could not lock the screen: \(error.localizedDescription)")
+                }
+            }
+
+            // Off, the built-in display is under a lid closed at a desk, or
+            // one whose external display was just unplugged: macOS keeps the
+            // panel and keyboard dark, and there is nothing to darken.
+            if config.darkenDisplayOnLidClose, !display.builtInIsOnline {
+                Log.info("display and keyboard backlight left alone: the built-in display is off, as macOS keeps it under a lid closed at a desk")
+            } else if config.darkenDisplayOnLidClose {
                 darkenSavingCurrent(manager)
             }
 
@@ -204,9 +227,13 @@ final class LidActions {
     /// closing lid. The entry is left undecided, as above, and the open
     /// does not take a 0 it reads as a level set since: only a reading
     /// above 0 decides that entry (`SessionManager.restoreDisplay`).
-    /// The keyboard reads 0 when suppressed by display sleep, so it takes
-    /// the current read if trusted now, else the last trusted sample, else
-    /// nothing, since restoring 0 would leave the backlight off for good.
+    /// A keyboard value kept after a refused restore stays undecided unless
+    /// the close reads the keyboard trusted, as for the display.
+    /// A keyboard already at 0 is left alone unless a positive restore is
+    /// already owed. Both manual off and ambient auto-off can read 0, with
+    /// different suppression flags; neither needs another explicit off.
+    /// A positive current read is saved if trusted, otherwise a positive
+    /// sample is used. No zero becomes a new restore obligation.
     private func darkenSavingCurrent(_ manager: SessionManager) {
         do {
             let current = try display.readBrightness()
@@ -278,12 +305,34 @@ final class LidActions {
             Log.error("display darken on lid close skipped: \(error.localizedDescription)")
         }
 
+        var keyboardRead = false
         do {
             if let current = try keyboard.readBrightness() {
+                keyboardRead = true
+                let state = manager.effectiveState
+                let trusted = sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed()
                 let value: Float?
-                if sampler?.keyboardReadIsTrusted ?? !keyboard.isSuppressedOrDimmed() {
+                var keptUndecided: Float?
+                if state.keyboardRestoreRefused, let kept = state.savedKeyboardBrightness, !trusted {
+                    // As for the display above: after a refused restore the
+                    // user was told to set the level by hand. A trusted 0
+                    // is the backlight still dark as the earlier close left
+                    // it, and a trusted level above 0 is the user's; both
+                    // decide the entry below. A suppressed or dimmed
+                    // reading, such as the 0 a real close reads once macOS
+                    // has turned the backlight off, shows neither, and the
+                    // sampler took no keyboard reading while the entry was
+                    // journaled, so its sample is older than the refusal.
+                    // The entry stays undecided and the open reads the
+                    // level again. A kept 0, saved by an older version, is
+                    // obsolete instead: the open discards it without a write.
+                    value = nil
+                    keptUndecided = kept
+                } else if current == 0 {
+                    value = state.savedKeyboardBrightness.flatMap { $0 > 0 ? $0 : nil }
+                } else if trusted {
                     value = current
-                } else if let sampled = sampler?.last?.keyboard {
+                } else if let sampled = sampler?.last?.keyboard, sampled > 0 {
                     value = sampled
                     Log.info("keyboard backlight read while suppressed or dimmed (\(current)); journaling the last trusted sample \(sampled)")
                 } else {
@@ -303,8 +352,14 @@ final class LidActions {
                     } catch {
                         Log.error("keyboard backlight off failed: \(error.localizedDescription)")
                     }
+                } else if let kept = keptUndecided {
+                    Log.info(kept > 0
+                        ? "keyboard backlight reads \(current) at the close; the value kept after a refused restore, \(kept), stays journaled and undecided, and the backlight is left alone, so the open reads it again"
+                        : "keyboard backlight reads \(current) at the close; the zero kept after a refused restore is obsolete, and the backlight is left alone, so the open discards it without a write")
                 } else {
-                    Log.info("keyboard backlight suppressed by display sleep and no trusted sample; leaving it to macOS")
+                    Log.info(current == 0
+                        ? "keyboard backlight already reads zero; leaving its automatic or user-off state untouched"
+                        : "keyboard backlight has no positive restore value; leaving it to macOS")
                 }
             } else {
                 Log.info("no built-in keyboard backlight; skipped")
@@ -319,8 +374,32 @@ final class LidActions {
         // a panel this put to sleep, so it is not asked to sleep.
         // With the owed edits applied: an entry this process already
         // settled is not restored, so the open would not wake for it.
+        //
+        // A keyboard read can journal no level above: a 0 stays with
+        // macOS, and so does a positive reading with neither a trusted
+        // read nor a positive sample. When nothing else is journaled
+        // either, as when the display is refused or unreadable, that would
+        // also drop the sleep request, which is what locks a screen set to
+        // lock on display sleep. A 0 is journaled then, with no keyboard
+        // write: the open wakes the display for it and discards it without
+        // a write, as it does an older version's saved zero.
+        if !manager.effectiveState.brightnessJournaled, keyboardRead, !manager.config.keepScreenAwake {
+            do {
+                try manager.journal { s in
+                    if s.savedKeyboardBrightness == nil { s.savedKeyboardBrightness = 0 }
+                }
+                Log.info("keyboard backlight zero journaled with no write, so the open wakes the display this asks to sleep; the open discards the zero and leaves the backlight to macOS")
+            } catch {
+                Log.error("keyboard backlight zero not journaled: \(error.localizedDescription)")
+            }
+        }
         guard manager.effectiveState.brightnessJournaled else {
             Log.info("display sleep not requested: no display or keyboard brightness is journaled, so nothing would wake the display on open")
+            return
+        }
+        // A display that sleeps locks the screen; brightness 0 keeps it dark.
+        guard !manager.config.keepScreenAwake else {
+            Log.info("display sleep not requested: keep the screen awake is on, so brightness 0 keeps the display dark and the screen unlocked")
             return
         }
         do {

@@ -188,10 +188,25 @@ login Keychain, not the configuration file.
 
 The recovery agent runs at login and every 60 seconds. Its command line pins
 the installed bundle's code requirement (for an ad-hoc build, the cdhash of
-that build) and runs `codesign --verify --strict` against it before executing
-the `backstop.sh` sealed inside the bundle. An edited bundle or script fails
-that check: the agent writes one line to `insomnia.log` and runs nothing until
-you reinstall. So no other account can edit it, the installer removes group
+that build) and verifies its signature and resources before executing the
+`backstop.sh` sealed inside the bundle. The native command uses the Security
+framework and directly executes `/bin/bash` with that script path; the external
+fallback runs `codesign --verify --strict`. Current ad-hoc builds start the
+app's headless recovery command, with a `SpawnConstraint` that launchd checks
+against the pinned cdhashes before the binary executes. Restoring an old
+binary or replacing it with one that skips verification is rejected by
+launchd, with a code-signing diagnostic in the system log. This enforcement
+requires System Integrity Protection to be enabled. The installer and each
+session's `arm()` check `csrutil status`; disabled, custom or unavailable
+status selects the external shell verifier instead. That agent runs
+`/bin/sh`, so Login Items & Extensions lists it as `sh` with a generic icon,
+not as Insomnia. After changing SIP,
+open the app and start a session or reinstall to replace a previously
+registered native agent. An edited sealed script
+is refused by the subsequent full-bundle check and logged in `insomnia.log`.
+Older bundles and other code-requirement formats keep the external shell
+verifier. Reinstall to restore the matching bundle/agent pair.
+So no other account can edit it, the installer removes group
 and other write permission and every ACL from the bundle it installs. The
 signature covers neither, so the bundle still verifies, and extended
 attributes such as a download's quarantine flag are kept. No executable is
@@ -213,7 +228,7 @@ four `pmset` commands itself.
 
 ## Upgrades
 
-Settings > App shows the installed version. "Check for updates" there asks
+Settings > General shows the installed version. "Check for updates" there asks
 GitHub once, when you click, for the release marked Latest and for the
 newest nightly, and tells you both tags and whether a newer stable release
 exists. It installs nothing; an upgrade is the steps above run again.

@@ -1,4 +1,5 @@
 import Foundation
+import IOKit
 import Security
 import XCTest
 import InsomniaTestHome
@@ -29,6 +30,35 @@ actor AsyncGate {
         let waiters = gateWaiters
         gateWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
+    }
+}
+
+/// Stands in for the manager's wait for the recovery lock
+/// (`Harness.makeManager(acquireRecoveryLock:)`). The next waits, in the
+/// order `holdNext` was called, wait for their gate. Then each gives up
+/// as for a lock still held by another process, or tries the lock once
+/// and gives up the same way if it is not free. Every other wait is the
+/// app's own.
+final class HeldLockWaits: @unchecked Sendable {
+    enum Then { case giveUp, take }
+    private let lock = NSLock()
+    private var holds: [(gate: AsyncGate, then: Then)] = []
+
+    func holdNext(until gate: AsyncGate, then: Then) {
+        lock.withLock { holds.append((gate, then)) }
+    }
+
+    /// Holds no wait has reached yet.
+    var holdsLeft: Int { lock.withLock { holds.count } }
+
+    func acquire(_ recoveryLock: RecoveryLock, timeout: TimeInterval) async throws -> RecoveryLockHandle {
+        let hold: (gate: AsyncGate, then: Then)? = lock.withLock { holds.isEmpty ? nil : holds.removeFirst() }
+        guard let hold else { return try await recoveryLock.acquire(timeout: timeout) }
+        await hold.gate.wait()
+        guard hold.then == .take, let handle = try recoveryLock.tryAcquire() else {
+            throw RecoveryLockError.busy(path: recoveryLock.path, seconds: timeout)
+        }
+        return handle
     }
 }
 
@@ -87,6 +117,8 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     private var _restoreGate: AsyncGate?
     private var _restoreCalledAt: Date?
     private var _readGate: AsyncGate?
+    private var _lockedReadGate: AsyncGate?
+    private var _throwOnLockedRead = false
     var throwOn: Set<String> = []
     /// Commands that take effect and *then* fail (a timeout after pmset
     /// already applied the setting): the ambiguous failure shape.
@@ -129,6 +161,19 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     var readGate: AsyncGate? {
         get { lock.withLock { _readGate } }
         set { lock.withLock { _readGate = newValue } }
+    }
+    /// Holds a `pmset -g` made under the recovery lock (the sleep check's
+    /// read inside its transaction) after the call is recorded, before it
+    /// answers. A read without the lock answers at once.
+    var lockedReadGate: AsyncGate? {
+        get { lock.withLock { _lockedReadGate } }
+        set { lock.withLock { _lockedReadGate = newValue } }
+    }
+    /// A `pmset -g` made under the recovery lock fails after the call is
+    /// recorded. A read without the lock answers.
+    var throwOnLockedRead: Bool {
+        get { lock.withLock { _throwOnLockedRead } }
+        set { lock.withLock { _throwOnLockedRead = newValue } }
     }
 
     /// Commands reported as still running after SIGTERM
@@ -232,6 +277,10 @@ final class FakeSleepGuard: SleepGuarding, @unchecked Sendable {
     func isSleepDisabled() async throws -> Bool {
         try record("pmset -g")
         if let gate = readGate { await gate.wait() }
+        if RecoveryLock.held != nil, let gate = lockedReadGate { await gate.wait() }
+        if RecoveryLock.held != nil, throwOnLockedRead {
+            throw SleepGuardError(command: "pmset -g", status: 1, stderr: "pmset: read failed")
+        }
         return sleepDisabled
     }
 
@@ -502,6 +551,7 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     private var _sleepRequests = 0
     private var _wakes = 0
     private var _asleep = false
+    private var _builtInIsOnline = true
     var throwOnRead = false
     var throwOnSet = false
     var throwOnSleep = false
@@ -521,6 +571,11 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
     var asleep: Bool {
         get { lock.withLock { _asleep } }
         set { lock.withLock { _asleep = newValue } }
+    }
+    /// False models a lid closed at a desk: the built-in display offline.
+    var builtInIsOnline: Bool {
+        get { lock.withLock { _builtInIsOnline } }
+        set { lock.withLock { _builtInIsOnline = newValue } }
     }
     /// Every value written, in order.
     var sets: [Float] { lock.withLock { _sets } }
@@ -555,6 +610,22 @@ final class FakeDisplayDimmer: DisplayDimming, @unchecked Sendable {
 
     func wake() {
         lock.withLock { _wakes += 1 }
+    }
+}
+
+/// Fake screen locker: counts calls, and throws when told to.
+final class FakeScreenLocker: ScreenLocking, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls = 0
+    var throwOnLock = false
+    var onLock: (@Sendable () -> Void)?
+
+    var calls: Int { lock.withLock { _calls } }
+
+    func lockNow() throws {
+        lock.withLock { _calls += 1 }
+        onLock?()
+        if throwOnLock { throw ScreenLockError(what: "SACLockScreenImmediate returned 1") }
     }
 }
 
@@ -715,14 +786,83 @@ extension ProcessSignalState {
     }
 }
 
-/// Mutable clamshell reading for reconcile gating tests.
+/// Mutable clamshell reading for reconcile gating tests. `atDesk` is an
+/// external display connected; `displayListFails` makes the display list
+/// unreadable.
 final class FakeClamshell: @unchecked Sendable {
     private let lock = NSLock()
     private var _closed: Bool?
+    private var _atDesk = false
+    private var _displayListFails = false
     init(_ closed: Bool? = false) { _closed = closed }
     var closed: Bool? {
         get { lock.withLock { _closed } }
         set { lock.withLock { _closed = newValue } }
+    }
+    var atDesk: Bool {
+        get { lock.withLock { _atDesk } }
+        set { lock.withLock { _atDesk = newValue } }
+    }
+    var displayListFails: Bool {
+        get { lock.withLock { _displayListFails } }
+        set { lock.withLock { _displayListFails = newValue } }
+    }
+    /// The display list as `LidObserver.readExternalDisplay` reads it.
+    var externalDisplay: Bool? { displayListFails ? nil : atDesk }
+}
+
+/// Records each sleep request and what held at that moment. Refuses it
+/// while sleep is disabled, as the kernel does.
+final class FakeClosedLidSleep: ClosedLidSleeping, @unchecked Sendable {
+    struct Request: Equatable {
+        let sleepDisabled: Bool
+        let lockHeld: Bool
+    }
+
+    private let lock = NSLock()
+    private let sleepGuard: FakeSleepGuard
+    private let recoveryLock: URL
+    private var _requests: [Request] = []
+
+    init(sleepGuard: FakeSleepGuard, recoveryLock: URL) {
+        self.sleepGuard = sleepGuard
+        self.recoveryLock = recoveryLock
+    }
+
+    var requests: [Request] { lock.withLock { _requests } }
+
+    func requestSleep() throws {
+        let disabled = sleepGuard.sleepDisabled
+        var held = true
+        if let handle = try? RecoveryLock(url: recoveryLock).tryAcquire() {
+            handle.release()
+            held = false
+        }
+        lock.withLock { _requests.append(Request(sleepDisabled: disabled, lockHeld: held)) }
+        if disabled { throw ClosedLidSleepError(call: "IOPMSleepSystem", code: kIOReturnNotPermitted) }
+    }
+}
+
+/// Stands in for the `LidObserver` the manager watches the lid with while
+/// a closed lid's sleep is owed. `deliver` is a change that held through
+/// the debounce; like the kernel's message, it reaches the manager only
+/// while the watcher runs.
+@MainActor
+final class FakeLidWatcher: LidWatching {
+    var onChange: ((Bool) -> Void)?
+    private(set) var running = false
+    private(set) var starts = 0
+
+    func start(closed: Bool) {
+        running = true
+        starts += 1
+    }
+
+    func stop() { running = false }
+
+    func deliver(closed: Bool) {
+        guard running else { return }
+        onChange?(closed)
     }
 }
 
@@ -803,6 +943,11 @@ struct Harness {
     let appNap: FakeAppNapPreferences
     let notifier: RecordingNotifier
     let clamshell: FakeClamshell
+    let lidSleep: FakeClosedLidSleep
+    /// Shared by every manager this harness makes.
+    let lidWatcher: FakeLidWatcher
+    /// Where a test posts `LidObserver.displaysChanged`.
+    let displayCenter = NotificationCenter()
     let processes: FakeProcessTable
 
     init(now: Date = Date(timeIntervalSince1970: 1_800_000_000)) {
@@ -818,7 +963,16 @@ struct Harness {
         appNap = FakeAppNapPreferences()
         notifier = RecordingNotifier()
         clamshell = FakeClamshell(false)
+        lidSleep = FakeClosedLidSleep(sleepGuard: guardFake, recoveryLock: home.paths.recoveryLock)
+        lidWatcher = FakeLidWatcher()
         processes = FakeProcessTable()
+    }
+
+    /// The lid moves and stays there past the debounce: the reading
+    /// changes, and the lid watcher delivers it if it is running.
+    func moveLid(closed: Bool) {
+        clamshell.closed = closed
+        lidWatcher.deliver(closed: closed)
     }
 
     /// `lockTimeout` is short so contention tests fail closed quickly;
@@ -833,9 +987,15 @@ struct Harness {
     /// after a restart.
     /// `customClock` replaces the harness clock, for a test that needs time to
     /// pass by itself, as a real timer does.
+    /// `acquireRecoveryLock` replaces the wait for the recovery lock, for a
+    /// test that says when a wait ends (`HeldLockWaits`).
+    /// `confirmDelay` is 0 so a closed lid's owed sleep is asked at once,
+    /// without the display check's confirmation.
     func makeManager(
         lockTimeout: TimeInterval = 0.3,
+        acquireRecoveryLock: (@Sendable (RecoveryLock, TimeInterval) async throws -> RecoveryLockHandle)? = nil,
         retryDelay: TimeInterval = 60,
+        confirmDelay: TimeInterval = 0,
         reassertDelay: Duration = .seconds(3600),
         keptRecheckDelay: Duration = .seconds(3600),
         keptRecheckAttempts: Int = 20,
@@ -843,6 +1003,7 @@ struct Harness {
         display: (any DisplayDimming)? = nil,
         keyboard: (any KeyboardBacklighting)? = nil,
         sleepGuard: (any SleepGuarding)? = nil,
+        displayAssertions: (any DisplayAssertionHolding)? = nil,
         bootSession: String = SignalProcessControl.bootSession,
         clock customClock: (@Sendable () -> Date)? = nil
     ) -> SessionManager {
@@ -858,12 +1019,20 @@ struct Harness {
             display: display ?? self.display,
             keyboard: keyboard ?? self.keyboard,
             appNap: appNap,
+            displayAssertions: displayAssertions ?? NoopDisplayAssertions(),
             notifier: notifier,
             clamshell: { lid.closed },
+            closedLidSleep: lidSleep,
+            closedLidWatcher: lidWatcher,
+            lidAtDesk: { lid.closed == true && lid.atDesk },
+            externalDisplay: { lid.externalDisplay },
             clock: customClock ?? { c.now },
             processLookup: { table.lookup($0) },
             recoveryLockTimeout: lockTimeout,
+            acquireRecoveryLock: acquireRecoveryLock ?? { try await $0.acquire(timeout: $1) },
             recoveryRetryDelay: retryDelay,
+            closedLidSleepConfirmDelay: confirmDelay,
+            displayNotifications: displayCenter,
             reassertDelay: reassertDelay,
             keptRecheckDelay: keptRecheckDelay,
             keptRecheckAttempts: keptRecheckAttempts,

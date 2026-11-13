@@ -59,6 +59,21 @@ closed bag. Its design goals are to:
 
 ## Core model
 
+The recovery agent starts the app's headless `--backstop` command only when
+the bundle advertises that command in `InsomniaBackstopCommand` and its
+pinned requirement consists entirely of cdhash clauses, and a bounded
+`csrutil status` call reports SIP enabled. `SpawnConstraint`
+lets launchd enforce those hashes before any app code executes; the command
+then runs the existing full-bundle verifier before the sealed script. Both
+the installer and `arm()` use the external shell verifier for older bundles
+or other requirement formats, or disabled, custom or unreadable SIP status,
+including a `swift run` build targeting an
+older installed app. The executable name comes from `CFBundleExecutable`.
+The native bundle path gives Background Task Management the app identity;
+`AssociatedBundleIdentifiers` also names the app, but is not proof of
+attribution for ad-hoc signatures with no Team ID. Appearance still needs
+the real-Mac check, and no Developer ID identity is implied.
+
 ```
 Session {
   startedAt:   Date
@@ -97,10 +112,22 @@ recovery; newly written journals use `frozenProcesses`.
 
 - Time is entered inline in the menu bar as Days / Hours / Minutes pills.
   Enter with empty fields uses the configured default preset. Maximum 30 days.
-- While active the menu bar shows a second-resolution countdown. The redraw
-  timer runs at 1 Hz and stops while the lid is closed.
+- While active the menu bar shows a second-resolution countdown (to the
+  minute in Popover style, section 11). The redraw
+  timer runs at 1 Hz and stops while the lid is closed or every display
+  sleeps. With the countdown style set to end time it shows the clock time
+  the session ends at instead (Settings, section 10), and no timer runs.
 - Click the cup/countdown to enter an extension; hold the end control to end.
   Right-click opens the status, browser actions, Settings, and Quit menu.
+  With "Start a session with one click" on, a click with no session starts
+  the default preset instead (sections 10 and 11).
+- "Show the countdown in the menu bar" (`showMenuBarCountdown`, default on,
+  also for a config.json without the key). Off: the status item is the eye
+  alone, open while a session runs and closed otherwise, with no countdown
+  and no end control. The right-click menu then leads with the time left
+  (minute granularity, "Time left: 2h 14m"), as it does with the end time
+  countdown; End session is there, as for every running session. Clicking
+  the eye still opens an extension.
 - Session start: write session + state to disk, arm the launchd backstop, and
   only then run `sudo pmset -a disablesleep 1`. A session never starts unless
   the backstop is armed. If pmset fails, or `pmset -g` no longer reads
@@ -108,10 +135,59 @@ recovery; newly written journals use `frozenProcesses`.
   a keep-awake daemon, can set it back to 0), delete the session file and
   surface the error. The
   journal and backstop always exist before sleep is disabled.
+- Sleep check during a session (`SessionManager.checkSleepHeld`, in every
+  style): `pmset -g` is read every 30 s, on the same timer as the
+  brightness sample, and when the popover opens. The read takes no lock.
+  When SleepDisabled reads 0 while the session holds sleep and nothing is
+  ending it, the app takes the session lock, reads the journal from disk
+  and the bit again, checks once more that nothing is ending the session,
+  writes `sleepDisabledByUs` to the journal, and only then runs
+  `sudo pmset -a disablesleep 1`, the command a start runs, so no new
+  sudoers entry is needed. It sets nothing if, at that last check, an end
+  or a quit has been asked for (one waiting for its retry included), the
+  deadline has passed, a restore was refused, or the backstop restored
+  sleep (the journal cleared or session.json gone). The last check comes
+  after the read under the lock, so an end, a quit or a deadline that
+  arrives during that read counts too. An end or a quit asked for after
+  it, while sudo is about to start or pmset runs, does not stop the set:
+  the end waits for it, then runs `disablesleep 0` and restores sleep.
+  A set that fails is logged, posts "Sleep is back on" once per session
+  and puts up the popover's "Sleep is not held" row; the next check
+  tries again. So does a read of 0 that the check cannot follow with a
+  set, because the session lock is busy or the read under it fails. Only
+  a read of 1 or a set that holds takes the row down. The right-click
+  menu's sleep line still comes from the journal and says it is not
+  verified live.
 - Session end (timer, End now, Quit, battery floor, thermal critical):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
+- An end that cannot finish stays pending until a retry finishes it. One
+  that changed nothing (a busy recovery lock, an unreadable state.json, a
+  `sudo pmset` still holding the lock) leaves the session active. While an
+  end is pending, a start and an extend are both refused at once with a
+  reason, in every style and from `--session`, because the retry would end
+  any time added. An extend asked for while that end still ran waits
+  behind it and is refused the same way. The reason goes away once the
+  end restores sleep or leaves the rest to the recovery agent, unless a
+  newer error has replaced it.
 - Quitting Insomnia always ends the session. There is no "keep awake after quit".
+- `Insomnia --session start <seconds> | extend <seconds> | end | status` runs
+  the same actions from a script or an agent (`SessionCommand.swift`). Each
+  command line writes its own request file, `session-command.<id>.request`
+  in the support directory, holding `start <seconds>`, `extend <seconds>`
+  or `end`, so no two command lines share a path. The running app watches
+  the directory, claims each file by renaming it, runs the requests oldest
+  first like the matching menu action (`end` is always a full end, which
+  also abandons a start in flight), and answers in
+  `session-command.<id>.reply`. The command line prints the session or the
+  app's reason and exits 0 or 1. A request that nothing claims within 2 s
+  is taken back, because the app is not running, and a request older than
+  5 s when the app reads it is dropped, so one left behind never starts a
+  session later. `status` only reads session.json. The
+  file is the same trust boundary as config.json: only this user can write
+  the directory, and anyone who can write it already controls the app. The
+  bundle declares the interface as `InsomniaSessionCommandVersion` in its
+  Info.plist, because an older build opens the menu bar app instead.
 
 ### 2. Sleep guard and root access
 
@@ -122,14 +198,76 @@ recovery; newly written journals use `frozenProcesses`.
   - `/usr/bin/pmset -b lowpowermode 1`
   - `/usr/bin/pmset -b lowpowermode 0`
 - Nothing else runs as root.
+- `disablesleep` stops system sleep only. The display still sleeps after
+  `displaysleep` minutes, and with Lock Screen set to require a password
+  immediately the screen locks then, which stops agents that drive the
+  screen. With "Keep the screen on and unlocked" on (`keepScreenAwake`,
+  default off), `SessionManager` holds a `PreventUserIdleDisplaySleep`
+  assertion (`ScreenAwake`, the one `caffeinate -d` holds) while a session
+  is active, and Settings applies the toggle to a running session. The
+  hold stops only the idle lock: with "Lock the screen"
+  (`lockScreenOnLidClose`) on, a lid close still locks the screen, and
+  LidActions then skips only the display sleep request. An end
+  request releases it before the recovery lock or the journal can refuse
+  the end, so a refused end never keeps the screen unlocked past the
+  deadline. A release macOS refuses keeps the hold and says so in the
+  menu; quitting Insomnia releases it. A hold or a timeout move macOS
+  refuses says so in the menu too, and turning the toggle off and on
+  tries again. A resume at launch that fails, or stops at a `sudo pmset`
+  still running, drops the session and any hold the toggle took
+  meanwhile, before the restore waits on a command. The
+  assertion also times out at the session's deadline (`TimeoutActionTurnOff`), and an extension moves the
+  timeout, so an app that hangs can't keep the screen unlocked past the
+  deadline while the backstop restores sleep. No
+  root, no journal entry: the assertion belongs to the process, so macOS
+  drops it when the app quits or crashes, and the backstop has nothing to
+  undo. The lock setting is never read or written. Lid close then darkens
+  without asking the display to sleep (section 4).
 
 ### 3. Lid observer
 
 - IOKit interest notification on `IOPMrootDomain` for `AppleClamshellState`.
   Insomnia sleeps in its run loop; the kernel wakes it on change. Zero cost
-  between events.
+  between events, with one exception: a closed lid whose display list
+  cannot be read (below).
 - 2-second debounce to ignore flapping.
 - Lid close and open each run a fixed, reversible action list (below).
+- A closed lid with an external display connected (closed-display mode:
+  an online display that is neither built in nor of vendor
+  `kDisplayVendorIDUnknown`) keeps the state delivered before it. Closed
+  at a desk, the lid stays open: no lid actions, the countdown keeps
+  running and the lid is no Low Power Mode cause. Unplugging the last
+  external display then delivers the close, and plugging one in again the
+  open, unless a saved display or keyboard brightness waits for the lid to
+  open. Closed in a bag, the lid stays closed when a display is plugged
+  in, until it opens, so the built-in panel and keyboard are only lit
+  again once they are uncovered.
+- A closed lid whose display list cannot be read (`CGGetOnlineDisplayList`
+  fails) may be at a desk or in a bag, so it is neither a close nor an
+  open: the lid keeps the state delivered before it, and the observer
+  drops a change waiting out the debounce. The observer then reads the lid
+  again every 2 s, with no event needed, until the list reads or the lid
+  opens, and the rules above take that reading: with no display, the close
+  comes one debounce later. A read that finds no lid at all changes
+  nothing either, and the reads go on. This read is the only thing the
+  observer runs between events, and it stops with the observer. An
+  unreadable read does not replace the reading before it, so a lid closed
+  at a desk whose display then goes away is still a display loss. A
+  session that starts under such a lid, or that the app finds still
+  running at launch, takes it as closed, as it takes a lid in a bag: the
+  countdown redraw stops and the lid is a Low Power Mode cause, but
+  Insomnia mutes, freezes, darkens and locks nothing for it.
+- A close darkens the display and keyboard backlight only while the
+  built-in display is online. Under a lid closed at a desk, and after its
+  external display is unplugged, it is offline and macOS keeps both dark,
+  so the close leaves them alone, a close replayed after a power command
+  included.
+  `NSApplication.didChangeScreenParametersNotification` reads the lid
+  again when displays come and go. A display asleep stays online. With the
+  lid closed and nothing plugged in, macOS keeps a stand-in display online
+  (vendor `unkn`, model `virt`), which does not count. The kernel's
+  `AppleClamshellCausesSleep` is no substitute: on Apple Silicon it is set
+  at lid changes only, and stays No after the display is unplugged.
 - Lid events do nothing when no session is active.
 - Each lid event is numbered as it arrives, before its actions queue behind
   earlier ones. An open makes every earlier close stale. A close still
@@ -145,13 +283,14 @@ Quit, or reconcile.
 
 | action | on close | on open |
 |---|---|---|
+| Screen lock (optional, default off) | lock the login session first, before any other action, with `SACLockScreenImmediate` (a private login.framework call); not journaled; a failure shows in the menu and the other actions still run | nothing: the login password unlocks it |
 | Display (optional, default on) | save brightness, set it to 0, request display sleep (best effort) | wake the display, restore the saved brightness |
 | Keyboard backlight (optional, same toggle) | save brightness, set it to 0 | restore the saved brightness |
 | Freeze scope | `SIGSTOP` every process whose responsible app is in the freeze scope (rules below) | `SIGCONT` the recorded pids only |
 | Docker rule (default off) | if Docker Desktop is running and `docker ps -q` is empty, journal its tree, ask `docker ps -q` once more right before the SIGSTOP and freeze it only on a second clean empty answer; busy, a failed probe, a timeout, a lid open or a session end at either point leaves it running | resume |
 | Mute (optional, default on) | journal the default output's UID, name, volume and mute state as its own entry, unless that device already has one, then mute that device; another device's entry never stops it. A device without a settable volume (a monitor's speakers) is journaled with volume 0 and `noVolume: true`; a device without a settable mute is skipped with an info line | restore each entry on its own device, never on another output, and clear only that entry; a device the user unmuted meanwhile is left as it is; a device that is not connected keeps its entry (see below) |
 | Low Power Mode | on (optional, default on) | off unless a battery or thermal floor still wants it |
-| Countdown redraw | stop timer | restart timer |
+| Countdown redraw | stop timer | restart timer; with the end time, format the text again only |
 
 The display and keyboard rows go through private frameworks with no ABI
 contract: the DisplayServices C functions and CoreBrightness's
@@ -308,7 +447,12 @@ owed. A write whose clear is owed is done all the same: the second write
 Mode still owes its write after the mode, as the clear would have
 journaled. A lid close that can read the device clears the flag too: it
 keeps the earlier saved value while the device reads 0, and saves the new
-level when it reads above 0. For the display that level must be trusted:
+level when it reads above 0. For the keyboard the reading itself must be
+trusted: a suppressed or dimmed reading, 0 or above, leaves the entry
+flagged and the backlight as it is, and the last sample is no help, since
+none is taken while an entry is journaled. A kept keyboard 0 from an older
+version is obsolete: a close that reads 0 leaves it flagged, and the open
+discards it without a write. For the display that level must be trusted:
 the last sample, the value owed after the mode, or a current read taken
 with the panel awake and Insomnia's Low Power Mode not on at any point in
 the run, nor over the entry since the Mac last started. Without one, the close leaves the entry flagged and the panel as
@@ -365,7 +509,8 @@ retry, unless a newer failure has taken its place.
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
 reports changes only, so no close event arrives for it. The next lid open
-restarts the redraw.
+restarts the redraw. A lid closed at a desk reads open then, unless
+reconcile keeps lid-close actions from a close in that session.
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from
@@ -438,7 +583,11 @@ does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
 is best effort. It is made only when a display or keyboard brightness is
 journaled, because the wake that undoes it on open, or on reconcile after
-a relaunch, runs only for such an entry. Display brightness 0 does not
+a relaunch, runs only for such an entry. A keyboard that can be read but
+journals no level is journaled as 0 for it when nothing else is, as
+described below. With "Keep the screen on and
+unlocked" on it is not made at all: a display that sleeps locks the screen,
+and Insomnia's own assertion would refuse it anyway. Display brightness 0 does not
 switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
 and restored on open, session end, Quit, or reconcile with the lid open; the
 backstop keeps the entries and only the app restores them (private
@@ -476,15 +625,39 @@ level not yet decided. Each level the app writes from the journal, or
 finds set since in place of a kept value, becomes that device's sample,
 so a close soon after a restore that came late, from the re-read of a
 kept value or after the mode, journals the restored level and not a 0
-sampled before it. The keyboard journals the current
-read if trusted now, else its last sample; when nothing trustworthy is
-known for it, it is left to macOS entirely (no journal entry, no write),
-because restoring a suppressed 0 would leave the backlight off. On open the
+sampled before it. A keyboard already reading 0 is left to macOS entirely
+(no new journal entry or write), unless a positive restore is already owed
+from an earlier close. One exception keeps the display sleep request: when
+a close reads the keyboard but journals no level for it, nothing else is
+journaled, as when the display is refused or unreadable, and "Keep the
+screen on and unlocked" is off, the close journals a 0 with no keyboard
+write, so the open still wakes the display it asked to sleep. The open
+discards that 0 as below. Ambient auto-off can read 0 with neither suppression
+nor dimming flagged, while manual off can set the suppression flag; neither
+is a reason to restore an older positive sample over it. For a positive
+current reading, the keyboard journals that reading if trusted now, else a
+positive last sample; without either, it is left alone, apart from the 0
+journaled for the sleep request above. A positive value
+kept after a refused restore is decided only by a trusted reading, as for
+the display: a 0 keeps it and a level above 0 replaces it. A suppressed or
+dimmed reading leaves it journaled and undecided, and the last sample is no
+help, since none is taken while an entry is journaled. A kept 0 is the
+older version's zero below: only a trusted level above 0 replaces it, and
+otherwise the open discards it.
+A saved zero, from an
+older version or journaled for the sleep request, is cleared without a
+keyboard write or reassertion, including
+when the private-call guard refuses; a failed clear stays owed for retry.
+This avoids committing automatic zero as a permanent off setting. It leaves
+macOS free to relight a keyboard that was already off, even while the lid is
+closed, and positive ambient-dimmed readings remain possible restore values.
+On open the
 restore is written, the entries cleared, and the same values written once
 more 2 s later, because powerd re-applies its own remembered brightness
 asynchronously after the wake and can override the first write; that second
-write is skipped if the lid closed again in the meantime (the close journals
-fresh values first) and superseded by any newer restore. A display restore
+write is canceled if another current lid close starts in the meantime, even
+when an already-zero keyboard creates no new journal entry, and superseded
+by any newer restore. A display restore
 written while Insomnia's own Low Power Mode was on is journaled as
 `displayRestoredUnderLowPower` and written once more, then re-asserted the
 same way, right after Insomnia switches the mode off (lid open, charger,
@@ -618,10 +791,10 @@ IOKit sends no event for a read that keeps failing.
 | condition | action | undo |
 |---|---|---|
 | battery below `lowPowerFloor` (default 40%) | `pmset -b lowpowermode 1` | charger connected, or session end |
-| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify | — |
-| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify | — |
-| thermal state `serious` | `lowpowermode 1` | thermal back to `nominal`/`fair`, or session end |
-| thermal state `critical` | end session, notify | — |
+| battery below `endFloor` (default 10%; 0 turns the end off) | end session, notify, sleep a closed lid | — |
+| battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify, sleep a closed lid | — |
+| thermal state `serious`, or `fair` with no `nominal` since a `serious` (the second only with `thermalHoldUntilNominal`, on by default) | `lowpowermode 1` | thermal back to `nominal` (back to `fair` with the hold off), or session end |
+| thermal state `critical` | end session, notify, sleep a closed lid | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
 
 `PowerMonitor` tells a machine with no internal battery (desktop: no floor
@@ -647,17 +820,93 @@ other floor when the two would cross (`endFloor` at most 95). A `config.json`
 that violates it is corrected at load by raising `lowPowerFloor` to `endFloor`
 + 5 (capped at 100), logged, and written back.
 
+The thermal cause holds from a `serious` reading until a `nominal` one. A Mac
+back at `fair` is still cooling down, and switching the mode off there brings
+back the load that made it serious, so the mode would go on and off as the
+Mac heats up and cools down. `FloorRuleDriver` keeps that history for the
+session, in memory: after a relaunch a Mac at `fair` counts as cooled down.
+The notifications say what the mode waits for ("Low Power Mode stays on until
+it is back to nominal") and why it went off ("Thermal state is back to
+nominal.", or "Thermal rules are off." when Settings turned them off). While
+the mode is on for heat the display sample is held, as for any Low Power Mode
+Insomnia switched on (section 4), so the hold can keep it longer than before.
+Nothing but `nominal` and the session end bounds the hold: a Mac that stays at
+`fair`, under a long build say, keeps the mode, and the display sample held,
+until the session ends. That is deliberate. A Mac at `fair` after `serious` is
+still carrying the heat, and a release on a timer would bring the cycling back
+at a slower pace. The right-click menu and the popover show the mode and the
+thermal state meanwhile, and turning the thermal rules off in Settings
+releases it at once.
+
+Settings can turn the hold off ("Keep Low Power Mode on until the Mac fully
+cools", `thermalHoldUntilNominal`, on by default and for a config.json without
+the key). Off, the thermal cause ends at `fair` as it did before the hold: full
+speed comes back sooner, and the mode can go on and off again as the Mac heats
+up. Turning it off while the mode is held at `fair` releases the mode at once
+("Thermal state is back to fair."), and the enable notification says "Low
+Power Mode is on until it cools down." instead of naming `nominal`.
+
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
 lid. One evaluation owns the mode: it is switched off only when no cause holds.
 Battery and thermal rules run only while the app is alive; they are not
 provided by the standalone backstop. Performance effects depend on workload.
 
+"Sleep a closed lid": macOS asks for a closed lid's sleep once, at the close,
+and the sleep guard refuses it. `disablesleep 0` only clears the kernel's flag
+(`kPowerEventUserDisabledSleep` in xnu's `IOPMrootDomain.cpp`) and does not
+look at the lid again. So these ends and the timer end owe a sleep, as does
+a launch reconcile that finds session.json expired (section 8: the app
+relaunched before the recovery agent's next run removed it), and Insomnia
+calls `IOPMSleepSystem` (no root needed) if
+`AppleClamshellState` is true and the lid is not closed at a desk (section 3:
+no external display online). It does not read `AppleClamshellCausesSleep`,
+which stays false after the display at a desk is unplugged with the lid
+still closed, when the Mac has to sleep. No external display has to hold
+for the 2 s debounce with no display change in between: a change starts the
+wait over (a display back drops the sleep), the display list is read again
+at its end, and the request goes ahead only if it still shows none, so a
+display that drops out for a moment, even again and again, does not put a
+Mac at a desk to sleep. A display list that cannot be
+read (`CGGetOnlineDisplayList` fails) is not taken as no display: the request
+waits 30 s and reads it again, and each such failure counts as a refusal
+below. It asks
+after an end, and only with no session, no lifecycle operation queued or
+running, and no `sudo pmset` left running. An end owes the sleep only when it
+finds the session, so the retry of an end that has run (session.json kept in
+place, a restore left to the app) owes nothing new, and the sleep is asked
+once. macOS refuses while sleep is still disabled, as after a failed
+`disablesleep 0` that the recovery agent retries, so a refused or postponed
+request is asked again every 30 s. The owed sleep is dropped once it is asked,
+when the lid is open or closed at a desk at the request, when a start begins,
+or after 10 refusals and unreadable display lists in all: sleep is then not
+coming back, as when the sudoers rule is gone. From the end that owes the sleep until it is
+dropped, the app also watches the lid as in section 3, apart from the
+session's own observer, which stops with the end. An open that holds for
+the 2 s debounce drops the sleep, between two requests or while the end
+waits for a `sudo pmset` left running; a lid already open at the end is
+left to the request's own check. Closing the lid again does not bring
+it back: macOS asks for that close's sleep itself, and sleep still disabled
+by a failed restore refuses it, as after an end that owes nothing. Asked
+every 30 s, that is at most about 5 minutes, while the agent tries to
+restore sleep every 60 s; a quit or an end's retry asks too and its refusal
+counts, while a postponed request does not. Only the app asks, so a quit
+waits while a sleep is owed, at most until those refusals end it. Other
+ends owe nothing.
+
 ### 7. Network failover
 
 - `NWPathMonitor` on the Wi-Fi interface. Event-driven.
 - Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
-  scan, then join with `associate(to:password:)`. The password is read from
+  scan, then join with `associate(to:password:)`. A scan that finds nothing
+  is tried again with the SSID's apostrophes swapped, straight (U+0027) for
+  typographic (U+2019) and back (`HotspotSSID.scanCandidates`): iOS names a
+  Personal Hotspot `Name’s iPhone` with U+2019, a Mac keyboard types U+0027,
+  and a directed scan matches the exact bytes. Measured on macOS 27.2: a
+  fresh directed scan takes about 2 s, and one made within about 10 s of it
+  answers from the scan cache in about 20 ms, so the other spelling costs a
+  join almost nothing. It is looked for among the networks the first scan
+  heard, which holds for an iPhone hotspot, since it broadcasts its name. The password is read from
   the login Keychain (generic-password service `insomnia-hotspot`, account =
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
@@ -672,7 +921,8 @@ provided by the standalone backstop. Performance effects depend on workload.
   or a locked keychain; the file-based keychain cannot tell them apart), and
   a missing item with `errSecItemNotFound`. Either skips the join and sets
   a `HotspotPasswordReport`, the `HotspotPasswordProblem` and the SSID it
-  was read for: a warning line in the right-click menu and a notice under
+  was read for: a warning line in the right-click menu (a warning row in
+  the menu bar popover in Popover style) and a notice under
   the password field in Settings, both only while that SSID is the one
   configured, and one notification per outage and hotspot (re-armed on
   recovery, on stop and when the password is saved). Settings checks the
@@ -745,11 +995,10 @@ provided by the standalone backstop. Performance effects depend on workload.
   followed by a fresh read of the item and its keychain.
 - macOS 26 requires Location Services permission before CoreWLAN exposes SSIDs
   or returns results for an SSID-filtered scan. Insomnia requests when-in-use
-  access when the hotspot is saved or a configured session starts, never at
-  launch. Mac apps have no when-in-use state: a grant settles on
+  access when the hotspot is saved, a configured session starts or the user
+  clicks Allow… in the hotspot settings, never at launch. Mac apps have no when-in-use state: a grant settles on
   `authorizedAlways`, and System Settings records it as Location Services
-  access for Insomnia (the Settings window says so next to the Location
-  row). Insomnia never starts location updates. The real hotspot join still
+  access for Insomnia (Settings says so next to Location access). Insomnia never starts location updates. The real hotspot join still
   must be run on the Mac in the manual test plan below.
 - Log lines naming the SSID, a tmux target or a process reach the unified
   log as private data (`Log.swift`), so `log show` prints `<private>` for
@@ -768,7 +1017,10 @@ provided by the standalone backstop. Performance effects depend on workload.
     the user (`tmux set-option -p -t <target> @insomnia-nudge on`) gets
     `tmux send-keys -t %N continue`, followed by `Enter` only when
     `tmuxNudgePressesEnter` is on (default off). An unmarked pane is
-    skipped and logged.
+    skipped and logged. So is a pane whose foreground program
+    (`pane_current_command`) is a shell, named in /etc/shells or a common
+    one: the mark outlives the program it was set for, and at the prompt
+    the keys would go to the shell.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
 - Recommended one-time setting, documented in docs/extras.md: System Settings >
@@ -787,6 +1039,11 @@ Reconcile runs at every Insomnia launch:
 1. Session file missing or expired → restore journaled changes: sleep,
    verified owned processes, Low Power Mode if we set it, saved audio, and
    recorded App Nap values.
+   A session file that decodes and has expired also owes a closed lid's
+   sleep (section 6). It is asked once the lock is free: after the
+   reconcile, or by the end that runs again when a `sudo pmset` left running
+   exits. A missing file owes none, and neither does one that does not
+   decode or cannot be read, whose end time is unknown.
    Unverified entries and failed restoration remain unresolved, not successful.
    A session file that does not decode counts as expired: it is renamed under
    the lock to `session.json.unreadable-<UTC stamp>` (never deleted, never
@@ -853,8 +1110,10 @@ Backstop, independent of the app:
   journal, any `session.json` and `--force` take the full run.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
-  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
-  build's cdhash) and execs the script when that passes; otherwise it logs
+  plist (strict Security framework validation in the native command, or
+  `codesign --verify --strict -R=...` in the external fallback; for an ad-hoc
+  build, that build's cdhash) and directly execs `/bin/bash` with the sealed
+  script path when that passes; otherwise it logs
   one line and exits without running anything. No executable lives in a
   writable directory. The plist is a per-user file like any LaunchAgent; at
   the next arm the app rewrites a plist that does not match, and reloads a
@@ -1003,7 +1262,7 @@ Backstop, independent of the app:
   has replaced it.
   Process recovery must verify identity and avoid resuming a process that
   Insomnia did not stop. The entries that record `startedAtMicros` go to
-  the installed app binary in one call (`Insomnia --resume-frozen
+  the app binary in one call (`Insomnia --resume-frozen
   <seconds>`, with one line `<pid> <startedAt> <startedAtMicros>
   <bootSession>` per entry on standard input, which has no size limit,
   answered before AppKit starts),
@@ -1012,7 +1271,12 @@ Backstop, independent of the app:
   input order, `<pid> <word>`, and exits 0 when every word is `resumed` or
   `gone`, 1 otherwise. A missing or malformed `<seconds>` (1 to 300), any
   further argument, empty input or a malformed line is a usage error (exit
-  64) that checks nothing. The script runs the binary only when the bundle's
+  64) that checks nothing. When the script runs from
+  `<name>.app/Contents/Resources`, the binary is the one in that bundle,
+  which the LaunchAgent, install.sh and uninstall.sh each verify before
+  they run the script. That holds after the user moves the bundle out of
+  ~/Applications. A checkout's copy uses the installed app in
+  ~/Applications. The script runs the binary only when the bundle's
   `Info.plist` declares `InsomniaResumeFrozenVersion` equal to the version
   the script speaks, because an older build would start the menu bar app
   instead; otherwise it keeps those entries. It runs it with the same
@@ -1073,12 +1337,43 @@ one-time update (section 10, once).
 ### 10. Settings
 
 JSON at `~/Library/Application Support/Insomnia/config.json`, edited through a
-small settings window. Like `session.json`, `state.json` and the recovery
+settings window: one page grouped by what happens (When the lid closes, Apps,
+Battery, If Wi-Fi drops, General), with Edit Apps and the hotspot in sheets. Like `session.json`, `state.json` and the recovery
 lock it is created mode 0600 in a 0700 directory, and a looser file from an
 older build is tightened when the app reads it:
 
-- presets, default preset, default field (the pill focused when the pills open:
-  days, hours or minutes; hours by default)
+- presets (the choices for the default session length), default preset,
+  default field (the pill focused when the pills open: days, hours or
+  minutes; hours by default), countdown (what the menu bar shows during a
+  session: the time left, or the end time; the time left by default). The
+  end time is the clock time in the system's 12 or 24 hour style, with the
+  weekday when it is another day and the date a week or more away. No timer
+  redraws the status item: the text is formatted again only when the
+  session changes or the time zone, the clock, the day or the locale does.
+  The right-click menu gains a "Time left" line. A change reaches a running
+  session at once. A value this build does not know reads as the time left.
+- show the countdown in the menu bar (`showMenuBarCountdown`) on/off,
+  default on. Off leaves the eye alone in the bar, as the menu bar list
+  above describes.
+- menu bar style (`menuBarMode`): Pills, Compact, Minimal or Popover
+  (section 11). The countdown switch applies to Pills and Popover; Compact
+  and Minimal never show a countdown in the bar.
+- start a session with one click (`oneClickStart`), default off, also for
+  a config.json without the key. The row sits right under the Menu bar
+  picker, with one line on what a click does with the switch on and off in
+  the chosen style. With Minimal chosen the row is greyed out and its line
+  says the switch does nothing there (section 11, One-click start).
+- keep the screen on and unlocked on/off (default off; section 2)
+- play a sound when you start or end a session (`sessionSounds`), default
+  off, also for a config.json without the key. Off, Insomnia generates,
+  loads and plays nothing. On, a start or an end asked for in the menu bar
+  plays a short tone, made in memory with no sound file. Nothing plays for
+  an end the user did not ask for (the timer, the backstop, Quit, a battery
+  or thermal floor, crash recovery at launch), for an end request that
+  found the session already ended another way, for `--session` commands,
+  while every display sleeps or while the lid is closed. The lid is read
+  when the tone would play, so a start or an end in the 2 s after a close,
+  before the lid observer reports it, plays nothing either.
 - freeze list (bundle ids), freeze every other app on/off (default off),
   Docker rule on/off, mute on lid close on/off (default on). Under the mute
   toggle: on Mac laptops with Apple silicon or a T2 chip, closing the lid
@@ -1089,17 +1384,31 @@ older build is tightened when the app reads it:
   `muteOnLidClose` on, the mark set, and is written back. When either value
   changed, the launch reconcile posts one "Lid-close settings changed"
   notification naming each change and where to change it back (Settings,
-  Lid-close actions). It posts before taking the recovery lock, so a busy
+  When the lid closes and Edit Apps). It posts before taking the recovery lock, so a busy
   lock or an unreadable journal does not hold it back, and after the app
   installs its notification delegate. The app keeps the change in `lidCloseDefaultsNotice` so Settings
-  shows the same line at the top of Lid-close actions until dismissed. The
+  shows the same line at the top of When the lid closes until dismissed. The
   mark stays set, so a setting the user turns back is never changed again. A
   missing `muteOnLidClose` in a config without the mark reads as off, as the
   earlier builds read it. A fresh install writes a config.json with the mark
   and the new defaults and shows no notice.
-- agent list (bundle ids), turn App Nap off for them on/off (default off)
-- `lowPowerFloor`, `endFloor`, thermal rules on/off
-- hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
+- agent list (bundle ids), turn App Nap off for them on/off (default off).
+  Edit Apps shows the agent list and the freeze list as one list with one
+  rule per app, Keep running or Freeze when lid closes, so an app is on
+  exactly one list; "All other apps" is `freezeAllApps`. An app an older
+  config.json names on both lists keeps running, as the freeze planner
+  treats it: Edit Apps and the summary lines on the page show it once, as
+  Keep running, and picking either rule for it takes it off the other list.
+  An Apple app, Insomnia or Docker Desktop on the freeze list alone shows as
+  Keep running too, since the planner never freezes it from the list, and
+  its row's Remove button clears the entry.
+- `lowPowerFloor`, `endFloor`, thermal rules on/off, the heat hold
+  (`thermalHoldUntilNominal`, default on). A change to any of
+  them, or to the lid option, during a session runs the floors at once:
+  `SessionManager.config` calls `floorInputsChanged` when `Config.floorInputs`
+  changes, and `AppServices` runs `reevaluateFloors` for it.
+- hotspot SSID, picked from the networks this Mac has joined or typed
+  (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
   the bundle's signature and location, and `install.sh` ad-hoc signs a
@@ -1128,7 +1437,7 @@ older build is tightened when the app reads it:
   whenever the app becomes active, so an approval or removal made in
   System Settings shows without a relaunch. With the flag off nothing is
   registered or unregistered at launch.
-- version and update check (Settings > App). The version line shows
+- version and update check (Settings > General). The version line shows
   `CFBundleShortVersionString` and `CFBundleVersion` from the running
   bundle's Info.plist, and the launch log line carries the same, so a bug
   report can name the build. A binary from `swift run` has no Info.plist
@@ -1163,6 +1472,338 @@ directly in the menu bar). Insomnia copies that interaction and the feel.
 along the menu bar: three pill fields spring out to the right of the icon,
 one after another with a short stagger.
 
+**Menu bar styles.** Settings > General opens with a Menu bar picker of
+four styles: Pills (the default, the inline entry described here), Compact,
+Minimal and Popover. One line under the picker says what the chosen style
+does. The config key is `menuBarMode`, stored as `pills`, `compact`,
+`minimal` or `popover`. A config without the key reads as Pills, or as
+Compact when an older build's `compactMode` is on. A value this build does
+not know reads as Pills and leaves the rest of the config as it was. All four
+styles share one persistent NSStatusItem, status button, and autosaved menu-bar
+position. Switching modes changes the content and click behavior without hiding,
+removing, or reinserting the item. This keeps the same identity for macOS and
+menu-bar managers such as Thaw; a separately inserted Compact item is no longer
+needed.
+
+**One-click start.** A switch under the Menu bar picker, "Start a session
+with one click" (`oneClickStart`), off by default. Off, every style works
+as this section describes. On, in Pills, Compact and Popover, a plain left
+click on the eye starts the default preset when no session runs, no start
+is pending and no end is restoring. The start takes the same path as a
+typed one and asks for the default preset. Every other click does what it
+does with the switch off:
+
+- Option-click opens the pills, the panel or the popover, so any length is
+  still one click away. In Popover a right-click or a Control-click opens
+  the popover too. On macOS 27 a click carries no keys, so the keys held
+  as the app handles it count; a click the app handles more than 50 ms
+  late, after a stall, counts as an Option-click, since Option can be up
+  by then.
+- A click during a session opens the extension (Pills), the panel
+  (Compact) or the popover. A click never ends a session.
+- A click while a start is pending or an end is restoring asks for nothing
+  more.
+- A default preset that no session can hold (not finite, not above zero,
+  or too large for an Int, as a hand-edited config.json can say) is never
+  asked for. The click opens the controls as with the switch off.
+
+A refused start shows its reason without another click, the way each
+style shows a refused typed start: the pills reopen with the error and
+the default length in the fields, Compact opens its panel with the error
+and the default length in its entry, and Popover opens the popover with
+the reason under the time buttons. Its fields are empty: a time left in
+them from an earlier opening does not come back, though a popover opened
+during the start keeps what was typed in it. In Pills and Compact, Return
+retries the same length, to the second, also after a time was typed there
+earlier; in Pills another click on the eye does too. Typing there goes to
+the default field from Settings, not to the field focused when the pills
+or the panel last closed. In Popover, Start
+and Return stay off until a time is typed, and a chip retries. A one-click
+start that goes through with a warning (an agent app's App Nap setting
+that could not be written, say) has spent its length: Compact shows the
+running session with the warning, and a click on its countdown opens
+empty fields. Minimal ignores
+the switch, because a click there already adds the default length, and
+Settings greys the row out. In Pills, Compact and Minimal a Control-click
+opens the right-click menu and never reaches the eye's click. The status
+view's event monitor takes the press, its drags and its release before
+SwiftUI sees them.
+
+**Compact mode.** Only the eye remains in the menu bar in every session state.
+Clicking it opens an arrowless native NSPanel with
+the same Days / Hours / Minutes pills, or the running countdown and hold-to-end
+control. Return starts or extends a session; clicking the countdown opens
+the fields to add time. Settings and Quit remain in the right-click menu.
+The hold-to-end control appears as soon as a start is submitted, so a pending
+start can be cancelled while the recovery agent and sleep guard prepare.
+Adding time stays disabled while a request is pending, and cancellation stays
+disabled while the resulting restoration finishes. The panel reads the
+session manager's own end state, so it shows every end, whoever started it:
+a hold or the menu's End session in any style, the timer, a battery or
+thermal floor, `--session end`, a reconcile or a failed start. From the
+request until the end restores sleep, or hands what is left to an armed
+recovery agent after `disablesleep 0` failed, the panel shows Ending… with
+its countdown and ring disabled and takes no keys, then the pills. That
+includes the wait for a retry after a restore command outlived its timeout,
+or after an end left work that only Insomnia can finish. An end that changed
+nothing leaves the session active: a busy recovery lock (retried in 30 s),
+an unreadable state.json (waits for a person) or a command still holding the
+lock (retried when it exits). The panel then shows Ending… with its
+countdown disabled, because time added then would be ended by the retry or
+refused. Its ring stays enabled to ask for the end again. The Pills style
+keeps its original behavior of showing the end control after session
+confirmation.
+The timer and input fields never widen the menu bar in this mode.
+Clicking outside dismisses the dropdown and retains
+unfinished duration input. Switching modes takes effect immediately without
+ending an active session or cancelling a pending start. The dropdown reuses
+the Pills style's DurationPillsView and SessionRunningControls, including
+PillView, HoldToEndButton, and duration-key handling: click to select,
+type digits, use Tab or arrows to move, Delete to erase, and Return to submit.
+Selection uses the original inline focus ring and bounce; there is no text
+cursor or text selection.
+Out-of-range digits receive the same feedback as in the Pills style. An
+empty draft opens on the default field from Settings, as the Pills do, when
+the panel opens, when the countdown is clicked to add time, and after a
+start, an extension or an end goes through. A draft with digits keeps its
+own focus. The countdown changes its digits in one step, as in the bar.
+The panel uses AppKit's native popover material and window shadow with rounded
+corners. It has no title bar or popover arrow. Its left edge aligns with the
+persistent status button, with a 2-point gap below the menu bar. The app clamps
+the panel to the display when space is limited.
+Opening the panel activates Insomnia, as the Pills do, so typed digits reach
+the panel and not the app in front. Clicking the icon again, clicking outside,
+or pressing Escape dismisses it; switching modes also closes it. Escape, a
+second click on the icon and a mode change give focus back to the app the user
+was in. Switching apps or opening Settings leaves focus where it went. An
+outside click that brings no app forward gives it back. The right-click menu
+gives it back after it closes, if no window of Insomnia took it. During an extension, Escape first returns
+from the input pills to the running countdown, matching the shared controls.
+The window fits only the active row, shrinking for the timer and expanding for
+duration entry or a wrapped error. Its content-size animation uses the same
+0.32-second duration as the original inline folding animation. Reopening
+starts at the current content size, and Reduce Motion skips the spatial resize.
+The same status item keeps its position when switching modes. All presentations
+use the same status rows and action
+handlers, including browser-relaunch confirmation and audio-recovery actions.
+
+**Minimal mode.** Only the eye occupies the menu bar, with no dropdown or
+inline editor. An arc with rounded ends and an opening beneath the eye
+appears as soon as a start is submitted. The thick remaining-time arc starts
+full and empties as the remaining fraction decreases, revealing a thinner
+track for elapsed time; an extension updates the session's total span and
+adds to the ring. Confirmation replaces the initial full arc with live
+progress. The arc reads the session's start and end on its own timer, about
+every hundredth of the session and from 2 to 60 seconds apart, so it drains
+with either countdown style. A start, an extension or an end redraws it at
+once. The timer stops while every display sleeps; a wake redraws the arc and
+restarts it. Time running out redraws in one step, and only added time
+animates. The item keeps the same width in every state. The arc and eye share
+one 0.32-second transition when starting and ending; the last progress value
+stays visible as the arc fades out and the eye closes. Reduce Motion uses a
+crossfade without resizing the eye or arc.
+
+A short click starts a session or adds time using the default session length
+from Settings, which Settings shows as a text field (such as 1d 2h 30m) while
+Minimal is chosen. Holding the eye for 0.6 seconds ends
+a session or cancels a pending start; releasing after a completed hold never
+adds time. Dragging away cancels the gesture. When the hold completes, the
+button must still be down and the pointer within 12 points of where the press
+began, as for the end ring: on macOS 27 the release and the drags arrive from
+a poll and may not have been delivered yet. Only that check ends a session: a
+release the app handles 0.6 seconds or more after the press, before the check
+has run (the main thread was busy), may be a click held back, so it ends
+nothing and adds no time. The same rules apply to the end ring in the Compact
+panel. Additional clicks wait for
+pending session work to finish, and an end blocks repeated actions until its
+restoration finishes. Right-click and Control-click retain the
+status menu, Settings, and Quit. In Compact and Minimal the status menu
+carries the time left while a session runs, since the bar has no countdown. Accessibility offers the start/add action,
+an End session action, and the remaining time. Switching modes does not restart
+or end a session.
+
+**Popover mode.** The menu bar carries the eye and, during a session, a
+short countdown; everything else lives in one popover that hangs from the
+icon. The bar never widens while a time is being typed. Popover style has
+no right-click menu: its status, warnings, Settings and Quit are in the
+popover.
+
+**The status item.**
+
+- Idle: the eye, closed. Nothing else in the bar.
+- Running: the eye, open, with the countdown beside it to the minute: the
+  time left ("2h 31m", "45m", "1d 3h", "<1m"; `SessionManager.remainingText`),
+  or, with the countdown style set to end time, the clock time the session
+  ends at. Nothing in the bar changes every second: the time left is
+  redrawn when its minute text changes, the end time only when the session
+  does, and nothing at all while every display sleeps (the manager's
+  redraw timer stops then, and a wake redraws at once). With "Show the
+  countdown in the menu bar" off the item is the eye alone. The popover's
+  header and the item's accessibility value ("Awake, 2h 31m left", or
+  "Awake, ends at 12:40 AM" with the end time) carry the session either
+  way. While a start is pending (the recovery agent and pmset can take
+  seconds) the eye opens at once with the projected countdown; a refused
+  start closes it.
+- The item is as wide as the eye, the countdown and their padding.
+  `NSStatusItem.length` is written from the width the SwiftUI layout
+  reports, and only when it changes: when a session starts or ends, and
+  when the countdown's text changes width, at most once a minute. Opening
+  or closing the popover never moves it. Every length write makes Control
+  Center re-lay out the menu bar and blocks the app's next render commit
+  for 8 to 130 ms (see the menu bar smoothness design spec, revision 4), so
+  nothing writes it per frame.
+
+**The popover.** In Popover style a click on the item, left or right
+(ctrl-click too), toggles one `NSPopover` (arrow pointing up at the icon).
+In the other styles the popover never opens. Switching away from Popover
+style closes it and gives the clicks back to the new style. A start or
+an extend pending in the popover carries over to the new style with its
+duration, from a chip or typed: a start refused after a switch to Pills
+reopens the pills on it, and an extend refused after a switch to Compact
+opens the panel's entry on it. The pills and the panel's entry hold
+whole minutes, so a 90 s chip reads 1m there. Submitting that entry
+unedited asks for 90 s again; after a digit or a backspace in it, the
+submit asks for what is typed. A Minimal click hands on its duration
+the same way. Opening it
+activates the app so its fields take typing, and refreshes the status (lid, battery and watts read
+there and then; the Wi-Fi and browser scans and the foreign-sleep bit
+re-read, filling in as they land). Esc, a click outside, switching apps
+or switching Spaces closes it. Esc, a click on the item, a style change
+and a click outside that brings no app forward (on another menu bar item,
+say) give focus back to the app the user was in, as the Compact panel
+does. Switching apps or Spaces, a click into another app or into
+Settings, and opening Settings leave focus where it went.
+Every click on the item flips it at once, however fast the clicks come:
+the controller's own open/closed state is the only truth, set the moment
+a click lands. Activating the app would bring its other windows
+forward with it, so a Settings window left behind other apps would come
+back with the popover: each of the app's windows under another app's
+window is taken off screen for the activation and put back under the
+window that was just above it. The popover never animates (AppKit holds an animating
+popover on screen for about half a second and puts off a show during
+it), and it is `.applicationDefined`, closed by the controller's own
+mouse-down monitors rather than by AppKit. On current macOS the menu bar
+is drawn by another process, so a click on the item first reaches the
+app as a click outside it (a global mouse-down, the app resigning
+active) and only then as the item's action; anything at the item's
+frame is left to the action, so that click is not taken as both a close
+and a reopen. A start that completes after the popover was closed and
+opened again leaves the new popover open.
+It is a fixed 300 pt wide: long text wraps and the popover grows
+downwards, never sideways. Top to bottom:
+
+1. **Header.** The eye and one line: "Not keeping your Mac awake",
+   "Starting…", "Ending…" through any end, or "Awake until 12:40 AM,
+   2h 31m left" (the weekday is added when the end is on another day).
+2. **Duration.** The popover opens on time buttons alone. Idle: preset
+   chips from `presets` (30m, 1h, 2h, …; a chip starts at once) and a
+   Custom chip, all in one row of equal chips when they fit, otherwise
+   wrapping onto as many rows as they need; a chip never truncates its
+   label. Custom puts out (or away) Days, Hours and Minutes fields with
+   a Start button, and puts the cursor in Hours; the fields are put away
+   again each time the popover opens, unless a refused start left its
+   value in them. Button labels never wrap ("Extend" stays one word on
+   one line). Start (Extend while running) is greyed out, and Enter in a
+   field does nothing, until the fields hold a time: every field in
+   range and the total above zero; it comes alive as the time is typed.
+   With a time typed, Enter in a field starts too. The fields are
+   validated by `DurationInput` (Days up to 30, Hours 0 to 23,
+   Minutes 0 to 59): an out-of-range or non-numeric field gets a red border.
+   Running: extend chips (+30m, +1h) and Custom, which puts out the same
+   fields with an Extend button, and a press-and-hold ring that ends the session
+   only when held for 0.6 s. As for the end ring in the bar, only the
+   ring's own check when it closes ends the session: the button must still
+   be down then and the pointer within 12 points of where the press began.
+   A release the app has not handled yet (the main thread was busy) ends
+   nothing, a click never ends a session, and the ring stops working as
+   the popover closes or an end starts, which cancels a hold in progress.
+   The popover reads the session manager's end state, as the Compact
+   panel does. Through any end, its own or one the manager started (the
+   timer, a floor, `--session end`, a retry), the chips, the fields and
+   Start or Extend are greyed out and Return does nothing. The ring is off
+   through it too, except while an end that changed nothing waits for its
+   retry with the session still active. Then the ring asks for the end
+   again at once.
+   A confirmed start or extend spends the
+   typed value and puts the fields away, but leaves the popover open on
+   the running session: only the user closes it.
+3. **Start error.** When the manager refuses a start, its reason is shown
+   under the fields in system orange, and the typed value stays in the
+   fields for a retry. The same text is not repeated as a warning row
+   while it shows there. Both survive closing and reopening the popover;
+   the next start, or a session coming up, clears them. When the last
+   error is a failed journal clear from undoing the start, it is not the
+   reason: the popover shows "Couldn't start", and that line stays a
+   warning row, which goes once a journal read shows the entry cleared,
+   as when the backstop clears it.
+4. **Status.** Short rows, one fact each, with an SF Symbol: the lid,
+   power (the charge, what the battery is
+   doing, and the time the power source list estimates: "48% · 5.6 W ·
+   2:32 left", "54% · Charging 27 W · 1:10 to full", "Calculating…"
+   while the system is still estimating, as it is for a while
+   after a plug change. Watts carry no sign: the words say which way the
+   power flows, as Stats and `pmset -g batt` do. Under half a watt while
+   charging, as at the charge limit, the draw and the time are left out:
+   "80% · On power adapter"; plugged in but draining, "62% · On power
+   adapter · 5.6 W"), the thermal state when it is above nominal
+   ("Thermal: serious"), whether hotspot failover is set up
+   (`HotspotFailoverRow`, left out while a hotspot password warning
+   shows), Wi-Fi (the
+   network name, or "On" when Location is not allowed, with the reason as
+   a tooltip), and only when they apply, Low Power Mode that Insomnia
+   switched on ("Low Power Mode set by Insomnia"), frozen apps, paused
+   Docker and the last network gap.
+5. **Warnings.** One row each with an orange triangle: a session that is
+   not holding sleep (including one whose sleep check, section 1, could not
+   set SleepDisabled again) or sleep still held with no session
+   (`SleepHeldLine.warning`; a session holding sleep as it should gets no
+   row, since the header already says so), throttled browsers (with a "Relaunch …
+   unthrottled" button per browser, which asks before quitting it), why a
+   relaunch did not happen, the hotspot password problem, a `sudo pmset`
+   left running, the last error, sleep disabled by someone else, and
+   output devices still muted from a lid close (each with a "Stop waiting
+   for …" button). The row order is fixed (`StatusMenu.popoverItems`).
+   Errors read as one short line (`ErrorSummary`: a plain-language line
+   for known prefixes such as "Couldn't arm the recovery backstop.
+   Reinstall with scripts/install.sh.", otherwise the first sentence, cut
+   to about two lines). The original text, paths and all, is the row's
+   tooltip and accessibility hint, and a click opens the row to it. The
+   error strings themselves are unchanged in the log and notifications.
+6. **Footer.** Settings… (Cmd-,) and Quit Insomnia (Cmd-Q). A build with
+   the scripts/simulate-lid.sh watcher compiled in also shows a small
+   muted "Lid simulation build" badge here, the full marker as its
+   tooltip, so it is never mistaken for a normal one.
+
+Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
+`Voltage`) on demand when the popover opens. Never continuously polled.
+
+**Look.** The popover is native: system text styles, standard controls,
+SF Symbols, the system popover material, light or dark with the system.
+The popover adds no colours of its own: the brand palette and the
+label-colour hold ring are the same as in the other styles.
+Warnings and errors use the system orange and red. Every button answers
+the pointer the same way: one hover state and one pressed state, shown at
+once with no animation (`PopoverButtonStyle`, which draws the buttons
+itself so no AppKit hover is layered under it). Chips and the warning
+rows' buttons have a soft rounded fill that strengthens under the
+pointer, Start/Extend is the system accent colour and lightens, Settings
+and Quit get a soft fill only under the pointer, and the popover's
+hold-to-end ring gets one behind it (the rings in Pills and the Compact
+panel do not). The popover's spacing, hover and status values live in
+`DesignTokens.swift`; motion lives in `Motion.swift`.
+
+**Popover motion and feel.**
+
+- The eye's blink is a slower spring (response 0.95, damping fraction 0.9
+  opening; 0.8 / 0.95 closing) so the lid lift and the lash hand-over are
+  seen; the pupil scales in from 0.6 on its own bouncier spring 0.2 s later
+  and eases out to 0.6 on close, clipped to the lens.
+- The fields shake on a rejected value with the snappy spring
+  (`.spring(response: 0.25, dampingFraction: 0.6)`).
+- Respect Reduce Motion: springs become short crossfades (0.15 s; the
+  blink 0.3 s), and nothing shakes. (The popover never animates, with or
+  without it.)
+
 ```
 ☕  ( Days ? ) ( Hours ? ) ( Minutes ? )
 ```
@@ -1180,10 +1821,17 @@ one after another with a short stagger.
   from the original design. Empty-field Enter starts the default preset.
 
 **Running state.** On Enter the pills collapse and morph into a compact
-second-resolution countdown next to the icon. Clicking the cup or countdown
-opens inline duration entry for an extension. Hold the end control to end the
-session. The right-click menu contains status lines (lid, watts, Wi-Fi, frozen
-apps, Docker), browser relaunch actions, Settings, and Quit.
+second-resolution countdown next to the icon (or the end time, when Settings
+asks for it). Clicking the cup or countdown opens inline duration entry for an
+extension. Hold the end control to end the session. The right-click menu
+contains status lines (lid, watts, Wi-Fi, frozen apps, Docker), browser
+relaunch actions, End session while running, Settings, and Quit. End session
+uses the same journaled restoration as the hold control; it leaves the app
+open. Wi-Fi occupies its own status row below the lid, power and battery row.
+The right-click menu anchors to the same persistent status button in every mode
+using AppKit's native context-menu presentation. Read-only rows fit their text
+without reserving a keyboard-shortcut column, while action rows retain the
+native shortcut layout and menu padding.
 
 Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
 `Voltage`) on demand when status is requested. Never continuously polled.
@@ -1193,11 +1841,13 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
 - Everything animates with springs, except the fold that closes the pills
   (a fixed-duration ease, so the slots can leave the moment the last pill
   is gone), the pupil shrinking away as the lid drops (a 0.4 s ease-out,
-  no bounce) and the Reduce Motion crossfades.
+  no bounce), the Pills style's approximately 0.147-second width reveal,
+  Minimal mode's coordinated 0.32-second ease-in-out transition, and the
+  Reduce Motion crossfades.
   Baseline: `.spring(response: 0.35, dampingFraction: 0.72)`; pill focus
   bounce and chip taps use a snappier `.spring(response: 0.25,
   dampingFraction: 0.6)` with a slight scale overshoot (1.0 → 1.06 → 1.0).
-- The status item's width is never animated: `NSStatusItem.length` is
+- The status item's native width is never animated: `NSStatusItem.length` is
   written once per layout change (`StatusWidthWriter`), to the width the
   SwiftUI layout of a custom `NSStatusItem` view reports once per open and
   once per close, as every Apple item does. (Every length write makes
@@ -1206,8 +1856,14 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   menu bar smoothness design spec, revision 4.) Layout-changing state (the
   phase, the pill slots, the error label) is set outside any animation
   transaction, so the layout is computed once per state; the hosting view
-  is laid out at that width, anchored at the leading edge, and the item's
-  window reveals or clips it. Only scale, offset and opacity animate inside.
+  is laid out at that width, anchored at the leading edge. The Pills style's
+  `StatusItemWidthMotion` compensates for the native window's movement with
+  an in-window translation: growth reserves space immediately, then the eye
+  glides as controls unfold to its right; shrinking retains the reservation
+  until the eye's return settles and then releases space in one write. An
+  interrupted close retargets the visible movement and cancels its obsolete
+  release. Reduce Motion and changes to Compact or Minimal settle the
+  reservation immediately; those modes do not apply this translation.
 - Each pill is a fixed slot sized by its placeholder at the typed weight and
   padding, so typing a digit never changes the layout.
 - Pills appear with a staggered scale-and-fade (about 40 ms between pills)
@@ -1216,11 +1872,14 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   by the slots before it, shrinks to 0.6 from its leading edge and fades,
   on one 0.32 s ease curve, farthest pill first, 40 ms apart, sliding under
   its neighbour. The slots leave in one relayout 0.36 s after the last
-  pill's step, and the width is written then, never across a visible pill.
+  pill's step, and the width reveal retargets then, never across a visible
+  pill. A smaller native reservation is written after the eye's return
+  animation settles.
   On Enter the eye starts to open at once and the countdown scales in from
-  the leading edge after the slots have left, showing the time the session
-  will read once the manager confirms it and ticking at 1 Hz meanwhile;
-  the hold-to-end ring follows the confirmation. A click on the eye during
+  the leading edge after the slots have left, showing what the session
+  will read once the manager confirms it, in the current countdown style,
+  and ticking at 1 Hz meanwhile when that is the time left; the
+  hold-to-end ring follows the confirmation. A click on the eye during
   an Esc fold brings the pills back; during an Enter fold the pending start
   owns the bar and the click does nothing until the manager answers.
   Transitions carry their own animation,
@@ -1229,10 +1888,14 @@ Battery watts are read from `AppleSmartBattery` (`InstantAmperage` ×
   opening; 0.8 / 0.95 closing) so the lid lift and the lash hand-over are
   seen; the pupil scales in from 0.6 on its own bouncier spring 0.2 s later
   and eases out to 0.6 on close, clipped to the lens.
-- Typing happens in a non-activating key panel: the app in front stays
-  frontmost; only key status moves to the pills while typing, as with
-  Spotlight, and it returns when the pills close.
-- Number changes in the countdown use `.contentTransition(.numericText())`.
+- Typing activates Insomnia and its key panel; closing the pills returns
+  focus to the previous app if Insomnia still owns it. Switching to another
+  window closes the pills without taking focus back. The right-click menu
+  also closes the pills before it starts handling keys.
+- The countdown changes its digits in one step, with no content transition
+  and no animation, in the bar and in the Compact panel. Each animated frame
+  re-renders the status item (`Motion.countdownTick`). Minimal's arc drains
+  the same way.
 - Focus ring is a soft glow that breathes in, not a hard outline.
 - Respect Reduce Motion: springs become short crossfades (0.15 s; the
   blink 0.3 s), the fold is opacity only in place (0.2 s), the stagger is
@@ -1247,13 +1910,15 @@ transitions. If it feels like a web dropdown, it is wrong.
 
 | input | mechanism | cost between events |
 |---|---|---|
-| lid | IOKit interest notification | none |
+| lid | IOKit interest notification | none, except one read every 2 s while the lid is closed and the display list cannot be read |
 | battery % | IOPS run loop source | none |
 | battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
-| countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
+| countdown redraw | 1 Hz timer, stopped while lid closed or displays asleep; none with the end time | one wake per second while active and visible; none with the end time |
+| Minimal arc redraw | timer at a hundredth of the session, 2 to 60 s, only in Minimal with a session, stopped while displays asleep | one wake per 2 to 60 s |
+| displays asleep | `NSWorkspace` screensDidSleep / screensDidWake, and `CGDisplayIsAsleep` once at launch | none |
 | hotspot retry | only during an outage | none otherwise |
 | update check | two HTTPS requests to api.github.com per click on "Check for updates" | none |
 
@@ -1278,6 +1943,7 @@ Insomnia/
       LidActions.swift
       Log.swift
       ProcessControl.swift
+      SessionCommand.swift
       SessionManager.swift
       SessionMath.swift
       Shell.swift
@@ -1294,6 +1960,7 @@ Insomnia/
       LidSimulation.swift
       LocationPermission.swift
       NetworkFailover.swift
+      ScreenAwake.swift
       Notifier.swift
       PowerMonitor.swift
       ShellTimeout.swift
@@ -1310,6 +1977,8 @@ Insomnia/
       ReminderScheduler.swift
       StatusMenu.swift
       SettingsView.swift
+      AppsSheet.swift
+      HotspotSheet.swift
       StatusItemController.swift
       StatusRootView.swift
       StatusSource.swift
@@ -1355,7 +2024,7 @@ git clone https://github.com/krishhgg/Insomnia.git && cd Insomnia
 ./scripts/install.sh      # asks for sudo once, for the sudoers file
 ```
 
-Then set the hotspot in Settings, pick a freeze list, and start a session.
+Then set up the hotspot and the app rules in Settings, and start a session.
 
 ## Manual test plan
 
@@ -1405,7 +2074,9 @@ validation record.
 11. **Floors.** Set `lowPowerFloor` above current charge → Low Power Mode on.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to
-    `serious`, `critical`, and recovery. Do not intentionally overheat the Mac.
+    `serious`, `critical`, and recovery: Low Power Mode stays on at `fair`
+    after `serious` and goes off at `nominal`. Do not intentionally overheat
+    the Mac.
 13. **Darken.** Brightness 70%, keyboard backlight on, close lid → both go to
     0 (check `state.json` has `savedDisplayBrightness` and
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
@@ -1437,7 +2108,7 @@ validation record.
 16. **Upgrade notice.** Install over a build whose config.json has
     `freezeAllApps: true` and `muteOnLidClose: false`. First launch → one
     "Lid-close settings changed" notification, the same line at the top of
-    Lid-close actions in Settings, both toggles changed, config.json has
+    When the lid closes in Settings, both settings changed, config.json has
     `lidCloseDefaultsApplied: true`. Turn freeze-all back on, relaunch → no
     notice, still on. Dismiss removes the Settings line. A fresh install
     shows no notice.

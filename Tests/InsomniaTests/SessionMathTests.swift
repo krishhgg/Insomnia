@@ -131,4 +131,46 @@ final class SessionMathTests: XCTestCase {
         // Only reads all-zeros once the deadline is actually reached.
         XCTAssertEqual(SessionMath.formatCountdown(remaining: 0.3, shape: .hours), "0:00:01")
     }
+
+    // MARK: End time
+
+    /// Friday 2027-01-15 08:00 UTC, read in a fixed calendar and locale so the
+    /// text does not depend on the machine running the test.
+    private var utc: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }
+
+    private func endTime(after offset: TimeInterval, locale: String = "en_GB") -> String {
+        SessionMath.formatEndTime(t0.addingTimeInterval(offset), now: t0, calendar: utc, locale: Locale(identifier: locale))
+    }
+
+    func testEndTimeReadsTheClockTimeToday() {
+        XCTAssertEqual(endTime(after: 9 * 3600 + 40 * 60), "17:40")
+        XCTAssertEqual(endTime(after: 9 * 3600 + 40 * 60 + 59), "17:40", "seconds are not shown")
+    }
+
+    func testEndTimeAddsTheWeekdayWhenItIsNotToday() {
+        XCTAssertEqual(endTime(after: 19 * 3600), "Sat 03:00")
+        XCTAssertEqual(endTime(after: 6 * 86400 + 9 * 3600 + 40 * 60), "Thu 17:40")
+    }
+
+    func testEndTimeAddsTheDateOnceTheWeekdayWouldBeAmbiguous() {
+        XCTAssertEqual(endTime(after: 7 * 86400 + 9 * 3600 + 40 * 60), "22 Jan at 17:40")
+    }
+
+    func testEndTimeFollowsTheTwelveHourLocale() {
+        let text = endTime(after: 9 * 3600 + 40 * 60, locale: "en_US").replacingOccurrences(of: "\u{202F}", with: " ")
+        XCTAssertEqual(text, "5:40 PM")
+    }
+
+    func testCountdownTextFollowsTheStyle() {
+        let end = t0.addingTimeInterval(4 * 3600)
+        XCTAssertEqual(SessionMath.countdownText(endsAt: end, shape: .hours, style: .remaining, now: t0), "4:00:00")
+        XCTAssertEqual(
+            SessionMath.countdownText(endsAt: end, shape: .hours, style: .endTime, now: t0, calendar: utc, locale: Locale(identifier: "en_GB")),
+            "12:00"
+        )
+    }
 }

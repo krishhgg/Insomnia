@@ -5,6 +5,7 @@ import XCTest
 final class LidActionsTests: XCTestCase {
     var h: Harness!
     var freezer: FakeFreezer!
+    let locker = FakeScreenLocker()
 
     let processes: [ProcessEntry] = [
         ProcessEntry(pid: 1, ppid: 0, startedAt: 1),
@@ -44,7 +45,7 @@ final class LidActionsTests: XCTestCase {
         m.config.freezeList = ["com.tinyspeck.slackmacgap"]
         if let dockerRule { m.config.dockerRule = dockerRule }
         let docker = DockerRule(freezer: freezer, probe: dockerIdle)
-        let actions = LidActions(manager: m, freezer: freezer, docker: docker, audio: h.audio, display: h.display, keyboard: h.keyboard, sampler: sampler)
+        let actions = LidActions(manager: m, freezer: freezer, docker: docker, audio: h.audio, display: h.display, keyboard: h.keyboard, screenLock: locker, sampler: sampler)
         return (m, actions)
     }
 
@@ -110,9 +111,9 @@ final class LidActionsTests: XCTestCase {
 
     /// The live defect: the lid closes after the panel idle-dimmed and
     /// slept. The display reads its dim value and the keyboard reads 0.
-    /// Restoring those would leave a dim panel and a dead backlight; the
-    /// last trusted sample is journaled instead. Both are still set to 0.
-    func testAsleepAndSuppressedAtCloseJournalsTheLastTrustedSample() async throws {
+    /// Restore the display sample; leave an already-zero keyboard alone,
+    /// since suppression also describes a keyboard the user turned off.
+    func testAsleepDisplayUsesSampleAndZeroKeyboardIsLeftAlone() async throws {
         let idle = Locked<Double>(3)
         let sampler = makeSampler(idle: idle)
         let (m, actions) = await make(sampler: sampler)
@@ -128,14 +129,14 @@ final class LidActionsTests: XCTestCase {
 
         let s = try XCTUnwrap(try h.store.loadState())
         XCTAssertEqual(s.savedDisplayBrightness, 0.7, "the idle-dim value was journaled")
-        XCTAssertEqual(s.savedKeyboardBrightness, 0.5, "the suppressed 0 was journaled")
+        XCTAssertNil(s.savedKeyboardBrightness)
         XCTAssertEqual(h.display.sets, [0])
-        XCTAssertEqual(h.keyboard.sets, [0])
+        XCTAssertEqual(h.keyboard.sets, [])
         XCTAssertNil(m.lastError)
 
         await actions.onOpen()
         XCTAssertEqual(h.display.sets, [0, 0.7])
-        XCTAssertEqual(h.keyboard.sets, [0, 0.5])
+        XCTAssertEqual(h.keyboard.sets, [])
     }
 
     /// Nothing trustworthy is known for the keyboard and it reads 0 under
@@ -157,7 +158,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.7)
         XCTAssertEqual(h.procs.suspended.count, 2)
         XCTAssertNil(m.lastError)
-        XCTAssertTrue(logText().contains("keyboard backlight suppressed by display sleep and no trusted sample; leaving it to macOS"), logText())
+        XCTAssertTrue(logText().contains("keyboard backlight already reads zero; leaving its automatic or user-off state untouched"), logText())
 
         await actions.onOpen()
         XCTAssertEqual(h.keyboard.sets, [])
@@ -649,7 +650,7 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.keyboard.sets, [0, 0.5, 0])
         XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.7, "the second close is journaled")
         let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
-        XCTAssertTrue(log.contains("display restore re-assert skipped: darkened again"), log)
+        XCTAssertTrue(log.contains("pending brightness re-assert canceled: lid closed again"), log)
         XCTAssertFalse(log.contains("display restore re-asserted"), log)
     }
 
@@ -831,6 +832,27 @@ final class LidActionsTests: XCTestCase {
         XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
     }
 
+    /// The last external display went away under a lid closed at a desk, so
+    /// the built-in display is off and macOS keeps it and the keyboard dark:
+    /// neither is touched or journaled, and the rest of the close runs. The
+    /// same for a close replayed after a power command.
+    func testACloseWithTheBuiltInDisplayOffLeavesDisplayAndKeyboardAlone() async throws {
+        let (m, actions) = await make()
+        await m.start(duration: 3600)
+        h.display.builtInIsOnline = false
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        let s = try XCTUnwrap(try h.store.loadState())
+        XCTAssertNil(s.savedDisplayBrightness)
+        XCTAssertNil(s.savedKeyboardBrightness)
+        XCTAssertFalse(s.savedAudioOutputs.isEmpty, "muted")
+        XCTAssertEqual(h.procs.suspended.count, 2, "frozen")
+    }
+
     func testDarkenOffTouchesNeitherDisplayNorKeyboard() async throws {
         let (m, actions) = await make()
         m.config.darkenDisplayOnLidClose = false
@@ -850,6 +872,90 @@ final class LidActionsTests: XCTestCase {
         XCTAssertEqual(h.display.sets, [])
         XCTAssertEqual(h.keyboard.sets, [])
         XCTAssertEqual(h.display.wakes, 0)
+    }
+
+    // MARK: Lock the screen
+
+    func testLockRunsBeforeDarkeningMuteAndFreezes() async throws {
+        let (m, actions) = await make(dockerRule: false, mute: true)
+        m.config.lockScreenOnLidClose = true
+        m.config.darkenDisplayOnLidClose = true
+        await m.start(duration: 3600)
+        let order = Locked<[String]>([])
+        locker.onLock = { order.value.append("lock") }
+        h.display.onSet = { _ in order.value.append("display") }
+        h.audio.onMute = { order.value.append("mute") }
+        h.procs.onSuspend = { _ in order.value.append("freeze") }
+
+        await actions.onClose()
+
+        XCTAssertEqual(order.value, ["lock", "display", "mute", "freeze"])
+        XCTAssertEqual(h.display.sets, [0])
+        XCTAssertEqual(h.audio.mutes, 1)
+        XCTAssertEqual(h.procs.suspended, [[100, 101, 102]])
+    }
+
+    func testCloseLocksTheScreenOnceWhenOn() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 1)
+        XCTAssertNil(m.lastError)
+        XCTAssertTrue(logText().contains("screen locked on lid close"), logText())
+
+        await actions.onOpen()
+        XCTAssertEqual(locker.calls, 1, "opening the lid does nothing for the lock")
+    }
+
+    func testCloseDoesNotLockWhenOff() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = false
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 0)
+    }
+
+    func testCloseWithNoSessionDoesNotLock() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 0)
+    }
+
+    func testACloseTheLidOpenOvertookDoesNotLock() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+        await m.start(duration: 3600)
+        let close = actions.lidEventArrived()
+        actions.lidEventArrived()
+
+        await actions.onClose(event: close)
+
+        XCTAssertEqual(locker.calls, 0)
+    }
+
+    func testAFailedLockIsShownAndTheRestOfTheCloseStillRuns() async throws {
+        let (m, actions) = await make()
+        m.config.lockScreenOnLidClose = true
+        locker.throwOnLock = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(locker.calls, 1)
+        let line = try XCTUnwrap(m.lastError)
+        XCTAssertTrue(line.contains("could not lock the screen"), line)
+        XCTAssertTrue(line.contains("SACLockScreenImmediate returned 1"), line)
+        XCTAssertTrue(logText().contains("could not lock the screen"), logText())
+        XCTAssertEqual(h.display.sets, [0], "darkening still ran")
+        XCTAssertEqual(h.procs.suspended.count, 2, "freezing still ran")
     }
 
     /// Open: wake the panel first (a slept display lights before its
@@ -979,6 +1085,28 @@ final class LidActionsTests: XCTestCase {
         XCTAssertNil(m.lastError)
         let log = (try? String(contentsOf: h.home.paths.logFile, encoding: .utf8)) ?? ""
         XCTAssertTrue(log.contains("display sleep request failed"), log)
+    }
+
+    /// With the screen kept awake a display sleep would lock the screen, so
+    /// the close darkens and journals as usual and asks for no sleep.
+    func testKeepScreenAwakeDarkensWithoutRequestingDisplaySleep() async throws {
+        let (m, actions) = await make()
+        m.config.keepScreenAwake = true
+        await m.start(duration: 3600)
+
+        await actions.onClose()
+
+        XCTAssertEqual(h.display.sets, [0])
+        XCTAssertEqual(h.keyboard.sets, [0])
+        XCTAssertEqual(h.display.sleepRequests, 0)
+        XCTAssertEqual(try h.store.loadState()?.savedDisplayBrightness, 0.7)
+        XCTAssertNil(m.lastError)
+        XCTAssertTrue(logText().contains("keep the screen awake is on"), logText())
+
+        await actions.onOpen()
+
+        XCTAssertEqual(h.display.sets.last, 0.7)
+        XCTAssertNil(try h.store.loadState()?.savedDisplayBrightness)
     }
 
     func testNoKeyboardBacklightSkipsTheKeyboard() async throws {
