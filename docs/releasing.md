@@ -265,6 +265,11 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 
 - With a text field focused in another app, open the duration pills and type digits, Tab, Backspace and Esc: only Insomnia changes, and Esc returns focus to the previous app. Repeat for extending a session and after a refused start. Switching apps closes the pills without taking focus back. Clicking an already-open Settings window keeps keyboard focus in Settings; opening Settings/Quit closes the pills and gives the menu its own keyboard input. Repeat on another display/Space. Do not send Enter to a chat or terminal as a test.
 
+- With SIP enabled, Login Items & Extensions lists the recovery agent as Insomnia with its app icon after an upgrade from the shell-based agent and after login; `launchctl print gui/$(id -u)/com.insomnia.backstop` starts `Insomnia --backstop` and records exit code 0 without opening the menu bar app. Ad-hoc builds may still say "Item from unidentified developer". Do not reset the background task database to clear a cached shell entry. With SIP disabled the agent is the shell verifier, and the row reads `sh` with a generic icon.
+- With SIP enabled, test the native plist's `SpawnConstraint` on a disposable agent: the pinned ad-hoc executable runs, but a different ad-hoc executable that only writes a marker (and performs no verification) must leave no marker and report `OS_REASON_CODESIGNING`. The same replacement without the constraint must run as a control. Restore an older Insomnia binary under the native plist and confirm that no GUI starts. Keep the full-bundle verification tests for edited scripts too.
+- Capture the native agent's `launchctl print` output, including `properties`, before and after a second `arm()` on the same build. Confirm the second call does not bootout/bootstrap the job, reset its run count or post another background-item notification. Preserve the raw output in the head's validation report; unit-test captures from disposable jobs do not replace the installed-agent check.
+- On a separately approved test machine already configured with SIP disabled, confirm installation and a later session use the external shell verifier. A registered native job must be replaced on the next `arm()` after a SIP change. Do not change a contributor's SIP settings for an automated test; unknown and failed status reads are also covered by injected tests.
+- Measure idle recovery launch cost against the external shell with the same temporary clean journal; record warm-run timings, since the native entry point loads the app's linked frameworks every minute.
 - Normal end, deadline expiry, and repeated Quit restore live power state
 - `Insomnia --session start 120` from Terminal while the app runs: the menu bar counts the session down and `pmset -g` reads SleepDisabled 1, `--session extend 60` moves the countdown out, and hold-to-end and `--session end` each end the session with SleepDisabled 0; with the app quit, the command prints that Insomnia is not running, and the next launch starts nothing
 - Sleep guard read back: on a Mac where another process sets SleepDisabled back to 0 about 2 s after `pmset -a disablesleep 1` (for example a root LaunchDaemon that loops `pmset -a disablesleep 0`), Start fails after about 5 s with "SleepDisabled read 0 again" and no session runs; on a Mac where the bit holds, the session starts about 5 s after Start and `pmset -g` reads SleepDisabled 1
@@ -343,6 +348,7 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 
 ### Display and keyboard backlight
 
+- Keyboard already off on close, both manually and through ambient auto-adjustment: no new keyboard save or write, no positive cached level restored over manual off, and macOS still adjusts automatically afterward. A positive restore owed from a previous close must survive. A legacy saved keyboard zero clears without a keyboard write, including after a refused restore or a failed journal clear. Repeat close before the two-second reassertion: no delayed write relights the keyboard. An already-off keyboard is left to macOS and may relight while closed; positive ambient-dimmed levels remain a limitation.
 - Lid-close display/keyboard darkening and restore
 - Darkening still runs under the private-call guards on macOS 26 (close the lid during a session: the log shows "display darkened" and "keyboard backlight off" and no "refused" line; Settings shows no note under the darken toggle)
 - Darkening refused on an unmeasured macOS version (a macOS major other than 26 or 27, or a `KeyboardBrightnessClient` whose methods changed: the log shows the "refused" line once and "skipped" at lid close, nothing is journaled for that device, and Settings names the reason under the darken toggle; with both refused the log shows "display sleep not requested" and the panel is lit when the lid opens; a level saved by the earlier build stays in state.json with `displayRestoreRefused` or `keyboardRestoreRefused` after the first open or launch, the menu says it could not be restored on this macOS build and names each saved level, Settings shows the saved level under the darken toggle, no "Restore incomplete" follows, and the backstop log does not fail for it)
@@ -368,6 +374,7 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 ### Hotspot
 
 - Hotspot permission, association, cancellation, and reconnect
+- An iPhone hotspot named `Name’s iPhone` (U+2019), with the SSID typed in Settings with a straight apostrophe: the outage join finds it on the first attempt and insomnia.log has "found as" with the typographic name
 - Hotspot password after a reinstall: menu and Settings report it unreadable, no prompt during an outage, re-save replaces the item (prompt on Save allowed)
 - Settings location note matches what System Settings shows after the grant
 
@@ -385,7 +392,7 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 
 - Install/upgrade/uninstall with recoverable failure conditions
 - Settings > General shows the version from the installed bundle's Info.plist, and the launch line in insomnia.log carries the same; "Check for updates" names the newest stable and nightly tags as the releases page shows them and says whether the installed version is behind, and with Wi-Fi off it shows "Could not check" with the reason, the log has the failure line, and nothing else changes
-- Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why
+- Recovery agent refuses to run after the installed bundle or its sealed backstop.sh is modified, and logs why. For the native command, confirm the strict in-process verification refuses the edited resource before `/bin/bash` starts; restore the matching signed bundle before continuing.
 - Running app refuses to arm (session start refused, reason shown) after its installed bundle is edited or re-signed under it
 - Upgrade whose new agent fails to load puts the previous bundle back and reloads the previous agent, on a working Mac
 - Upgrade whose new agent plist cannot be saved, and a rerun after an install killed mid-swap, leave the app and the agent's plist matching, on a working Mac

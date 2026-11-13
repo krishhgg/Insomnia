@@ -16,6 +16,26 @@ import Security
 /// which install.sh reads; the two must agree for the app to recognise the
 /// plist install.sh wrote (PackagingTests checks this on a scratch bundle).
 enum CodeRequirement {
+    /// Only a requirement made entirely of cdhash clauses can be enforced
+    /// before executing ad-hoc code. Keep the external shell verifier for
+    /// any other requirement instead of dropping a clause we do not know.
+    static func launchHashes(in requirement: String) -> [Data]? {
+        var hashes: [Data] = []
+        for clause in requirement.components(separatedBy: " or ") {
+            guard clause.hasPrefix("cdhash H\""), clause.hasSuffix("\"") else { return nil }
+            let hex = Array(clause.dropFirst(9).dropLast().utf8)
+            guard hex.count == 40, hex.allSatisfy({ "0123456789abcdefABCDEF".utf8.contains($0) }) else { return nil }
+            var hash = Data()
+            for offset in stride(from: 0, to: hex.count, by: 2) {
+                let pair = String(decoding: hex[offset..<(offset + 2)], as: UTF8.self)
+                guard let byte = UInt8(pair, radix: 16) else { return nil }
+                hash.append(byte)
+            }
+            hashes.append(hash)
+        }
+        return hashes
+    }
+
     struct ReadError: LocalizedError {
         let path: String
         let step: String
