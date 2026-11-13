@@ -33,6 +33,7 @@ The session, recovery, Login Items, lid and network rows ran on the MacBook only
 | A `SleepDisabled` set by something else is left alone and reported | Passed |
 | The agent finishes a journal clear the app could not | Passed |
 | Loose permissions on an existing install are tightened at launch | Passed |
+| Frozen process recovery, and restoring an existing Low Power Mode or App Nap setting | Passed in part. The installed agent resumed a frozen test process and cleared its entry. An existing Low Power Mode, on and then off, was kept through normal sessions. A Terminal App Nap setting that was absent, off or on came back at a normal end, and off came back through the agent after a force-quit. Not run: recovery with a missing bundle, restoring saved audio, and restoring at uninstall |
 | Login Items & Extensions lists the recovery agent as Insomnia with its app icon | Failed on the release candidate before a logout: the row reads Insomnia, "Item from unidentified developer", with a generic icon instead of the app icon. Not yet rechecked after a login |
 | A timed end with the lid closed puts the Mac to sleep (#138) | Passed, real lid on the MacBook |
 | A lid closed on an external display counts as open, and unplugging that display counts as a close (#135) | Passed, real lid on the MacBook |
@@ -42,7 +43,7 @@ The session, recovery, Login Items, lid and network rows ran on the MacBook only
 | A tmux pane back at its shell prompt gets no nudge (#68) | Passed, with a real Wi-Fi drop |
 | Mute on lid close skips an output with no mute control (#157) | Passed with a simulated lid close. An output with mute but no volume control is covered by unit tests only |
 
-Not run for this release: an install with SIP disabled; reboot or login with an active or dirty journal; frozen process recovery; restoring an existing Low Power Mode, App Nap or audio setting; macOS 27 power modes; battery and thermal events, including the heat hold; the privileged command edge cases; uninstall; VoiceOver; a second display; and Spaces. The Gatekeeper prompt on first launch was not seen, because a download with `gh` carries no quarantine flag.
+Not run for this release: an install with SIP disabled; reboot or login with an active or dirty journal; macOS 27 power modes; battery and thermal events, including the heat hold; the privileged command edge cases; uninstall; VoiceOver; a second display; and Spaces. The Gatekeeper prompt on first launch was not seen, because a download with `gh` carries no quarantine flag.
 
 ## v0.1.0
 
