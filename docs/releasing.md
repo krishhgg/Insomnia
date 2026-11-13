@@ -402,6 +402,7 @@ Settings > General opens with the Menu bar picker: Pills (the default), Compact,
 - Install from a release zip with `install.sh --allow-unverified-origin --app` on a working Mac, first launch of the downloaded app
 - Installed bundle from a release zip has no group or other write bit and no ACL (`ls -leR ~/Applications/Insomnia.app`), keeps its quarantine flag (`xattr -p com.apple.quarantine`) and passes `codesign --verify --strict --deep`, on a working Mac
 - `uninstall.sh` run from a release zip unpacked in `/tmp` runs the installed app's sealed `backstop.sh` after `codesign --verify`, on a working Mac
+- Uninstall with no session after `sudo pmset -a disablesleep 1`: it removes everything, then prints the `sudo pmset -a disablesleep 0` command and ends with "Done, except for sleep", on a working Mac
 - `install.sh` and `uninstall.sh` from a release zip unpacked in `/tmp`, with a `build-app.sh` and a `backstop.sh` added to the unpacked folder, run neither (install without `--app` stops, uninstall runs the sealed copy), on a working Mac
 - `install.sh --app` from a release zip stops with the Apple Silicon message on an Intel Mac, and installs on an Apple Silicon Mac from a Terminal running under Rosetta
 - Install or uninstall whose own process is killed (`kill -9 <pid>`) during a `launchctl bootout` keeps the recovery lock until that bootout has ended or been stopped, about 33 s at most, and the app started afterwards keeps its agent loaded, on a working Mac

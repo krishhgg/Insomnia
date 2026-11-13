@@ -1384,6 +1384,44 @@ final class RecoveryScriptTests: XCTestCase {
         XCTAssertTrue(r.stderr.contains(fx.sudoers.path), r.stderr)
     }
 
+    /// The backstop's restore exited 0 but pmset still reads the bit: the
+    /// sudoers rule and the agent stay, so the restore can still be made.
+    func testUninstallStopsWhenSleepIsStillDisabledAfterItsRestore() throws {
+        try fx.installMachinery()
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false}"#)
+        fx.setMode("pmset", "1")
+
+        let r = try fx.run(fx.uninstall)
+
+        XCTAssertNotEqual(r.status, 0)
+        XCTAssertTrue(fx.exists(fx.plist))
+        XCTAssertTrue(fx.exists(fx.sudoers))
+        XCTAssertTrue(fx.exists(fx.app))
+        XCTAssertFalse(fx.calls().contains { $0.hasPrefix("launchctl") }, "\(fx.calls())")
+        XCTAssertTrue(r.stderr.contains("BEFORE removing anything"), r.stderr)
+        XCTAssertTrue(r.stderr.contains("sudo pmset -a disablesleep 0"), r.stderr)
+    }
+
+    /// A bit Insomnia never claimed is left alone, but the uninstall says so
+    /// instead of an unqualified "Done".
+    func testUninstallWarnsAboutSleepDisabledByAnotherSource() throws {
+        for mode in ["1", "fail"] {
+            let f = try ScriptFixture()
+            defer { f.destroy() }
+            try f.installMachinery()
+            f.setMode("pmset", mode)
+
+            let r = try f.run(f.uninstall)
+
+            XCTAssertEqual(r.status, 0, mode + r.stderr + r.stdout)
+            XCTAssertFalse(f.exists(f.sudoers), mode)
+            XCTAssertFalse(f.exists(f.app), mode)
+            XCTAssertTrue(r.stderr.contains("sudo pmset -a disablesleep 0"), mode + r.stderr)
+            XCTAssertTrue(r.stdout.contains("Done, except for sleep"), mode + r.stdout)
+            XCTAssertFalse(f.calls().contains { $0.contains("pmset DIRECT") || $0.contains("disablesleep") }, "\(mode) \(f.calls())")
+        }
+    }
+
     func testUninstallAbortsOnSavedAudioAndExplainsReopeningTheApp() throws {
         try fx.installMachinery()
         try fx.writeState(#"{"sleepDisabledByUs":false,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"savedOutputVolume":0.25,"savedMuted":true}"#)
@@ -6874,6 +6912,7 @@ private final class ScriptFixture {
             "SUDO": bin.appendingPathComponent("sudo").path,
             "CODESIGN": bin.appendingPathComponent("codesign").path,
             "DEFAULTS": bin.appendingPathComponent("defaults").path,
+            "PMSET": fakePmset,
             "KILL": bin.appendingPathComponent("kill").path,
             "APP": app.path,
             "SUDOERS": sudoers.path,
@@ -7130,7 +7169,16 @@ private final class ScriptFixture {
           *) exit 1 ;;
         esac
         """)
+        // pmset: `-g` reads SleepDisabled from mode "pmset" (0 by default;
+        // "fail" exits 1). Anything else is a direct call, which no script
+        // should make.
         try writeFake("pmset", """
+        if [[ "$*" == -g ]]; then
+          mode="$(cat "\(r)/pmset.mode" 2>/dev/null || echo 0)"
+          [[ "$mode" == fail ]] && exit 1
+          printf 'System-wide power settings:\\n SleepDisabled\\t\\t%s\\n' "$mode"
+          exit 0
+        fi
         printf 'pmset DIRECT %s\\n' "$*" >> "\(calls)"
         exit 99
         """)

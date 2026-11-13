@@ -74,6 +74,7 @@ PLUTIL=/usr/bin/plutil
 CODESIGN=/usr/bin/codesign
 LOCKF=/usr/bin/lockf
 DEFAULTS=/usr/bin/defaults
+PMSET=/usr/bin/pmset
 KILL=/bin/kill
 DATE=/bin/date
 MKDIR=/bin/mkdir
@@ -951,6 +952,12 @@ if [[ -n "$CHECKOUT_BACKSTOP" && "$BACKSTOP" != "$CHECKOUT_BACKSTOP" ]]; then
   echo "$APP does not declare InsomniaResumeFrozenVersion $RESUME_FROZEN_VERSION; using the backstop installed with it, $BACKSTOP"
 fi
 echo "using $BACKSTOP"
+# Whether the journal held the sleep bit before the backstop cleared it, for
+# the live read below.
+claimed_sleep=0
+if [[ -f "$STATE" && "$(extract "$STATE" sleepDisabledByUs || true)" == "true" ]]; then
+  claimed_sleep=1
+fi
 recovery_rc=0
 /bin/bash "$BACKSTOP" --force || recovery_rc=$?
 
@@ -982,6 +989,37 @@ if app_running; then
   echo "Insomnia started again; quit it and rerun. Nothing was removed." >&2
   exit 1
 fi
+
+# The journal says what Insomnia believes; pmset says what the Mac does. A
+# restore that exited 0 without taking effect, or a bit set by something
+# else, would otherwise outlive the sudoers rule and the app's warning.
+step "Checking that sleep is enabled"
+sleep_note=""
+pmset_rc=0
+bounded "$PMSET" -g || pmset_rc=$?
+sleep_disabled=""
+if (( pmset_rc == 0 )); then
+  sleep_disabled="$(awk '$1 == "SleepDisabled" { print $2; exit }' <<< "$BOUNDED_OUTPUT")"
+fi
+case "$sleep_disabled" in
+  0) echo "SleepDisabled 0" ;;
+  1)
+    if (( claimed_sleep == 1 )); then
+      cat >&2 <<MSG
+
+Uninstall stopped BEFORE removing anything: Insomnia restored sleep, yet pmset
+still reads SleepDisabled 1, so closing the lid would not sleep this Mac.
+Something may be setting it again. Run 'sudo pmset -a disablesleep 0', check
+that 'pmset -g' reads SleepDisabled 0, then rerun this script.
+MSG
+      exit 1
+    fi
+    sleep_note="Sleep is still disabled (pmset reads SleepDisabled 1). Insomnia has no record of setting it, so it was left as is. To let this Mac sleep again: sudo pmset -a disablesleep 0"
+    echo "$sleep_note" ;;
+  *)
+    sleep_note="Could not read SleepDisabled from 'pmset -g' (exit $pmset_rc). Check that it reads 0; if not, run: sudo pmset -a disablesleep 0"
+    echo "$sleep_note" ;;
+esac
 
 step "Checking App Nap settings of agent apps"
 list_unrecorded_app_nap
@@ -1101,8 +1139,13 @@ else
 fi
 (( ${#kept_brightness[@]} == 0 )) || echo "Kept $STATE: it holds the brightness listed above."
 
+[[ -z "$sleep_note" ]] || printf '\n%s\n' "$sleep_note" >&2
 if (( remove_failures > 0 )); then
   echo "Done, except $remove_failures file(s) that could not be removed (named above)." >&2
   exit 1
 fi
-echo "Done."
+if [[ -n "$sleep_note" ]]; then
+  echo "Done, except for sleep (see above)."
+else
+  echo "Done."
+fi
