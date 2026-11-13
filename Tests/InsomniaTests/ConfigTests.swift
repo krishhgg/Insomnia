@@ -386,6 +386,20 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(freeze.settingsLine, "This update changed a lid-close setting: \"All other apps\" now keep running when the lid closes. All other apps is behind the Edit Apps\u{2026} button.")
     }
 
+    /// Lock-screen-on-close is off for a config.json without the key and
+    /// survives a save and load when on.
+    func testLockScreenOnLidCloseDefaultsOffAndRoundTrips() throws {
+        let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"muteOnLidClose": true}"#.utf8))
+        XCTAssertFalse(legacy.lockScreenOnLidClose)
+        XCTAssertFalse(Config().lockScreenOnLidClose)
+        var on = Config()
+        on.lockScreenOnLidClose = true
+        let data = try Store.makeEncoder().encode(on)
+        let back = try Store.makeDecoder().decode(Config.self, from: data)
+        XCTAssertTrue(back.lockScreenOnLidClose)
+        XCTAssertEqual(back, on)
+    }
+
     func testCompactModeDefaultsOffForOlderConfigs() throws {
         let legacy = try Store.makeDecoder().decode(Config.self, from: Data(#"{"presets": [600], "defaultPreset": 600}"#.utf8))
         XCTAssertFalse(legacy.compactMode)

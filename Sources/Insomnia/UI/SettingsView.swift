@@ -107,7 +107,7 @@ struct SettingsView: View {
     }
 
     /// Under the keep-awake toggle.
-    static let keepScreenAwakeNote = "Off by default. When on, the display never turns off on its own during a session, so the screen saver never starts and the screen never locks, and agents that drive the screen keep working. With the lid closed the display goes to brightness 0 instead of sleeping. When the session ends, idle display sleep and the lock come back. Anyone who opens the Mac during the session finds it unlocked."
+    static let keepScreenAwakeNote = "Off by default. When on, the display never turns off on its own during a session, so the screen saver never starts and the screen never locks while idle, and agents that drive the screen keep working. With the lid closed the display goes to brightness 0 instead of sleeping. \"Lock the screen\" under When the lid closes still locks it at a lid close. When the session ends, idle display sleep and the lock come back. Anyone who opens the Mac during the session finds it unlocked, unless a lid close locked it."
 
     /// Under the mute toggle and in the README. Apple Platform Security,
     /// "Hardware microphone disconnect".
@@ -127,6 +127,10 @@ struct SettingsView: View {
                     Spacer()
                     Button("Dismiss") { manager.dismissLidCloseNotice() }
                 }
+            }
+            Toggle(isOn: manager.binding(\.lockScreenOnLidClose)) {
+                Text("Lock the screen")
+                Text("On: closing the lid during a session locks the screen, and opening it asks for your login password. Command-line agents and browser automation keep running; agents that work through the screen, such as computer use, wait until you sign in. Off: the Mac stays signed in with the lid closed. A lid closed on an external display does not lock until the display is unplugged.")
             }
             Toggle(
                 "Turn off the display and keyboard backlight",
