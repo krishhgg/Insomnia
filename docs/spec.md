@@ -59,6 +59,21 @@ closed bag. Its design goals are to:
 
 ## Core model
 
+The recovery agent starts the app's headless `--backstop` command only when
+the bundle advertises that command in `InsomniaBackstopCommand` and its
+pinned requirement consists entirely of cdhash clauses, and a bounded
+`csrutil status` call reports SIP enabled. `SpawnConstraint`
+lets launchd enforce those hashes before any app code executes; the command
+then runs the existing full-bundle verifier before the sealed script. Both
+the installer and `arm()` use the external shell verifier for older bundles
+or other requirement formats, or disabled, custom or unreadable SIP status,
+including a `swift run` build targeting an
+older installed app. The executable name comes from `CFBundleExecutable`.
+The native bundle path gives Background Task Management the app identity;
+`AssociatedBundleIdentifiers` also names the app, but is not proof of
+attribution for ad-hoc signatures with no Team ID. Appearance still needs
+the real-Mac check, and no Developer ID identity is implied.
+
 ```
 Session {
   startedAt:   Date
@@ -432,7 +447,12 @@ owed. A write whose clear is owed is done all the same: the second write
 Mode still owes its write after the mode, as the clear would have
 journaled. A lid close that can read the device clears the flag too: it
 keeps the earlier saved value while the device reads 0, and saves the new
-level when it reads above 0. For the display that level must be trusted:
+level when it reads above 0. For the keyboard the reading itself must be
+trusted: a suppressed or dimmed reading, 0 or above, leaves the entry
+flagged and the backlight as it is, and the last sample is no help, since
+none is taken while an entry is journaled. A kept keyboard 0 from an older
+version is obsolete: a close that reads 0 leaves it flagged, and the open
+discards it without a write. For the display that level must be trusted:
 the last sample, the value owed after the mode, or a current read taken
 with the panel awake and Insomnia's Low Power Mode not on at any point in
 the run, nor over the entry since the Mac last started. Without one, the close leaves the entry flagged and the panel as
@@ -563,7 +583,9 @@ does) is ignored while any process holds a display assertion, and agents
 routinely do, so brightness 0 is the primary mechanism and the sleep request
 is best effort. It is made only when a display or keyboard brightness is
 journaled, because the wake that undoes it on open, or on reconcile after
-a relaunch, runs only for such an entry. With "Keep the screen on and
+a relaunch, runs only for such an entry. A keyboard that can be read but
+journals no level is journaled as 0 for it when nothing else is, as
+described below. With "Keep the screen on and
 unlocked" on it is not made at all: a display that sleeps locks the screen,
 and Insomnia's own assertion would refuse it anyway. Display brightness 0 does not
 switch the keyboard backlight off; it is set separately. Both values are journaled before they are changed
@@ -603,15 +625,39 @@ level not yet decided. Each level the app writes from the journal, or
 finds set since in place of a kept value, becomes that device's sample,
 so a close soon after a restore that came late, from the re-read of a
 kept value or after the mode, journals the restored level and not a 0
-sampled before it. The keyboard journals the current
-read if trusted now, else its last sample; when nothing trustworthy is
-known for it, it is left to macOS entirely (no journal entry, no write),
-because restoring a suppressed 0 would leave the backlight off. On open the
+sampled before it. A keyboard already reading 0 is left to macOS entirely
+(no new journal entry or write), unless a positive restore is already owed
+from an earlier close. One exception keeps the display sleep request: when
+a close reads the keyboard but journals no level for it, nothing else is
+journaled, as when the display is refused or unreadable, and "Keep the
+screen on and unlocked" is off, the close journals a 0 with no keyboard
+write, so the open still wakes the display it asked to sleep. The open
+discards that 0 as below. Ambient auto-off can read 0 with neither suppression
+nor dimming flagged, while manual off can set the suppression flag; neither
+is a reason to restore an older positive sample over it. For a positive
+current reading, the keyboard journals that reading if trusted now, else a
+positive last sample; without either, it is left alone, apart from the 0
+journaled for the sleep request above. A positive value
+kept after a refused restore is decided only by a trusted reading, as for
+the display: a 0 keeps it and a level above 0 replaces it. A suppressed or
+dimmed reading leaves it journaled and undecided, and the last sample is no
+help, since none is taken while an entry is journaled. A kept 0 is the
+older version's zero below: only a trusted level above 0 replaces it, and
+otherwise the open discards it.
+A saved zero, from an
+older version or journaled for the sleep request, is cleared without a
+keyboard write or reassertion, including
+when the private-call guard refuses; a failed clear stays owed for retry.
+This avoids committing automatic zero as a permanent off setting. It leaves
+macOS free to relight a keyboard that was already off, even while the lid is
+closed, and positive ambient-dimmed readings remain possible restore values.
+On open the
 restore is written, the entries cleared, and the same values written once
 more 2 s later, because powerd re-applies its own remembered brightness
 asynchronously after the wake and can override the first write; that second
-write is skipped if the lid closed again in the meantime (the close journals
-fresh values first) and superseded by any newer restore. A display restore
+write is canceled if another current lid close starts in the meantime, even
+when an already-zero keyboard creates no new journal entry, and superseded
+by any newer restore. A display restore
 written while Insomnia's own Low Power Mode was on is journaled as
 `displayRestoredUnderLowPower` and written once more, then re-asserted the
 same way, right after Insomnia switches the mode off (lid open, charger,
@@ -826,7 +872,15 @@ ends owe nothing.
 
 - `NWPathMonitor` on the Wi-Fi interface. Event-driven.
 - Path unsatisfied for more than 5 s: use CoreWLAN to run an SSID-filtered
-  scan, then join with `associate(to:password:)`. The password is read from
+  scan, then join with `associate(to:password:)`. A scan that finds nothing
+  is tried again with the SSID's apostrophes swapped, straight (U+0027) for
+  typographic (U+2019) and back (`HotspotSSID.scanCandidates`): iOS names a
+  Personal Hotspot `Name’s iPhone` with U+2019, a Mac keyboard types U+0027,
+  and a directed scan matches the exact bytes. Measured on macOS 27.2: a
+  fresh directed scan takes about 2 s, and one made within about 10 s of it
+  answers from the scan cache in about 20 ms, so the other spelling costs a
+  join almost nothing. It is looked for among the networks the first scan
+  heard, which holds for an iPhone hotspot, since it broadcasts its name. The password is read from
   the login Keychain (generic-password service `insomnia-hotspot`, account =
   SSID) and is never placed in process arguments. Retry with backoff (5 s,
   10 s, 20 s, 30 s, then every 30 s) until the path is satisfied or the
@@ -937,7 +991,10 @@ ends owe nothing.
     the user (`tmux set-option -p -t <target> @insomnia-nudge on`) gets
     `tmux send-keys -t %N continue`, followed by `Enter` only when
     `tmuxNudgePressesEnter` is on (default off). An unmarked pane is
-    skipped and logged.
+    skipped and logged. So is a pane whose foreground program
+    (`pane_current_command`) is a shell, named in /etc/shells or a common
+    one: the mark outlives the program it was set for, and at the prompt
+    the keys would go to the shell.
   - Post a notification: "Network was down 2m 10s. Nudged 2 tmux panes.
     Check GUI agents."
 - Recommended one-time setting, documented in docs/extras.md: System Settings >
@@ -1027,8 +1084,10 @@ Backstop, independent of the app:
   journal, any `session.json` and `--force` take the full run.
 - The agent runs only the `backstop.sh` sealed in the signed bundle. Its
   command line verifies the bundle against the code requirement pinned in the
-  plist (`codesign --verify --strict -R=...`; for an ad-hoc build, that
-  build's cdhash) and execs the script when that passes; otherwise it logs
+  plist (strict Security framework validation in the native command, or
+  `codesign --verify --strict -R=...` in the external fallback; for an ad-hoc
+  build, that build's cdhash) and directly execs `/bin/bash` with the sealed
+  script path when that passes; otherwise it logs
   one line and exits without running anything. No executable lives in a
   writable directory. The plist is a per-user file like any LaunchAgent; at
   the next arm the app rewrites a plist that does not match, and reloads a

@@ -10,8 +10,12 @@ final class LaunchdBackstopTests: XCTestCase {
     /// fake reader below hands it out for the fixture bundle.
     static let requirement = "cdhash H\"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c\""
     var home: TempHome!
-    /// (exe, args) of every command the backstop ran.
+    /// (exe, args) of every launchctl command the backstop ran.
     let calls = Locked<[[String]]>([])
+    let integrityStatus = Locked(ShellResult(status: 0, stdout: "System Integrity Protection status: enabled.\n", stderr: ""))
+    let integrityReadFails = Locked(false)
+    let integrityReadCancelled = Locked(false)
+    let integrityReads = Locked(0)
     /// Whether `launchctl print` reports the job loaded.
     let loaded = Locked(false)
     /// The ProgramArguments of the plist the loaded job was bootstrapped
@@ -19,6 +23,8 @@ final class LaunchdBackstopTests: XCTestCase {
     let loadedJob = Locked<[String]>([])
     /// Its StartInterval, which `launchctl print` lists as `run interval`.
     let loadedInterval = Locked<Int?>(nil)
+    let loadedConstraint = Locked(false)
+    let printedJob = Locked<String?>(nil)
     let bootstrapFails = Locked(false)
     /// bootout returns an error and leaves the job loaded, as launchd does
     /// for a job that is mid-transition.
@@ -34,9 +40,15 @@ final class LaunchdBackstopTests: XCTestCase {
     override func setUp() {
         home = TempHome()
         calls.value = []
+        integrityStatus.value = ShellResult(status: 0, stdout: "System Integrity Protection status: enabled.\n", stderr: "")
+        integrityReadFails.value = false
+        integrityReadCancelled.value = false
+        integrityReads.value = 0
         loaded.value = false
         loadedJob.value = []
         loadedInterval.value = nil
+        loadedConstraint.value = false
+        printedJob.value = nil
         bootstrapFails.value = false
         bootoutFails.value = false
         onBootout.value = nil
@@ -56,9 +68,14 @@ final class LaunchdBackstopTests: XCTestCase {
             let script = home.paths.backstopScript
             try FileManager.default.createDirectory(at: script.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("#!/bin/bash\n".utf8).write(to: script)
+            let info: [String: Any] = ["InsomniaBackstopCommand": BackstopCommand.argument, "CFBundleExecutable": "Insomnia"]
+            try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+                .write(to: home.paths.appBundle.appendingPathComponent("Contents/Info.plist"))
         }
-        let calls = calls, loaded = loaded, loadedJob = loadedJob, loadedInterval = loadedInterval, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
+        let calls = calls, loaded = loaded, loadedJob = loadedJob, loadedInterval = loadedInterval, loadedConstraint = loadedConstraint, bootstrapFails = bootstrapFails, bootoutFails = bootoutFails
+        let integrityStatus = integrityStatus, integrityReadFails = integrityReadFails, integrityReadCancelled = integrityReadCancelled, integrityReads = integrityReads
         let onBootout = onBootout, onBootstrapped = onBootstrapped, trustedPlistAtBootstrap = trustedPlistAtBootstrap
+        let printedJob = printedJob
         let trusted = home.paths.backstopPlist
         let label = "com.insomnia.backstop"
         // What launchd itself enforces on a path argument (proven against a
@@ -85,11 +102,18 @@ final class LaunchdBackstopTests: XCTestCase {
             return requirement
         }
         return LaunchdBackstop(paths: home.paths, bundle: bundle, pin: pin, uid: 501) { exe, args in
+            if exe == LaunchdBackstop.csrutil {
+                integrityReads.value += 1
+                XCTAssertEqual(args, ["status"])
+                if integrityReadCancelled.value { throw CancellationError() }
+                if integrityReadFails.value { throw BackstopError(message: "status unavailable") }
+                return integrityStatus.value
+            }
             calls.value.append([exe] + args)
             switch args.first {
             case "print":
                 guard loaded.value else { return ShellResult(status: 113, stdout: "", stderr: "Could not find service") }
-                return ShellResult(status: 0, stdout: Self.printOutput(arguments: loadedJob.value, runInterval: loadedInterval.value), stderr: "")
+                return ShellResult(status: 0, stdout: printedJob.value ?? Self.printOutput(arguments: loadedJob.value, runInterval: loadedInterval.value, hasSpawnConstraint: loadedConstraint.value), stderr: "")
             case "bootstrap":
                 trustedPlistAtBootstrap.value.append(try? Data(contentsOf: trusted))
                 guard args.count == 3, launchdAccepts(args[2]) else {
@@ -103,6 +127,7 @@ final class LaunchdBackstopTests: XCTestCase {
                     .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
                 loadedJob.value = plist?["ProgramArguments"] as? [String] ?? []
                 loadedInterval.value = plist?["StartInterval"] as? Int
+                loadedConstraint.value = plist?["SpawnConstraint"] != nil
                 if let hook = onBootstrapped.value { onBootstrapped.value = nil; hook() }
                 return ShellResult(status: 0, stdout: "", stderr: "")
             case "bootout":
@@ -124,11 +149,77 @@ final class LaunchdBackstopTests: XCTestCase {
         }
     }
 
+    /// Captured from a disposable native job using the generated constraint.
+    /// Paths, identifiers, hashes and numeric IDs are replaced; layout and
+    /// properties are launchctl's actual output, not inferred from the plist.
+    static let capturedNative = """
+    gui/502/com.insomnia.spawn-probe.fixture = {
+    \tactive count = 0
+    \tpath = /private/tmp/insomnia-spawn-probe-fixture/com.insomnia.spawn-probe.fixture.plist
+    \ttype = LaunchAgent
+    \tstate = not running
+
+    \tprogram = /private/tmp/insomnia-spawn-probe-fixture/Insomnia Probe.app/Contents/MacOS/Insomnia
+    \targuments = {
+    \t\t/private/tmp/insomnia-spawn-probe-fixture/Insomnia Probe.app/Contents/MacOS/Insomnia
+    \t\t--backstop
+    \t\tcdhash H"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    \t}
+
+    \tinherited environment = {
+    \t\tSSH_AUTH_SOCK => /private/tmp/com.apple.launchd.fixture/Listeners
+    \t}
+
+    \tdefault environment = {
+    \t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+    \t}
+
+    \tenvironment = {
+    \t\tOSLogRateLimit => 64
+    \t\tXPC_SERVICE_NAME => com.insomnia.spawn-probe.fixture
+    \t}
+
+    \tdomain = gui/502 [100000]
+    \tasid = 100000
+    \tminimum runtime = 10
+    \texit timeout = 5
+    \truns = 1
+    \tlast exit code = 0
+
+    \tresource coalition = {
+    \t\tID = 100
+    \t\ttype = resource
+    \t\tstate = active
+    \t\tactive count = 1
+    \t\tname = com.insomnia.spawn-probe.fixture
+    \t}
+
+    \tjetsam coalition = {
+    \t\tID = 101
+    \t\ttype = jetsam
+    \t\tstate = active
+    \t\tactive count = 1
+    \t\tname = com.insomnia.spawn-probe.fixture
+    \t}
+
+    \tspawn type = daemon (3)
+    \tjetsam priority = 40
+    \tjetsam memory limit (active) = (unlimited)
+    \tjetsam memory limit (inactive) = (unlimited)
+    \tjetsamproperties category = daemon
+    \tjetsam thread limit = 32
+    \tcpumon = default
+    \trun interval = 60 seconds
+
+    \tproperties = runatload | inferred program | has spawn constraint
+    }
+    """
+
     /// `launchctl print gui/501/<label>` for a loaded job, in the layout
     /// launchctl prints (checked 2026-10-02): top-level keys indented by one
     /// tab, each argument on its own line indented by two, and `run
     /// interval` only for a job with a StartInterval.
-    static func printOutput(arguments: [String], runInterval: Int?) -> String {
+    static func printOutput(arguments: [String], runInterval: Int?, hasSpawnConstraint: Bool = false) -> String {
         """
         gui/501/com.insomnia.backstop = {
         \tactive count = 0
@@ -147,7 +238,7 @@ final class LaunchdBackstopTests: XCTestCase {
         \tdomain = gui/501 [100022]
         \tcpumon = default
         \(runInterval.map { "\trun interval = \($0) seconds\n" } ?? "")
-        \tproperties = runatload | inferred program | managed LWCR | has LWCR
+        \tproperties = runatload | inferred program | managed LWCR | has LWCR\(hasSpawnConstraint ? " | has spawn constraint" : "")
         }
 
         """
@@ -198,18 +289,48 @@ final class LaunchdBackstopTests: XCTestCase {
     }
 
     private var expectedArguments: [String] {
-        ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", Self.requirement, home.paths.appBundle.path]
+        [home.paths.appBundle.appendingPathComponent("Contents/MacOS/Insomnia").path, "--backstop", Self.requirement]
     }
 
     func testPlistIsAPersistentPollingAgentThatVerifiesTheBundleFirst() {
-        let target = BackstopTarget(bundle: URL(fileURLWithPath: "/x/Insomnia.app", isDirectory: true), requirement: "cdhash H\"ab\"")
+        let target = BackstopTarget(bundle: URL(fileURLWithPath: "/x/Insomnia.app", isDirectory: true), requirement: Self.requirement, nativeExecutable: URL(fileURLWithPath: "/x/Insomnia.app/Contents/MacOS/Insomnia"))
         let d = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: target)
         XCTAssertEqual(d["Label"] as? String, "com.insomnia.backstop")
-        XCTAssertEqual(d["ProgramArguments"] as? [String], ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", "cdhash H\"ab\"", "/x/Insomnia.app"])
+        XCTAssertEqual(d["ProgramArguments"] as? [String], ["/x/Insomnia.app/Contents/MacOS/Insomnia", "--backstop", Self.requirement])
+        XCTAssertEqual(d["AssociatedBundleIdentifiers"] as? [String], [Paths.bundleIdentifier])
+        let constraint = d["SpawnConstraint"] as? [String: [String: [Data]]]
+        XCTAssertEqual(constraint?["cdhash"]?["$in"], CodeRequirement.launchHashes(in: Self.requirement))
         XCTAssertEqual(d["RunAtLoad"] as? Bool, true)
         XCTAssertEqual(d["StartInterval"] as? Int, 60)
         XCTAssertNil(d["StartCalendarInterval"], "a per-deadline trigger would need a reload per extension")
         XCTAssertEqual(target.script.path, "/x/Insomnia.app/Contents/Resources/backstop.sh")
+    }
+
+    func testSpawnHashesRequireEveryClauseToBeAnExactCdHash() {
+        let other = "cdhash H\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+        XCTAssertEqual(CodeRequirement.launchHashes(in: Self.requirement + " or " + other)?.count, 2)
+        XCTAssertEqual(CodeRequirement.launchHashes(in: other), [Data(repeating: 0xaa, count: 20)])
+        for invalid in ["", "cdhash H\"ab\"", "cdhash H\"+1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+                        Self.requirement + " or always", Self.requirement + " and anchor apple",
+                        "identifier com.kgarg.insomnia and anchor apple generic"] {
+            XCTAssertNil(CodeRequirement.launchHashes(in: invalid), invalid)
+        }
+    }
+
+    func testUnknownRequirementsKeepTheExternalVerifier() {
+        let target = BackstopTarget(bundle: home.paths.appBundle, requirement: "identifier com.kgarg.insomnia",
+                                    nativeExecutable: home.paths.appBundle.appendingPathComponent("Contents/MacOS/Insomnia"))
+        let plist = LaunchdBackstop.plistDictionary(label: "com.insomnia.backstop", target: target)
+        XCTAssertEqual((plist["ProgramArguments"] as? [String])?.first, "/bin/sh")
+        XCTAssertNil(plist["SpawnConstraint"])
+    }
+
+    func testNativeExecutableComesFromTheBundleMetadata() throws {
+        _ = try makeBackstop()
+        let info: [String: Any] = ["InsomniaBackstopCommand": BackstopCommand.argument, "CFBundleExecutable": "Custom helper"]
+        try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            .write(to: home.paths.appBundle.appendingPathComponent("Contents/Info.plist"))
+        XCTAssertEqual(LaunchdBackstop.nativeExecutable(in: home.paths.appBundle)?.lastPathComponent, "Custom helper")
     }
 
     /// The program itself: verify the bundle ($2) against the requirement
@@ -277,6 +398,82 @@ final class LaunchdBackstopTests: XCTestCase {
         XCTAssertEqual(calls.value.map { $0[1] }, ["bootout", "bootstrap"])
         XCTAssertEqual(try plistOnDisk()["ProgramArguments"] as? [String], expectedArguments)
         XCTAssertTrue(loaded.value)
+    }
+
+    func testVerifiedShellAgentIsMigratedToTheAppExecutable() async throws {
+        let b = try makeBackstop()
+        let arguments = ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", Self.requirement, home.paths.appBundle.path]
+        try writePlist(["Label": "com.insomnia.backstop", "ProgramArguments": arguments, "RunAtLoad": true, "StartInterval": 60])
+        loaded.value = true
+        loadedJob.value = arguments
+        loadedInterval.value = 60
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["bootout", "bootstrap"])
+        XCTAssertEqual(try plistOnDisk()["ProgramArguments"] as? [String], expectedArguments)
+        XCTAssertEqual(try plistOnDisk()["AssociatedBundleIdentifiers"] as? [String], [Paths.bundleIdentifier])
+    }
+
+    func testDevelopmentBuildKeepsTheExternalVerifierForAnOlderInstalledBundle() async throws {
+        let b = try makeBackstop()
+        try FileManager.default.removeItem(at: home.paths.appBundle.appendingPathComponent("Contents/Info.plist"))
+        try await b.arm()
+        XCTAssertEqual(try plistOnDisk()["ProgramArguments"] as? [String],
+                       ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", Self.requirement, home.paths.appBundle.path])
+        XCTAssertNil(try plistOnDisk()["SpawnConstraint"])
+    }
+
+    func testLoadedNativeJobWithoutTheConstraintIsReloaded() async throws {
+        let b = try makeBackstop()
+        try await b.arm()
+        loadedConstraint.value = false
+        calls.value = []
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["print", "bootout", "bootstrap"])
+        XCTAssertTrue(loadedConstraint.value)
+    }
+
+    func testArmUsesTheExternalVerifierUnlessSIPIsKnownEnabled() async throws {
+        let b = try makeBackstop()
+        for status in [
+            ShellResult(status: 0, stdout: "System Integrity Protection status: disabled.\n", stderr: ""),
+            ShellResult(status: 0, stdout: "System Integrity Protection status: unknown (Custom Configuration).\n", stderr: ""),
+            ShellResult(status: 0, stdout: "", stderr: ""),
+            ShellResult(status: 1, stdout: "System Integrity Protection status: enabled.\n", stderr: "failed"),
+            ShellResult(status: 0, stdout: "System Integrity Protection status: enabled.\n", stderr: "unexpected diagnostic"),
+        ] {
+            integrityStatus.value = status
+            try await b.arm()
+            XCTAssertEqual(try plistOnDisk()["ProgramArguments"] as? [String],
+                           ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", Self.requirement, home.paths.appBundle.path])
+            XCTAssertNil(try plistOnDisk()["SpawnConstraint"])
+        }
+        integrityReadFails.value = true
+        try await b.arm()
+        XCTAssertNil(try plistOnDisk()["SpawnConstraint"])
+    }
+
+    func testArmRechecksSIPAndReplacesTheNativeAgentWhenDisabled() async throws {
+        let b = try makeBackstop()
+        try await b.arm()
+        XCTAssertNotNil(try plistOnDisk()["SpawnConstraint"])
+        integrityStatus.value = ShellResult(status: 0, stdout: "System Integrity Protection status: disabled.\n", stderr: "")
+        calls.value = []
+        try await b.arm()
+        XCTAssertEqual(calls.value.map { $0[1] }, ["bootout", "bootstrap"])
+        XCTAssertNil(try plistOnDisk()["SpawnConstraint"])
+        XCTAssertEqual(loadedJob.value.first, "/bin/sh")
+        XCTAssertEqual(integrityReads.value, 2)
+    }
+
+    func testCancellationDuringSIPReadDoesNotReplaceTheAgent() async throws {
+        let b = try makeBackstop()
+        integrityReadCancelled.value = true
+        do {
+            try await b.arm()
+            XCTFail("cancelled read was ignored")
+        } catch is CancellationError {}
+        XCTAssertTrue(calls.value.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.paths.backstopPlist.path))
     }
 
     /// After an upgrade the bundle's requirement changes (a new ad-hoc
@@ -364,8 +561,12 @@ final class LaunchdBackstopTests: XCTestCase {
         let b = try makeBackstop()
         try await b.arm()
         calls.value = []
+        printedJob.value = Self.capturedNative
+            .replacingOccurrences(of: "/private/tmp/insomnia-spawn-probe-fixture/Insomnia Probe.app/Contents/MacOS/Insomnia", with: expectedArguments[0])
+            .replacingOccurrences(of: "cdhash H\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", with: Self.requirement)
         try await b.arm()
         XCTAssertEqual(calls.value, [["/bin/launchctl", "print", "gui/501/com.insomnia.backstop"]], "a loaded agent was reloaded, opening a window with no agent")
+        XCTAssertEqual(integrityReads.value, 2)
     }
 
     /// Plist current but the job not loaded (logged out and in without the
@@ -403,7 +604,7 @@ final class LaunchdBackstopTests: XCTestCase {
         let b = try makeBackstop()
         try await b.arm()
         let trusted = try Data(contentsOf: home.paths.backstopPlist)
-        loadedJob.value = ["/bin/sh", "-c", LaunchdBackstop.agentProgram, "sh", "cdhash H\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", home.paths.appBundle.path]
+        loadedJob.value = [home.paths.appBundle.appendingPathComponent("Contents/MacOS/Insomnia").path, "--backstop", "cdhash H\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""]
         calls.value = []
 
         try await b.arm()
@@ -426,8 +627,12 @@ final class LaunchdBackstopTests: XCTestCase {
     /// has no StartInterval.
     func testLoadedJobIsReadFromLaunchctlsLayout() {
         XCTAssertEqual(
-            LaunchdBackstop.loadedJob(fromPrint: Self.printOutput(arguments: expectedArguments, runInterval: 60)),
-            LaunchdBackstop.LoadedJob(arguments: expectedArguments, runInterval: 60)
+            LaunchdBackstop.loadedJob(fromPrint: Self.capturedNative),
+            LaunchdBackstop.LoadedJob(arguments: ["/private/tmp/insomnia-spawn-probe-fixture/Insomnia Probe.app/Contents/MacOS/Insomnia", "--backstop", "cdhash H\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""], runInterval: 60, hasSpawnConstraint: true)
+        )
+        XCTAssertEqual(
+            LaunchdBackstop.loadedJob(fromPrint: Self.printOutput(arguments: expectedArguments, runInterval: 60, hasSpawnConstraint: true)),
+            LaunchdBackstop.LoadedJob(arguments: expectedArguments, runInterval: 60, hasSpawnConstraint: true)
         )
         let captured = """
         gui/501/com.insomnia.backstop = {
