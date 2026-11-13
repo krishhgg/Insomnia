@@ -138,15 +138,17 @@ final class MenuBarModel {
     /// popover opens on the time buttons alone, so this is closed on every
     /// open unless a refused start left its value in the fields.
     var customShown = false
-    /// The battery draw and time left the popover shows, read when it
-    /// opens and again when the battery's percent or charging state
-    /// changes while it is up. Its redraws (typing, the header's minute)
-    /// read this, not IOKit.
+    /// The battery draw, time left and thermal state the popover shows,
+    /// read when it opens, again when the battery's percent or charging
+    /// state or the session's thermal state changes while it is up, and on
+    /// its timer. Its redraws (typing, the header's minute) read this, not
+    /// IOKit.
     var popoverPower: PopoverPower?
 
     struct PopoverPower: Equatable {
         var watts: Double?
         var timeRemaining: BatteryTimeRemaining?
+        var thermal: ProcessInfo.ThermalState
     }
 
     /// Countdown text shown while the manager is still starting the session.

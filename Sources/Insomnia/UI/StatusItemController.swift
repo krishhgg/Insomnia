@@ -356,11 +356,13 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     }
 
     /// A change in the battery's percent or charging state reads the watts
-    /// and the time left again for a popover that is up.
+    /// and the time left again for a popover that is up, and so does a
+    /// thermal change the session's observer reports.
     private func observePopoverPower() {
         withObservationTracking {
             _ = status.batteryPercent
             _ = status.isCharging
+            _ = status.thermalState
         } onChange: { [weak self] in
             Task { @MainActor in self?.observePopoverPower() }
         }
@@ -369,7 +371,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
 
     private func readPopoverPower() {
         model.popoverPower = MenuBarModel.PopoverPower(
-            watts: status.instantWatts(), timeRemaining: status.batteryTimeRemaining())
+            watts: status.instantWatts(), timeRemaining: status.batteryTimeRemaining(),
+            thermal: status.instantThermalState())
     }
 
     private func armPopoverPowerTick() {
@@ -1956,10 +1959,11 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
     /// `hotspotPassword` is what the failover row reads; nil leaves the
     /// row out. So does a warning about the hotspot password, which
     /// already says what is wrong.
-    /// `power` is the popover's last reading of the watts and the time
-    /// left (`MenuBarModel.popoverPower`); nil reads them now.
+    /// `power` is the popover's last reading of the watts, the time left
+    /// and the thermal state (`MenuBarModel.popoverPower`); nil reads them
+    /// now.
     static func statusItems(manager: SessionManager, status: any StatusSource, power: MenuBarModel.PopoverPower? = nil, startError: String? = nil, starting: Bool = false, hotspotPassword: HotspotPasswordCheck? = nil) -> [StatusMenu.Item] {
-        let power = power ?? MenuBarModel.PopoverPower(watts: status.instantWatts(), timeRemaining: status.batteryTimeRemaining())
+        let power = power ?? MenuBarModel.PopoverPower(watts: status.instantWatts(), timeRemaining: status.batteryTimeRemaining(), thermal: status.instantThermalState())
         let ssid = manager.config.hotspotSSID
         let locationAuthorized = (status as? LiveStatusSource)?.locationPermission.isAuthorized ?? true
         // A report about an SSID edited away since is not shown.
@@ -1979,12 +1983,14 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                 batteryPercent: status.batteryPercent,
                 isCharging: status.isCharging,
                 timeRemaining: power.timeRemaining,
+                thermal: power.thermal,
                 failover: failover
             ),
             actions: StatusLines.actionRows(
                 frozenCount: status.frozenCount,
                 dockerPaused: status.dockerPaused,
-                lastGap: status.lastGap
+                lastGap: status.lastGap,
+                lowPower: manager.effectiveState.lowPowerSetByUs
             ),
             throttledBrowsers: status.throttledBrowsers,
             relaunchProblems: status.relaunchProblems,
@@ -2081,7 +2087,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
                 lidClosed: status.lidClosed,
                 watts: status.instantWatts(),
                 batteryPercent: status.batteryPercent,
-                isCharging: status.isCharging
+                isCharging: status.isCharging,
+                thermal: status.thermalState
             ),
             network: StatusLines.network(
                 wifiSSID: WiFiStatusName.display(
@@ -2092,7 +2099,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate {
             actions: StatusLines.actions(
                 frozenCount: status.frozenCount,
                 dockerPaused: status.dockerPaused,
-                lastGap: status.lastGap
+                lastGap: status.lastGap,
+                lowPower: manager.effectiveState.lowPowerSetByUs
             ),
             throttledBrowsers: status.throttledBrowsers,
             relaunchProblems: status.relaunchProblems,

@@ -419,6 +419,13 @@ final class UIStatusTests: XCTestCase {
             StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: 82, isCharging: true),
             "Lid: open \u{00B7} 82% charging"
         )
+        // A thermal state above nominal is named; nominal is left out.
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: true, watts: 6.04, batteryPercent: 64, isCharging: false, thermal: .serious),
+            "Lid: closed \u{00B7} 6.0 W \u{00B7} 64% \u{00B7} Thermal: serious"
+        )
+        XCTAssertEqual(StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: nil, isCharging: false, thermal: .fair), "Lid: open \u{00B7} Thermal: fair")
+        XCTAssertEqual(StatusLines.machine(lidClosed: false, watts: nil, batteryPercent: nil, isCharging: false, thermal: .nominal), "Lid: open")
     }
 
     func testNetworkLinePreservesStatusAndOmitsUnknownNames() {
@@ -435,6 +442,55 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(StatusLines.actions(frozenCount: 3, dockerPaused: true, lastGap: nil), "3 apps frozen \u{00B7} Docker paused")
         XCTAssertEqual(StatusLines.actions(frozenCount: 1, dockerPaused: false, lastGap: 12.4), "1 app frozen \u{00B7} last gap 12s")
         XCTAssertEqual(StatusLines.actions(frozenCount: 0, dockerPaused: true, lastGap: 0), "Docker paused")
+        XCTAssertEqual(StatusLines.actions(frozenCount: 0, dockerPaused: false, lastGap: nil, lowPower: true), "Low Power Mode set by Insomnia")
+        XCTAssertEqual(StatusLines.actions(frozenCount: 2, dockerPaused: false, lastGap: nil, lowPower: true), "Low Power Mode set by Insomnia \u{00B7} 2 apps frozen")
+    }
+
+    /// The menu reads Low Power Mode from the journal and the thermal state
+    /// from the status source.
+    @MainActor
+    func testMenuShowsInsomniasLowPowerModeAndTheThermalState() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let source = RecordingStatusSource()
+        source.thermalState = .serious
+        XCTAssertTrue(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Lid: open \u{00B7} Thermal: serious"))
+        XCTAssertFalse(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
+
+        await m.setLowPower(true)
+        XCTAssertTrue(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
+
+        await m.end(reason: .user)
+        XCTAssertFalse(StatusItemController.menuItems(manager: m, status: source).map(\.title).contains("Low Power Mode set by Insomnia"))
+    }
+
+    /// Popover style has no right-click menu, so the popover's rows carry
+    /// the same two facts: the thermal state under the power row, and
+    /// Insomnia's Low Power Mode first among what the session holds.
+    @MainActor
+    func testPopoverShowsInsomniasLowPowerModeAndTheThermalState() async {
+        let h = Harness()
+        defer { h.home.destroy() }
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let source = RecordingStatusSource()
+        source.batteryPercent = 64
+        source.frozenCount = 2
+        var titles: [String] { StatusItemController.statusItems(manager: m, status: source).map(\.title) }
+        XCTAssertFalse(titles.contains { $0.hasPrefix("Thermal") })
+        XCTAssertFalse(titles.contains("Low Power Mode set by Insomnia"))
+
+        source.thermalState = .serious
+        await m.setLowPower(true)
+        let thermal = titles.firstIndex(of: "Thermal: serious")
+        XCTAssertEqual(thermal.map { titles[$0 - 1] }, "64%", "the thermal row follows the power row")
+        let lowPower = titles.firstIndex(of: "Low Power Mode set by Insomnia")
+        XCTAssertEqual(lowPower.map { titles[$0 + 1] }, "2 apps frozen", "Low Power Mode leads the held rows")
+
+        await m.end(reason: .user)
+        XCTAssertFalse(titles.contains("Low Power Mode set by Insomnia"))
     }
 
     /// The menu puts the warning sign in front of the shared text, which
@@ -1963,6 +2019,32 @@ final class UIStatusTests: XCTestCase {
         ])
         XCTAssertEqual(StatusLines.actionRows(frozenCount: 1, dockerPaused: false, lastGap: 12.4).map(\.title), ["1 app frozen", "Last network gap 12s"])
         XCTAssertEqual(StatusLines.actionRows(frozenCount: 0, dockerPaused: true, lastGap: 0).map(\.title), ["Docker paused"])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 0, dockerPaused: false, lastGap: nil, lowPower: true), [
+            StatusMenu.Item(title: "Low Power Mode set by Insomnia", kind: .info, symbol: "gauge.with.dots.needle.33percent"),
+        ])
+        XCTAssertEqual(StatusLines.actionRows(frozenCount: 1, dockerPaused: true, lastGap: nil, lowPower: true).map(\.title), ["Low Power Mode set by Insomnia", "1 app frozen", "Docker paused"])
+    }
+
+    /// Above nominal the thermal state gets a row after the power row, as
+    /// it follows the charge on the menu line; nominal gets none.
+    func testThermalRowAppearsAboveNominal() {
+        let wifi = WiFiStatusName.Display(text: "iPhone", help: nil)
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: true, watts: 6.04, wifi: wifi, batteryPercent: 64, isCharging: false, thermal: .serious).map(\.title),
+            ["Lid closed", "64% \u{00B7} 6.0 W", "Thermal: serious", "iPhone"]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false, thermal: .fair),
+            [
+                StatusMenu.Item(title: "Lid open", kind: .info, symbol: "laptopcomputer"),
+                StatusMenu.Item(title: "Thermal: fair", kind: .info, symbol: "thermometer.medium"),
+            ]
+        )
+        XCTAssertEqual(
+            StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false, thermal: .critical).last,
+            StatusMenu.Item(title: "Thermal: critical", kind: .info, symbol: "thermometer.high")
+        )
+        XCTAssertEqual(StatusLines.machine(lidClosed: false, watts: nil, wifi: nil, batteryPercent: nil, isCharging: false, thermal: .nominal).map(\.title), ["Lid open"])
     }
 
     func testThrottleWarningInThePopover() {
@@ -2108,6 +2190,44 @@ final class UIStatusTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(source.powerReads, closed, "nothing is read while the popover is closed")
         XCTAssertNil(controller.popoverPowerTick)
+    }
+
+    /// The thermal row follows the machine while the popover stays up: a
+    /// change the session's observer reports redraws it at once, and the
+    /// popover's timer reads the state again, since after a session ends
+    /// nothing else does. A hot session that ends with the popover open
+    /// must not leave "Thermal: critical" up after the Mac cools.
+    @MainActor
+    func testAnOpenPopoverFollowsTheThermalState() async {
+        _ = NSApplication.shared
+        let h = Harness()
+        defer { h.home.destroy() }
+        let source = CountingStatusSource()
+        let controller = StatusItemController(manager: popoverManager(h), status: source, showSettings: {})
+        let view = controller.makePopoverView()
+        var thermalRows: [String] { view.items().map(\.title).filter { $0.hasPrefix("Thermal") } }
+        controller.openPopover()
+        XCTAssertEqual(thermalRows, [])
+
+        // The observer's change, with the timer's 10 s far off.
+        source.thermalState = .critical
+        for _ in 0..<200 where controller.model.popoverPower?.thermal != .critical {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(thermalRows, ["Thermal: critical"], "a reported change redraws the row")
+        controller.closePopover()
+
+        // No session keeps thermalState current: only a read now sees the
+        // Mac cool.
+        controller.popoverPowerInterval = 0.05
+        controller.openPopover()
+        XCTAssertEqual(thermalRows, ["Thermal: critical"])
+        source.systemThermal = .nominal
+        for _ in 0..<200 where controller.model.popoverPower?.thermal != .nominal {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(thermalRows, [], "the timer reads the state again")
+        controller.closePopover()
     }
 
     /// A controller released with the popover up stops its power timer
@@ -2708,6 +2828,7 @@ final class RecordingStatusSource: StatusSource {
     var lidClosed = false
     var batteryPercent: Int? = nil
     var isCharging = false
+    var thermalState: ProcessInfo.ThermalState = .nominal
     var wifiSSID: String? = nil
     var lastGap: TimeInterval? = nil
     var frozenCount = 0
@@ -2730,6 +2851,7 @@ final class CountingStatusSource: StatusSource {
     var lidClosed = false
     var batteryPercent: Int? = nil
     var isCharging = false
+    var thermalState: ProcessInfo.ThermalState = .nominal
     var wifiSSID: String? = nil
     var lastGap: TimeInterval? = nil
     var frozenCount = 0
@@ -2742,6 +2864,9 @@ final class CountingStatusSource: StatusSource {
     /// What the watts read reports, and how many times it was read.
     var watts: Double?
     @ObservationIgnored private(set) var powerReads = 0
+    /// What a read of the thermal state now reports; nil reads
+    /// `thermalState`, as the protocol's default does.
+    @ObservationIgnored var systemThermal: ProcessInfo.ThermalState?
 
     func refreshOnDemand() { onDemand += 1 }
     func refreshInstant() { instant += 1 }
@@ -2749,5 +2874,6 @@ final class CountingStatusSource: StatusSource {
         powerReads += 1
         return watts
     }
+    func instantThermalState() -> ProcessInfo.ThermalState { systemThermal ?? thermalState }
     func relaunchUnthrottled(_ browser: ThrottledBrowser) {}
 }

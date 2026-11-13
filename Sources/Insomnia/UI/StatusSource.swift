@@ -10,6 +10,8 @@ protocol StatusSource: AnyObject, Observable {
     var lidClosed: Bool { get }
     var batteryPercent: Int? { get }
     var isCharging: Bool { get }
+    /// The thermal state, read again when the menu opens.
+    var thermalState: ProcessInfo.ThermalState { get }
     var wifiSSID: String? { get }
     /// Length of the most recent network outage, nil if none this session.
     var lastGap: TimeInterval? { get }
@@ -35,6 +37,9 @@ protocol StatusSource: AnyObject, Observable {
     /// The battery's time to empty or to full, read on demand like the
     /// watts. Never polled.
     func batteryTimeRemaining() -> BatteryTimeRemaining?
+    /// The thermal state read now, for an open popover's timer. Outside a
+    /// session nothing keeps `thermalState` current between openings.
+    func instantThermalState() -> ProcessInfo.ThermalState
     /// Relaunch the browser the user confirmed, as the menu item or the
     /// popover's button named it.
     func relaunchUnthrottled(_ browser: ThrottledBrowser)
@@ -42,6 +47,7 @@ protocol StatusSource: AnyObject, Observable {
 
 extension StatusSource {
     func batteryTimeRemaining() -> BatteryTimeRemaining? { nil }
+    func instantThermalState() -> ProcessInfo.ThermalState { thermalState }
 }
 
 /// Stand-in until the system layer is plugged in. Reports nothing.
@@ -51,6 +57,7 @@ final class PlaceholderStatus: StatusSource {
     var lidClosed: Bool = false
     var batteryPercent: Int? = nil
     var isCharging: Bool = false
+    var thermalState: ProcessInfo.ThermalState = .nominal
     var wifiSSID: String? = nil
     var lastGap: TimeInterval? = nil
     var frozenCount: Int = 0
@@ -72,14 +79,18 @@ final class PlaceholderStatus: StatusSource {
 /// menu gets one line per group; the popover one row per fact, each with
 /// its SF Symbol.
 enum StatusLines {
-    /// "Lid: closed · 4.1 W · 82%". Unknown parts are omitted.
-    static func machine(lidClosed: Bool, watts: Double?, batteryPercent: Int?, isCharging: Bool) -> String {
+    /// "Lid: closed · 4.1 W · 82% · Thermal: serious". Unknown parts are
+    /// omitted, and so is a nominal thermal state.
+    static func machine(lidClosed: Bool, watts: Double?, batteryPercent: Int?, isCharging: Bool, thermal: ProcessInfo.ThermalState = .nominal) -> String {
         var parts: [String] = ["Lid: \(lidClosed ? "closed" : "open")"]
         if let w = watts {
             parts.append(String(format: "%.1f W", w))
         }
         if let p = batteryPercent {
             parts.append(isCharging ? "\(p)% charging" : "\(p)%")
+        }
+        if thermal != .nominal {
+            parts.append("Thermal: \(PowerMonitor.name(thermal))")
         }
         return parts.joined(separator: " \u{00B7} ")
     }
@@ -91,9 +102,15 @@ enum StatusLines {
         return "Wi-Fi: \(ssid)"
     }
 
-    /// "3 apps frozen · Docker paused", or nil when nothing is held.
-    static func actions(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?) -> String? {
+    /// "Low Power Mode set by Insomnia · 3 apps frozen · Docker paused",
+    /// or nil when nothing is held. `lowPower` is the journal's
+    /// `lowPowerSetByUs`: the mode Insomnia switched on and switches off
+    /// again.
+    static func actions(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?, lowPower: Bool = false) -> String? {
         var parts: [String] = []
+        if lowPower {
+            parts.append("Low Power Mode set by Insomnia")
+        }
         if frozenCount > 0 {
             parts.append(frozenCount == 1 ? "1 app frozen" : "\(frozenCount) apps frozen")
         }
@@ -106,12 +123,13 @@ enum StatusLines {
         return parts.isEmpty ? nil : parts.joined(separator: " \u{00B7} ")
     }
 
-    /// Lid, power, hotspot failover and Wi-Fi rows, in that order. The lid
-    /// is always known; the power row is left out when neither the draw
-    /// nor the charge is known, the failover row when the caller has none
-    /// (`HotspotFailoverRow`), and the Wi-Fi row when there is no network
-    /// to name.
-    static func machine(lidClosed: Bool, watts: Double?, wifi: WiFiStatusName.Display?, batteryPercent: Int?, isCharging: Bool, timeRemaining: BatteryTimeRemaining? = nil, failover: StatusMenu.Item? = nil) -> [StatusMenu.Item] {
+    /// Lid, power, thermal state, hotspot failover and Wi-Fi rows, in that
+    /// order. The lid is always known; the power row is left out when
+    /// neither the draw nor the charge is known, the thermal row at
+    /// nominal, as on the menu line, the failover row when the caller has
+    /// none (`HotspotFailoverRow`), and the Wi-Fi row when there is no
+    /// network to name.
+    static func machine(lidClosed: Bool, watts: Double?, wifi: WiFiStatusName.Display?, batteryPercent: Int?, isCharging: Bool, timeRemaining: BatteryTimeRemaining? = nil, thermal: ProcessInfo.ThermalState = .nominal, failover: StatusMenu.Item? = nil) -> [StatusMenu.Item] {
         var rows = [StatusMenu.Item(title: lidClosed ? "Lid closed" : "Lid open", kind: .info, symbol: "laptopcomputer")]
         // Plugged in at the charge limit the battery reports charging but
         // draws nothing: "80% · Charging 0.0 W" says the wrong thing. Under
@@ -127,6 +145,9 @@ enum StatusLines {
         if let title = powerTitle(watts: watts, batteryPercent: batteryPercent, isCharging: charging, idleOnAdapter: idleOnAdapter, drainingOnAdapter: drainingOnAdapter, timeRemaining: timeRemaining) {
             let symbol = idleOnAdapter || drainingOnAdapter ? "powerplug" : charging ? "battery.100percent.bolt" : (batteryPercent == nil ? "bolt" : "battery.75percent")
             rows.append(StatusMenu.Item(title: title, kind: .info, symbol: symbol))
+        }
+        if thermal != .nominal {
+            rows.append(StatusMenu.Item(title: "Thermal: \(PowerMonitor.name(thermal))", kind: .info, symbol: thermal == .fair ? "thermometer.medium" : "thermometer.high"))
         }
         if let failover {
             rows.append(failover)
@@ -173,11 +194,15 @@ enum StatusLines {
         "\(minutes / 60):" + String(format: "%02d", minutes % 60)
     }
 
-    /// Frozen apps, paused Docker and the last network gap, each only when
-    /// it applies; empty when nothing is held. The popover's rows for what
-    /// `actions` puts on one menu line.
-    static func actionRows(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?) -> [StatusMenu.Item] {
+    /// Low Power Mode that Insomnia switched on, frozen apps, paused Docker
+    /// and the last network gap, each only when it applies; empty when
+    /// nothing is held. The popover's rows for what `actions` puts on one
+    /// menu line. `lowPower` is the journal's `lowPowerSetByUs`, as there.
+    static func actionRows(frozenCount: Int, dockerPaused: Bool, lastGap: TimeInterval?, lowPower: Bool = false) -> [StatusMenu.Item] {
         var rows: [StatusMenu.Item] = []
+        if lowPower {
+            rows.append(StatusMenu.Item(title: "Low Power Mode set by Insomnia", kind: .info, symbol: "gauge.with.dots.needle.33percent"))
+        }
         if frozenCount > 0 {
             rows.append(StatusMenu.Item(title: frozenCount == 1 ? "1 app frozen" : "\(frozenCount) apps frozen", kind: .info, symbol: "snowflake"))
         }

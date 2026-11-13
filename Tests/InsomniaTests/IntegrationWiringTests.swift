@@ -17,6 +17,7 @@ final class IntegrationWiringTests: XCTestCase {
         services.status.lidClosed = true
         services.status.batteryPercent = 41
         services.status.isCharging = true
+        services.status.thermalState = .serious
         services.status.wifiSSID = "iPhone"
         services.status.lastGap = 12
         services.status.frozenCount = 3
@@ -28,6 +29,7 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertTrue(source.lidClosed)
         XCTAssertEqual(source.batteryPercent, 41)
         XCTAssertTrue(source.isCharging)
+        XCTAssertEqual(source.thermalState, .serious)
         XCTAssertEqual(source.wifiSSID, "iPhone")
         XCTAssertEqual(source.lastGap, 12)
         XCTAssertEqual(source.frozenCount, 3)
@@ -36,12 +38,12 @@ final class IntegrationWiringTests: XCTestCase {
         XCTAssertEqual(source.locationPermission.authorizationStatus, .authorizedAlways)
     }
 
-    /// `reevaluateFloors()` is the hook Settings calls when a floor input
-    /// changes. It queues on the floor chain exactly like a power event, so
-    /// with no session (no floor driver) it does nothing. Starting the
-    /// services needs the real lid and battery observers, so the queued run
-    /// itself is covered at the driver level
-    /// (`testTogglingLidOptionWhileLidIsClosedAppliesOnTheNextRun`).
+    /// `reevaluateFloors()` is what `SessionManager.floorInputsChanged`
+    /// runs when a floor input changes. It queues on the floor chain exactly
+    /// like a power event, so with no session (no floor driver) it does
+    /// nothing. Starting the services needs the real lid and battery
+    /// observers, so the queued run itself is covered at the driver level
+    /// (`testSettingsChangesApplyWithoutAPowerEvent`).
     @MainActor
     func testReevaluateFloorsWithoutASessionIsANoOp() {
         let home = TempHome()
