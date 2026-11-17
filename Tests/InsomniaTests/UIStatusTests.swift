@@ -573,8 +573,8 @@ final class UIStatusTests: XCTestCase {
         XCTAssertEqual(menu.items[3].representedObject as? ThrottledBrowser, ThrottledBrowser(bundleId: "com.google.Chrome", name: "Google Chrome"))
         XCTAssertTrue(menu.items[3].isEnabled)
         XCTAssertTrue(menu.items[4].isSeparatorItem)
-        XCTAssertEqual(menu.items[5].keyEquivalent, ",")
-        XCTAssertEqual(menu.items[6].keyEquivalent, "q")
+        XCTAssertEqual(menu.items[5].keyEquivalent, Self.commandKey(","))
+        XCTAssertEqual(menu.items[6].keyEquivalent, Self.commandKey("q"))
 
         let combined = StatusMenu.menu(
             [StatusMenu.Item(title: items[0].title + " \u{00B7} " + items[1].title, kind: .info)] + Array(items.dropFirst(2)),
@@ -588,6 +588,22 @@ final class UIStatusTests: XCTestCase {
         menu.update()
         combined.update()
         XCTAssertLessThan(menu.size.width, combined.size.width, "Separate status rows reduce the native menu's width")
+    }
+
+    /// The key AppKit shows for Command-`key` on this Mac's keyboard layout.
+    /// AppKit moves a menu item's shortcut to the key in the same place on
+    /// the layout (Command-comma is Command-ö on Turkish Q) once something
+    /// reads the item, as the accessibility labels above do.
+    @MainActor
+    private static func commandKey(_ key: String) -> String {
+        let item = NSMenuItem(title: "", action: NSSelectorFromString("action"), keyEquivalent: key)
+        item.keyEquivalentModifierMask = .command
+        let menu = NSMenu()
+        menu.addItem(item)
+        return withExtendedLifetime(menu) {
+            _ = item.accessibilityLabel()
+            return item.keyEquivalent
+        }
     }
 
     func testMenuOmitsAbsentOrEmptyNetworkRows() {
