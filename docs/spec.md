@@ -301,7 +301,8 @@ a C symbol carries no type information, so on any other major the display
 is left alone until someone measures again. The `KeyboardBrightnessClient`
 methods are read through the Objective-C runtime and compared with the type
 encodings measured on macOS 26 (`DisplayPower.measuredKeyboardClientEncodings`,
-stack offsets removed); a missing required method or a changed encoding
+stack offsets removed, `BOOL` as the running architecture encodes it: `B`
+on Apple Silicon, `c` on Intel); a missing required method or a changed encoding
 refuses the keyboard backlight before anything is instantiated. A refused
 device is skipped at lid close with a log line, nothing is journaled for
 it, and Settings shows the reason under the darken toggle. With nothing
