@@ -104,7 +104,11 @@ enum DisplayPower {
     /// measured on macOS 26.2 (25C56, arm64), with the stack offsets
     /// removed: the offsets depend on layout, the types do not. An Objective-C
     /// method carries its encoding at run time, so a changed argument or
-    /// return type is seen before the method is called.
+    /// return type is seen before the method is called. `B` here is the
+    /// method's `BOOL`, which an Intel Mac encodes as `c`; see
+    /// `boolEncoding`. Every `B` in this table is mapped, so an entry must
+    /// hold only bare type characters: a class name (`@"NSBundle"`) or a
+    /// struct (`{...}`) containing `B` would be rewritten on Intel too.
     static let measuredKeyboardClientEncodings: [String: String] = [
         "copyKeyboardBacklightIDs": "@@:",
         "isKeyboardBuiltIn:": "B@:Q",
@@ -120,6 +124,16 @@ enum DisplayPower {
         "copyKeyboardBacklightIDs", "isKeyboardBuiltIn:", "brightnessForKeyboard:", "setBrightness:forKeyboard:",
     ]
 
+    /// How this architecture encodes `BOOL`: `bool` (`B`) on Apple
+    /// Silicon, `signed char` (`c`) on Intel, as objc.h defines it.
+    /// Measured on macOS 26.2 (25C56, x86_64), KeyboardBrightnessClient
+    /// has the arm64 encodings with every `B` read as `c`.
+    #if arch(x86_64)
+    static let boolEncoding: Character = "c"
+    #else
+    static let boolEncoding: Character = "B"
+    #endif
+
     /// "B24@0:8Q16" -> "B@:Q".
     static func typeEncodingWithoutOffsets(_ encoding: String) -> String {
         encoding.filter { !$0.isNumber }
@@ -128,8 +142,12 @@ enum DisplayPower {
     /// nil when every required selector exists and every selector that
     /// exists has the measured encoding; otherwise why the client is refused.
     /// `encodingFor` returns a selector's raw type encoding, nil when the
-    /// class has no such method.
-    static func keyboardClientRefusal(encodingFor: (String) -> String?) -> String? {
+    /// class has no such method. The measured `BOOL` slots are expected as
+    /// `boolEncoding`; every other type must match as measured.
+    static func keyboardClientRefusal(
+        boolEncoding: Character = DisplayPower.boolEncoding,
+        encodingFor: (String) -> String?
+    ) -> String? {
         for name in measuredKeyboardClientEncodings.keys.sorted() {
             guard let raw = encodingFor(name) else {
                 if requiredKeyboardClientSelectors.contains(name) {
@@ -138,7 +156,7 @@ enum DisplayPower {
                 continue
             }
             let found = typeEncodingWithoutOffsets(raw)
-            let measured = measuredKeyboardClientEncodings[name]!
+            let measured = String(measuredKeyboardClientEncodings[name]!.map { $0 == "B" ? boolEncoding : $0 })
             if found != measured {
                 return "KeyboardBrightnessClient \(name) has type encoding \(found), measured \(measured) on macOS 26; the keyboard backlight is left alone until it is measured again"
             }
