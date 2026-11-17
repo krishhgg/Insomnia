@@ -124,7 +124,7 @@ Release zips are built for arm64 only, and their `install.sh --app` stops on
 an Intel Mac. On Intel, building from source (below) is the only option. The
 test suite passes on one Intel MacBook Pro (see
 [release-validation.md](release-validation.md)), but the app itself is
-untested there.
+untested there, including the keyboard backlight it darkens at lid close.
 
 ## Build from source
 
