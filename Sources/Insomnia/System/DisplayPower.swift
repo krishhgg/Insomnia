@@ -106,7 +106,9 @@ enum DisplayPower {
     /// method carries its encoding at run time, so a changed argument or
     /// return type is seen before the method is called. `B` here is the
     /// method's `BOOL`, which an Intel Mac encodes as `c`; see
-    /// `boolEncoding`.
+    /// `boolEncoding`. Every `B` in this table is mapped, so an entry must
+    /// hold only bare type characters: a class name (`@"NSBundle"`) or a
+    /// struct (`{...}`) containing `B` would be rewritten on Intel too.
     static let measuredKeyboardClientEncodings: [String: String] = [
         "copyKeyboardBacklightIDs": "@@:",
         "isKeyboardBuiltIn:": "B@:Q",
