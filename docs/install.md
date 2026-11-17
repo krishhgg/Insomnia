@@ -121,8 +121,10 @@ and asks for administrator access to install a narrowly scoped sudoers rule. It 
 power-setting commands. Review that permission before installing.
 
 Release zips are built for arm64 only, and their `install.sh --app` stops on
-an Intel Mac. On Intel, building from source (below) is the only option, and
-it is untested there.
+an Intel Mac. On Intel, building from source (below) is the only option. The
+test suite passes on one Intel MacBook Pro (see
+[release-validation.md](release-validation.md)), but the app itself is
+untested there.
 
 ## Build from source
 

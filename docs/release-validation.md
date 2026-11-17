@@ -376,6 +376,32 @@ and no session was started.
 - Not exercised: a screen shorter than the Settings window, such as a
   13-inch MacBook Air, and VoiceOver.
 
+## November 17, 2026 keyboard backlight encodings on Intel (MacBook Pro, Intel Core i9)
+
+Machine: MacBook Pro (MacBookPro16,1), Intel Core i9-9880H, macOS 26.2
+(25C56), x86_64, Swift 6.3.2. Build: the `intel-bool-encoding` branch, from
+`main` at `3f474ff`, by `swift build` and `swift test`. Nothing was
+installed and no session was started.
+
+- Read-only through the Objective-C runtime, the `KeyboardBrightnessClient`
+  instance method type encodings: `copyKeyboardBacklightIDs` `@16@0:8`,
+  `isKeyboardBuiltIn:` `c24@0:8Q16`, `brightnessForKeyboard:` `f24@0:8Q16`,
+  `setBrightness:forKeyboard:` `c28@0:8f16Q20`,
+  `isBacklightSuppressedOnKeyboard:` `c24@0:8Q16`,
+  `isBacklightDimmedOnKeyboard:` `c24@0:8Q16`. These are the arm64
+  encodings with `BOOL` as `c`, since `BOOL` is `signed char` on x86_64.
+  The guard now expects `BOOL` in this architecture's encoding, so it no
+  longer refuses the class on Intel; every other type is still compared as
+  measured on arm64.
+- On `main` at `3f474ff`, `swift test` failed 6 tests here: 5 in
+  `PrivateDisplayGuardTests` and `RefusedDarkeningTests` on the encoding,
+  and `testScreenshotStatusUsesSeparateNativeMenuRows`, because AppKit
+  shows the Settings item's Command-comma as Command-ö on the Turkish-QWERTY-PC
+  keyboard layout. On the branch all 1878 tests ran, 14 skipped (tmux
+  integration cases; tmux is not installed here), none failed.
+- Not exercised: the keyboard backlight itself on this Mac. No method of the
+  class was called, and no lid close was run.
+
 ## Distribution boundary
 
 Packaging is automated: `scripts/build-app.sh` makes the bundle, and the
