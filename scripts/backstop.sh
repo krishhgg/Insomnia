@@ -309,17 +309,27 @@ fi
 
 # --- Helpers -----------------------------------------------------------------
 
+# plutil's output counts only when it exits 0. The plutil of macOS 15 writes
+# "Could not extract value" to standard output, not standard error, when -o -
+# is given and the keypath is missing, so a missing key would read as that
+# message: `while [[ -n "$(type_of f list.$i)" ]]` never ended and held the
+# recovery lock. A sentinel keeps the trailing newlines epoch_at counts.
+plutil_out() { # plutil args...
+  local out
+  out="$("$PLUTIL" "$@" 2>/dev/null && echo .)" || return 1
+  printf '%s' "${out%.}"
+}
 # plutil -extract <key> raw prints the scalar; returns non-zero if missing.
 extract() { # file keypath
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" raw -o - "$1"
 }
 extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" json -o - "$1"
 }
 # Type name of a keypath (bool, integer, float, string, array, dictionary,
 # "(any)" for null); empty if the key is absent.
 type_of() { # file keypath
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+  plutil_out -type "$2" -o - "$1" || true
 }
 is_true() { # file key
   [[ "$(extract "$1" "$2" || true)" == "true" ]]

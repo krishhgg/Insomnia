@@ -225,14 +225,24 @@ supervise() { # base command args...
 case "$APP_SUPPORT" in /*) ;; *) echo "refusing: app support path is not absolute: $APP_SUPPORT" >&2; exit 1 ;; esac
 [[ "$(basename "$APP")" == "Insomnia.app" ]] || { echo "refusing: $APP is not an Insomnia.app bundle path" >&2; exit 1; }
 
+# plutil's output counts only when it exits 0. The plutil of macOS 15 writes
+# "Could not extract value" to standard output, not standard error, when -o -
+# is given and the keypath is missing, so a missing key would read as that
+# message: `while [[ -n "$(type_of f list.$i)" ]]` never ended and held the
+# recovery lock. A sentinel keeps the trailing newlines epoch_at counts.
+plutil_out() { # plutil args...
+  local out
+  out="$("$PLUTIL" "$@" 2>/dev/null && echo .)" || return 1
+  printf '%s' "${out%.}"
+}
 extract() { # file keypath (raw scalar; non-zero if missing)
-  "$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" raw -o - "$1"
 }
 extract_json() { # file keypath
-  "$PLUTIL" -extract "$2" json -o - "$1" 2>/dev/null
+  plutil_out -extract "$2" json -o - "$1"
 }
 type_of() { # file keypath -> bool|integer|float|string|array|dictionary|(any); empty if absent
-  "$PLUTIL" -type "$2" -o - "$1" 2>/dev/null || true
+  plutil_out -type "$2" -o - "$1" || true
 }
 
 # Prints one line per way the app's records about a kept display entry would

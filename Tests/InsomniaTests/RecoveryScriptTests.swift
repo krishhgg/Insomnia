@@ -907,7 +907,7 @@ final class RecoveryScriptTests: XCTestCase {
         for script in [fx.backstop, fx.uninstall] {
             let text = try String(contentsOf: script, encoding: .utf8)
             var functions = ""
-            for name in ["extract", "epoch_of", "epoch_at"] {
+            for name in ["plutil_out", "extract", "epoch_of", "epoch_at"] {
                 let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
                 let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
                 functions += text[start.lowerBound..<end.upperBound]
@@ -926,6 +926,120 @@ final class RecoveryScriptTests: XCTestCase {
                 XCTAssertEqual(shell[i], app[i], "\(script.lastPathComponent) and the app read \(text.debugDescription) differently")
             }
         }
+    }
+
+    /// A plutil that writes its "Could not extract value" error to standard
+    /// output, as the plutil of macOS 15 does when -o - is given and the
+    /// keypath is missing. Every other run goes to the real plutil.
+    private func writeStdoutErrorPlutil() throws -> URL {
+        let fake = fx.bin.appendingPathComponent("plutil-errors-on-stdout")
+        try "#!/bin/bash\nexec /usr/bin/plutil \"$@\" 2>&1\n".write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        return fake
+    }
+
+    /// The plist helpers of all three scripts, run against a plutil that
+    /// prints its error on standard output: a missing keypath is absent
+    /// (empty output, non-zero status, an empty type), and a present one
+    /// reads exactly as the real plutil prints it, trailing newlines too.
+    func testPlistHelpersIgnoreAnErrorPrintedOnStandardOutput() throws {
+        let plutil = try writeStdoutErrorPlutil()
+        let file = fx.root.appendingPathComponent("helpers.json")
+        try #"{"name":"value\n","list":[],"items":[{"pid":1}]}"#.write(to: file, atomically: true, encoding: .utf8)
+        let checks = #"""
+        f="$1"
+        printf 'type list=[%s]\n' "$(type_of "$f" list)"
+        printf 'type list.0=[%s]\n' "$(type_of "$f" list.0)"
+        printf 'type items.1=[%s]\n' "$(type_of "$f" items.1)"
+        if out="$(extract "$f" missing)"; then printf 'extract missing ok=[%s]\n' "$out"; else printf 'extract missing failed=[%s]\n' "$out"; fi
+        if out="$(extract_json "$f" list.0)"; then printf 'json list.0 ok=[%s]\n' "$out"; else printf 'json list.0 failed=[%s]\n' "$out"; fi
+        if extract_json "$f" items.0 >/dev/null; then echo 'json items.0 present'; else echo 'json items.0 absent'; fi
+        a="$(extract "$f" name; echo .)"
+        b="$(/usr/bin/plutil -extract name raw -o - "$f"; echo .)"
+        [[ "$a" == "$b" ]] && echo 'name exact' || printf 'name differs=[%s]\n' "$a"
+        """#
+        let expected = """
+        type list=[array]
+        type list.0=[]
+        type items.1=[]
+        extract missing failed=[]
+        json list.0 failed=[]
+        json items.0 present
+        name exact
+
+        """
+        for script in [fx.backstop, fx.uninstall] {
+            let text = try String(contentsOf: script, encoding: .utf8)
+            var functions = ""
+            for name in ["plutil_out", "extract", "extract_json", "type_of"] {
+                let start = try XCTUnwrap(text.range(of: "\n\(name)() {"), "\(name) in \(script.lastPathComponent)")
+                let end = try XCTUnwrap(text.range(of: "\n}\n", range: start.upperBound..<text.endIndex))
+                functions += text[start.lowerBound..<end.upperBound]
+            }
+            let harness = fx.root.appendingPathComponent("plist-helpers.\(script.lastPathComponent)")
+            try ("set -euo pipefail\nPLUTIL='\(plutil.path)'" + functions + "\n" + checks + "\n")
+                .write(to: harness, atomically: true, encoding: .utf8)
+
+            let r = try fx.run(harness, [file.path])
+
+            XCTAssertEqual(r.status, 0, r.stderr)
+            XCTAssertEqual(r.stdout, expected, script.lastPathComponent)
+        }
+
+        let install = try String(contentsOf: fx.install, encoding: .utf8)
+        let start = try XCTUnwrap(install.range(of: "\nplist_raw() {"))
+        let end = try XCTUnwrap(install.range(of: "\n}\n", range: start.upperBound..<install.endIndex))
+        let harness = fx.root.appendingPathComponent("plist-raw.install.sh")
+        try ("set -euo pipefail\nPLUTIL='\(plutil.path)'" + install[start.lowerBound..<end.upperBound] + #"""
+            printf 'missing=[%s]\n' "$(plist_raw "$1" missing || true)"
+            printf 'items.0.pid=[%s]\n' "$(plist_raw "$1" items.0.pid || true)"
+            """# + "\n").write(to: harness, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(harness, [file.path])
+
+        XCTAssertEqual(r.status, 0, r.stderr)
+        XCTAssertEqual(r.stdout, "missing=[]\nitems.0.pid=[1]\n")
+    }
+
+    /// The backstop reads an expired session and a dirty journal with empty
+    /// lists through a plutil that prints its error on standard output. It
+    /// must finish and undo the journal: reading such an error as a type
+    /// once made the loop over `extensions.<i>` run forever while it held
+    /// the recovery lock, so no session could end or start until the run
+    /// was killed. The run is bounded here so a regression fails instead of
+    /// hanging the suite.
+    func testBackstopFinishesWhenPlutilPrintsItsErrorOnStandardOutput() throws {
+        let plutil = try writeStdoutErrorPlutil()
+        let script = fx.root.appendingPathComponent("backstop.stdout-errors.sh")
+        try ScriptFixture.patch(try String(contentsOf: fx.backstop, encoding: .utf8), ["PLUTIL": plutil.path])
+            .write(to: script, atomically: true, encoding: .utf8)
+        let f = ISO8601DateFormatter()
+        try JSONSerialization.data(withJSONObject: [
+            "startedAt": f.string(from: Date(timeIntervalSinceNow: -7200)),
+            "endsAt": f.string(from: Date(timeIntervalSinceNow: -3600)),
+            "extensions": [Int](),
+        ]).write(to: fx.session)
+        try fx.writeState(#"{"sleepDisabledByUs":true,"lowPowerSetByUs":false,"frozenProcesses":[],"dockerFrozen":false,"appNapOverrides":[],"savedAudioOutputs":[]}"#)
+        let bounded = fx.root.appendingPathComponent("bounded.sh")
+        try #"""
+        set -m
+        /bin/bash "$1" &
+        job=$!
+        for _ in $(seq 1 300); do
+          if [[ -z "$(jobs -rp)" ]]; then wait "$job"; exit $?; fi
+          sleep 0.1
+        done
+        kill -KILL -- "-$job" 2>/dev/null
+        echo "backstop still running after 30 s" >&2
+        exit 124
+        """#.write(to: bounded, atomically: true, encoding: .utf8)
+
+        let r = try fx.run(bounded, [script.path])
+
+        XCTAssertEqual(r.status, 0, r.stderr + fx.log())
+        XCTAssertEqual(fx.calls(), ["sudo -n \(fx.fakePmset) -a disablesleep 0"])
+        XCTAssertEqual(try fx.stateJSON()["sleepDisabledByUs"] as? Bool, false)
+        XCTAssertFalse(fx.exists(fx.session))
     }
 
     /// A future endsAt with a newline stored after it is not a date for the
