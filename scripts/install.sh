@@ -43,6 +43,16 @@ if [[ -n "${INSOMNIA_HOME:-}" ]]; then
   exit 1
 fi
 
+# The raw value at a plist keypath; empty, and non-zero, when plutil fails.
+# The plutil of macOS 15 writes "Could not extract value" to standard output,
+# not standard error, when -o - is given and the keypath is missing, so its
+# output counts only when it exits 0.
+plist_raw() { # file keypath
+  local out
+  out="$("$PLUTIL" -extract "$2" raw -o - "$1" 2>/dev/null)" || return 1
+  printf '%s\n' "$out"
+}
+
 # How long to wait for the app to exit after asking it to quit.
 QUIT_WAIT_SECONDS=15
 
@@ -388,12 +398,12 @@ if [[ -n "$PREBUILT" ]]; then
     echo "Check the zip against SHA256SUMS and 'gh attestation verify' (README, Install) and download it again." >&2
     exit 1
   fi
-  PREBUILT_ID="$("$PLUTIL" -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  PREBUILT_ID="$(plist_raw "$INFO_PLIST" CFBundleIdentifier || true)"
   if [[ "$PREBUILT_ID" != "$BUNDLE_ID" ]]; then
     echo "$PREBUILT has bundle identifier '${PREBUILT_ID:-<none>}', not $BUNDLE_ID. Nothing was changed." >&2
     exit 1
   fi
-  PREBUILT_VERSION="$("$PLUTIL" -extract CFBundleShortVersionString raw -o - "$INFO_PLIST" 2>/dev/null || true)"
+  PREBUILT_VERSION="$(plist_raw "$INFO_PLIST" CFBundleShortVersionString || true)"
   if [[ ! "$PREBUILT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "$PREBUILT has no usable CFBundleShortVersionString ('${PREBUILT_VERSION:-<none>}'). Nothing was changed." >&2
     exit 1
@@ -678,10 +688,10 @@ done
 # it is not known which of the two it pins.
 plist_pins_previous() {
   local pinned rc
-  if [[ "$("$PLUTIL" -extract ProgramArguments.1 raw -o - "$PLIST" 2>/dev/null || true)" == --backstop ]]; then
-    pinned="$("$PLUTIL" -extract ProgramArguments.2 raw -o - "$PLIST" 2>/dev/null || true)"
+  if [[ "$(plist_raw "$PLIST" ProgramArguments.1 || true)" == --backstop ]]; then
+    pinned="$(plist_raw "$PLIST" ProgramArguments.2 || true)"
   else
-    pinned="$("$PLUTIL" -extract ProgramArguments.4 raw -o - "$PLIST" 2>/dev/null || true)"
+    pinned="$(plist_raw "$PLIST" ProgramArguments.4 || true)"
   fi
   [[ -n "$pinned" ]] || return 1
   rc=0
@@ -937,8 +947,8 @@ launch_hashes() {
   done
 }
 LAUNCH_HASHES="$(launch_hashes)" || LAUNCH_HASHES=""
-NATIVE_BACKSTOP="$("$PLUTIL" -extract InsomniaBackstopCommand raw -o - "$NEW_APP/Contents/Info.plist" 2>/dev/null || true)"
-EXECUTABLE_NAME="$("$PLUTIL" -extract CFBundleExecutable raw -o - "$NEW_APP/Contents/Info.plist" 2>/dev/null || true)"
+NATIVE_BACKSTOP="$(plist_raw "$NEW_APP/Contents/Info.plist" InsomniaBackstopCommand || true)"
+EXECUTABLE_NAME="$(plist_raw "$NEW_APP/Contents/Info.plist" CFBundleExecutable || true)"
 AGENT_EXECUTABLE=""
 case "$EXECUTABLE_NAME" in
   ""|.|..|*/*) ;;
