@@ -159,7 +159,7 @@ final class AppServices {
         sampler.follow(manager)
 
         lid.onChange = { [weak self] closed in self?.lidChanged(closed) }
-        lid.brightnessJournaled = { [weak manager] in manager?.effectiveState.brightnessJournaled ?? false }
+        lid.onPhysicalOpen = { [weak self] in self?.lidPhysicallyOpened() }
         lid.start(closed: manager.lidTakenAsClosed)
         status.lidClosed = lid.isClosed
         sampleBrightnessIfLidOpen()
@@ -205,6 +205,7 @@ final class AppServices {
         running = false
         lid.stop()
         lid.onChange = nil
+        lid.onPhysicalOpen = nil
         lastLidEvent = nil
         stopLidSimulation()
         power.stop()
@@ -420,6 +421,23 @@ final class AppServices {
             // floor chain, so it stays serialized with battery events.
             self.powerChanged()
             if !closed { self.scheduleSampleAfterOpen() }
+        }
+        lidTasks.append(task)
+    }
+
+    /// The lid physically opened while already counted as open (closed at a
+    /// desk): restore any brightness deferred while the lid was shut, and
+    /// schedule a fresh open-lid brightness sample.
+    private func lidPhysicallyOpened() {
+        guard let actions = lidActions else { return }
+        let previous = lidTasks.last
+        let task = Task { @MainActor in
+            await previous?.value
+            guard !Task.isCancelled, self.running else { return }
+            await actions.onPhysicalOpen()
+            guard !Task.isCancelled, self.running else { return }
+            self.syncState()
+            self.scheduleSampleAfterOpen()
         }
         lidTasks.append(task)
     }

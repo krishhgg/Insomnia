@@ -17,8 +17,11 @@ A MacBook used closed on an external display is in use at a desk, so
 Insomnia does not act on that lid: the countdown keeps running and nothing
 is paused, muted or darkened. Unplug the display and the lid actions run
 then, apart from the darkening, which macOS already does under that lid;
-plug it in again and they are undone. A lid that closed in a bag stays
-closed for Insomnia when you plug in a display, until you open it. If macOS
+plug it in again and they are undone. A lid that closed in a bag also
+counts as open once you plug in an external display: frozen apps resume,
+audio restores, Low Power Mode turns off and the countdown runs again,
+while the built-in display and keyboard brightness saved at the close wait
+until you physically open the lid. If macOS
 cannot list the displays when the lid closes, Insomnia does not act on the
 lid yet: it checks the list again every 2 seconds and decides once it can tell
 whether a display is connected.

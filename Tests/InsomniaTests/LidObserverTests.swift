@@ -26,6 +26,9 @@ final class LidObserverTests: XCTestCase {
             self.events.append("change \(closed)")
             self.readsAtChange.append(self.reads)
         }
+        observer.onPhysicalOpen = { [unowned self] in
+            self.events.append("physicalOpen")
+        }
         return observer
     }
 
@@ -152,58 +155,83 @@ final class LidObserverTests: XCTestCase {
         observer.handleInterest()
         await waitUntil("the close was never delivered") { !events.isEmpty }
         XCTAssertEqual(events, ["change true"])
-        XCTAssertTrue(observer.closedByDisplayLoss)
 
         reading = .closedAtDesk
         observer.handleInterest()
         await waitUntil("the open was never delivered") { events.count >= 2 }
         XCTAssertEqual(events, ["change true", "change false"])
-        XCTAssertFalse(observer.closedByDisplayLoss)
+        XCTAssertFalse(observer.isClosed)
+        XCTAssertTrue(observer.isShut)
     }
 
-    /// A saved brightness only a lid open may restore keeps a lid closed by
-    /// its display's unplugging closed when the display comes back.
-    func testADisplayBackLeavesTheLidClosedWhileABrightnessWaits() async {
-        let observer = makeObserver()
-        observer.brightnessJournaled = { true }
-        reading = .closedAtDesk
-        observer.handleInterest()
-        reading = .closed
-        observer.handleInterest()
-        await waitUntil("the close was never delivered") { !events.isEmpty }
-        XCTAssertTrue(observer.closedByDisplayLoss)
-
-        reading = .closedAtDesk
-        observer.handleInterest()
-        await pastTheDebounce()
-        XCTAssertEqual(events, ["change true"], "the display's return opened a lid a brightness waits under")
-
-        reading = .open
-        observer.handleInterest()
-        await waitUntil("the open was never delivered") { events.count >= 2 }
-        XCTAssertEqual(events, ["change true", "change false"])
-    }
-
-    /// Closed with nothing attached, then a display plugged in: still
-    /// closed, until the lid opens.
-    func testALidClosedInABagStaysClosedWhenADisplayIsPluggedIn() async {
+    /// Closed in a bag, then plugged into an external display without
+    /// opening the lid: counts as open right away (so apps thaw and audio
+    /// restores), stays physically shut, and delivers `physicalOpen` once
+    /// the lid actually opens (so deferred brightness restores).
+    func testALidClosedInABagOpensWhenPluggedIntoADisplayAndSignalsPhysicalOpen() async {
         let observer = makeObserver()
         reading = .closed
         observer.handleInterest()
         await waitUntil("the close was never delivered") { !events.isEmpty }
-        XCTAssertFalse(observer.closedByDisplayLoss)
+        XCTAssertEqual(events, ["change true"])
 
         reading = .closedAtDesk
         observer.handleInterest()
-        await pastTheDebounce()
-        XCTAssertEqual(events, ["change true"], "a display plugged into a closed lid opened it")
-        XCTAssertTrue(observer.isClosed)
+        await waitUntil("the open on display attach was never delivered") { events.count >= 2 }
+        XCTAssertEqual(events, ["change true", "change false"])
+        XCTAssertFalse(observer.isClosed)
+        XCTAssertTrue(observer.isShut)
 
         reading = .open
         observer.handleInterest()
-        await waitUntil("the open was never delivered") { events.count >= 2 }
-        XCTAssertEqual(events, ["change true", "change false"])
+        await waitUntil("the physical open was never delivered") { events.count >= 3 }
+        XCTAssertEqual(events, ["change true", "change false", "physicalOpen"])
+        XCTAssertFalse(observer.isClosed)
         XCTAssertFalse(observer.isShut)
+    }
+
+    /// A brief physical lid crack while closed at a desk is debounced as a
+    /// flap and does not fire `physicalOpen`.
+    func testAPhysicalOpenFlapAtADeskIsIgnored() async {
+        let observer = makeObserver()
+        reading = .closedAtDesk
+        observer.seed(closed: false)
+
+        reading = .open
+        observer.handleInterest()
+        reading = .closedAtDesk
+        observer.handleInterest()
+        await pastTheDebounce()
+
+        XCTAssertEqual(events, [])
+        XCTAssertTrue(observer.isShut)
+    }
+
+    func testWaiterRunsAfterAPendingPhysicalOpenSettlesOrFlaps() async {
+        let observer = makeObserver()
+        reading = .closedAtDesk
+        observer.seed(closed: false)
+
+        reading = .open
+        observer.handleInterest()
+        observer.whenSettled(waiter())
+        XCTAssertEqual(events, [], "ran before the physical open debounce settled")
+
+        await waitUntil("the physical open never settled") { events.count >= 2 }
+        XCTAssertEqual(events, ["physicalOpen", "settled true"])
+
+        // Flap case: back to closedAtDesk before debounce fires.
+        events = []
+        reading = .closedAtDesk
+        observer.seed(closed: false)
+        reading = .open
+        observer.handleInterest()
+        observer.whenSettled(waiter())
+        reading = .closedAtDesk
+        observer.handleInterest()
+        XCTAssertEqual(events, ["settled false"])
+        await pastTheDebounce()
+        XCTAssertEqual(events, ["settled false"])
     }
 
     /// A display that comes back within the debounce leaves the lid open.
@@ -220,10 +248,9 @@ final class LidObserverTests: XCTestCase {
     }
 
     /// A lid closed at a desk loses its display, and the debounce finds the
-    /// lid open with no event for it. The lid is no longer at a desk, so
-    /// closing it again is an ordinary close, and a display plugged in then
-    /// leaves it closed.
-    func testAnOpenLidFoundWhenTheDebounceEndsIsNoLongerAtADesk() async {
+    /// lid open with no event for it. Closing it again and plugging in a
+    /// display still opens it for desk use.
+    func testAnOpenLidFoundWhenTheDebounceEndsReopensWhenDockedAgain() async {
         let observer = makeObserver()
         reading = .closedAtDesk
         observer.handleInterest()
@@ -238,20 +265,21 @@ final class LidObserverTests: XCTestCase {
         observer.handleInterest()
         await waitUntil("the close was never delivered") { events.count >= 2 }
         XCTAssertEqual(events, ["settled false", "change true"])
-        XCTAssertFalse(observer.closedByDisplayLoss, "a lid closed after it read open lost a display")
 
         reading = .closedAtDesk
         observer.handleInterest()
-        await pastTheDebounce()
-        XCTAssertEqual(events, ["settled false", "change true"], "a display plugged into a lid closed away from a desk opened it")
-        XCTAssertTrue(observer.isClosed)
+        await waitUntil("the open on display attach was never delivered") { events.count >= 3 }
+        XCTAssertEqual(events, ["settled false", "change true", "change false"])
+        XCTAssertFalse(observer.isClosed)
+        XCTAssertTrue(observer.isShut)
     }
 
-    func testTheSeedDecidesALidClosedAtADesk() {
+    func testTheSeedCountsALidClosedAtADeskAsOpen() {
         let observer = makeObserver()
         reading = .closedAtDesk
         observer.seed(closed: true)
-        XCTAssertTrue(observer.isClosed)
+        XCTAssertFalse(observer.isClosed)
+        XCTAssertTrue(observer.isShut)
         observer.seed(closed: false)
         XCTAssertFalse(observer.isClosed)
         reading = .closed
@@ -371,7 +399,6 @@ final class LidObserverTests: XCTestCase {
 
         XCTAssertEqual(events, ["change true"])
         XCTAssertEqual(readsAtChange, [readsWhenUnknown + 2], "the close was not delivered by the debounce after the read that saw it")
-        XCTAssertFalse(observer.closedByDisplayLoss)
         await pastTheDebounce()
         XCTAssertEqual(reads, readsWhenUnknown + 2, "the lid is still read again after the close")
     }
@@ -424,10 +451,9 @@ final class LidObserverTests: XCTestCase {
     }
 
     /// A lid closed at a desk, then a display list that cannot be read,
-    /// then no display: the unreadable read does not hide where the lid
-    /// was, so the close is a display loss and the display's return opens
-    /// the lid.
-    func testALidAtADeskThatLosesItsDisplayAcrossAnUnreadableListIsADisplayLoss() async {
+    /// then no display: closes once the list reads no display, and opens
+    /// again once the display is back.
+    func testALidAtADeskThatLosesItsDisplayAcrossAnUnreadableListReopensOnReturn() async {
         let observer = makeObserver()
         defer { observer.stop() }
         reading = .closedAtDesk
@@ -441,7 +467,6 @@ final class LidObserverTests: XCTestCase {
         observer.handleInterest()
         await waitUntil("the close was never delivered") { !events.isEmpty }
         XCTAssertEqual(events, ["change true"])
-        XCTAssertTrue(observer.closedByDisplayLoss)
 
         reading = .closedAtDesk
         observer.handleInterest()
@@ -450,9 +475,8 @@ final class LidObserverTests: XCTestCase {
     }
 
     /// The display goes away and the list cannot be read before the
-    /// debounce ends: the close that comes once it reads is still a
-    /// display loss.
-    func testADisplayLossCutShortByAnUnreadableListIsStillADisplayLoss() async {
+    /// debounce ends: the close comes once it reads again.
+    func testADisplayLossCutShortByAnUnreadableListDeliversCloseOnceReadable() async {
         let observer = makeObserver()
         defer { observer.stop() }
         reading = .closedAtDesk
@@ -468,11 +492,10 @@ final class LidObserverTests: XCTestCase {
         await waitUntil("the close was never delivered") { !events.isEmpty }
 
         XCTAssertEqual(events, ["change true"])
-        XCTAssertTrue(observer.closedByDisplayLoss)
     }
 
-    /// The seed takes such a lid as it is told, as at a desk, and reads it
-    /// again until the list reads.
+    /// The seed takes a lid whose display list cannot be read as it is told,
+    /// and reads it again until the list reads.
     func testTheSeedDecidesALidWhoseDisplayListCannotBeRead() async {
         let observer = makeObserver()
         defer { observer.stop() }
@@ -486,7 +509,6 @@ final class LidObserverTests: XCTestCase {
         await waitUntil("the close was never delivered") { !events.isEmpty }
 
         XCTAssertEqual(events, ["change true"])
-        XCTAssertTrue(observer.closedByDisplayLoss, "a lid taken as at a desk lost no display")
     }
 
     func testStopEndsTheReadsOfAnUnreadableDisplayList() async {

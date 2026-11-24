@@ -168,6 +168,15 @@ final class LidActions {
         manager.resumeCountdown()
     }
 
+    /// The lid physically opened while already counted as open (closed at a
+    /// desk). Restores any built-in display or keyboard brightness that was
+    /// deferred while the lid was shut.
+    func onPhysicalOpen() async {
+        guard let manager, manager.isActive, !Task.isCancelled else { return }
+        guard manager.effectiveState.brightnessJournaled else { return }
+        await manager.undoLidActions()
+    }
+
     // MARK: Private
 
     /// The answer of `probe`, or nil as soon as a lid event after `event`

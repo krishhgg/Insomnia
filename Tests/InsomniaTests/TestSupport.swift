@@ -850,6 +850,7 @@ final class FakeClosedLidSleep: ClosedLidSleeping, @unchecked Sendable {
 @MainActor
 final class FakeLidWatcher: LidWatching {
     var onChange: ((Bool) -> Void)?
+    var onPhysicalOpen: (() -> Void)?
     private(set) var running = false
     private(set) var starts = 0
 
@@ -863,6 +864,11 @@ final class FakeLidWatcher: LidWatching {
     func deliver(closed: Bool) {
         guard running else { return }
         onChange?(closed)
+    }
+
+    func deliverPhysicalOpen() {
+        guard running else { return }
+        onPhysicalOpen?()
     }
 }
 
