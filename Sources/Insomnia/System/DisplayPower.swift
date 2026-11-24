@@ -282,6 +282,9 @@ final class DisplayServicesDimmer: DisplayDimming, @unchecked Sendable {
     }
 
     private func changeableDisplay(_ symbols: Symbols) throws -> CGDirectDisplayID {
+        guard builtInIsOnline else {
+            throw DisplayPowerError(what: "built-in display is offline")
+        }
         let display = Self.builtInDisplayID()
         guard symbols.canChange(display) else {
             throw DisplayPowerError(what: "display \(display) cannot change brightness")

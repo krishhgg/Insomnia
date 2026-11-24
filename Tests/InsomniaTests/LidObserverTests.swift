@@ -207,6 +207,33 @@ final class LidObserverTests: XCTestCase {
         XCTAssertTrue(observer.isShut)
     }
 
+    func testWaiterRunsAfterAPendingPhysicalOpenSettlesOrFlaps() async {
+        let observer = makeObserver()
+        reading = .closedAtDesk
+        observer.seed(closed: false)
+
+        reading = .open
+        observer.handleInterest()
+        observer.whenSettled(waiter())
+        XCTAssertEqual(events, [], "ran before the physical open debounce settled")
+
+        await waitUntil("the physical open never settled") { events.count >= 2 }
+        XCTAssertEqual(events, ["physicalOpen", "settled true"])
+
+        // Flap case: back to closedAtDesk before debounce fires.
+        events = []
+        reading = .closedAtDesk
+        observer.seed(closed: false)
+        reading = .open
+        observer.handleInterest()
+        observer.whenSettled(waiter())
+        reading = .closedAtDesk
+        observer.handleInterest()
+        XCTAssertEqual(events, ["settled false"])
+        await pastTheDebounce()
+        XCTAssertEqual(events, ["settled false"])
+    }
+
     /// A display that comes back within the debounce leaves the lid open.
     func testADisplayUnpluggedForAMomentIsAFlap() async {
         let observer = makeObserver()

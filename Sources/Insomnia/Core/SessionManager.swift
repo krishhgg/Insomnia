@@ -2224,7 +2224,7 @@ final class SessionManager {
             dropDisplayWrite(reason: "the mode was cleared by someone else")
         }
 
-        undoLidActionsInJournal()
+        undoLidActionsInJournal(restoreBrightness: !(clamshell() == true && lidAtDesk()))
         restoreAppNapInJournal()
         // After the undo: a restore just written with the mode off owes
         // nothing more (its journal write clears the entry), and a lid

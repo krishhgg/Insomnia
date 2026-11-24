@@ -179,4 +179,44 @@ final class ClosedDisplayModeTests: XCTestCase {
         XCTAssertEqual(h.audio.applied.first?.muted, false)
         XCTAssertEqual(try h.store.loadState()?.savedAudioOutputs, [])
     }
+
+    /// Ending a session while docked in clamshell mode with deferred
+    /// brightness must not wake or write to the external display; the saved
+    /// brightness stays in the journal for the next launch once the lid opens.
+    func testSessionEndWhileDockedDefersBrightnessWithoutWakingDisplay() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        try m.journal {
+            $0.savedDisplayBrightness = 0.75
+            $0.savedKeyboardBrightness = 0.5
+        }
+        atDesk()
+        h.display.builtInIsOnline = false
+
+        let outcome = await m.end(reason: .user)
+
+        XCTAssertEqual(outcome, .incomplete(agentArmed: true))
+        XCTAssertEqual(h.display.wakes, 0)
+        XCTAssertEqual(h.display.sets, [])
+        XCTAssertEqual(h.keyboard.sets, [])
+        let after = try XCTUnwrap(try h.store.loadState())
+        XCTAssertFalse(after.sleepDisabledByUs)
+        XCTAssertEqual(after.savedDisplayBrightness, 0.75)
+        XCTAssertEqual(after.savedKeyboardBrightness, 0.5)
+    }
+
+    /// A physical lid open while a closed-lid sleep is owed drops the sleep.
+    func testPhysicalOpenDropsOwedClosedLidSleep() async throws {
+        let m = h.makeManager(confirmDelay: 60)
+        await m.start(duration: 3600)
+        h.clamshell.closed = true
+        h.clamshell.atDesk = false
+
+        await m.end(reason: .timer)
+        XCTAssertTrue(h.lidWatcher.running)
+
+        h.lidWatcher.deliverPhysicalOpen()
+        XCTAssertFalse(h.lidWatcher.running)
+        XCTAssertEqual(h.lidSleep.requests, [])
+    }
 }

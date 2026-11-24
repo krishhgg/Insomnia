@@ -253,7 +253,7 @@ final class LidObserver {
     /// pending change is about to replace. One waiter at a time: a newer
     /// one replaces it. `stop` drops it.
     func whenSettled(_ body: @escaping (_ delivered: Bool) -> Void) {
-        guard pending != nil else {
+        guard pending != nil || pendingPhysicalOpen else {
             body(false)
             return
         }
@@ -344,12 +344,14 @@ final class LidObserver {
         let reading = read()
         guard reading == .open else {
             if reading == .closedDisplaysUnknown { readDisplaysAgainLater() }
+            settled(delivered: false)
             return
         }
         lastDeliveredShut = false
         record(.open)
         Log.info("lid physically open")
         onPhysicalOpen?()
+        settled(delivered: true)
     }
 
     /// Takes a reading other than `closedDisplaysUnknown` into the lid's
@@ -416,6 +418,7 @@ final class LidObserver {
         pendingPhysicalOpen = false
         debounceTimer?.invalidate()
         debounceTimer = nil
+        settled(delivered: false)
     }
 
     private static let atDeskLog = "closed with an external display connected: counted as open"
