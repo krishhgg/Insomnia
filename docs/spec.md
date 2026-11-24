@@ -234,13 +234,15 @@ recovery; newly written journals use `frozenProcesses`.
 - Lid close and open each run a fixed, reversible action list (below).
 - A closed lid with an external display connected (closed-display mode:
   an online display that is neither built in nor of vendor
-  `kDisplayVendorIDUnknown`) keeps the state delivered before it. Closed
-  at a desk, the lid stays open: no lid actions, the countdown keeps
-  running and the lid is no Low Power Mode cause. Unplugging the last
-  external display then delivers the close, and plugging one in again the
-  open, unless a saved display or keyboard brightness waits for the lid to
-  open. Closed in a bag, the lid stays closed when a display is plugged
-  in, until it opens, so the built-in panel and keyboard are only lit
+  `kDisplayVendorIDUnknown`) always counts as open: no lid actions run,
+  the countdown keeps running and the lid is no Low Power Mode cause.
+  Unplugging the last external display then delivers the close, and
+  plugging one in again the open. Closed in a bag and then plugged into
+  an external display without opening the lid, the lid counts as open
+  too: frozen apps resume, audio restores, Low Power Mode turns off and
+  the countdown resumes, while any saved built-in display or keyboard
+  brightness stays deferred in the journal until the lid physically opens
+  (`onPhysicalOpen`), so the built-in panel and keyboard are only lit
   again once they are uncovered.
 - A closed lid whose display list cannot be read (`CGGetOnlineDisplayList`
   fails) may be at a desk or in a bag, so it is neither a close nor an
@@ -509,8 +511,9 @@ retry, unless a newer failure has taken its place.
 A session that starts, or that reconcile resumes at launch, while the lid
 reads closed starts with the countdown redraw stopped: the lid observer
 reports changes only, so no close event arrives for it. The next lid open
-restarts the redraw. A lid closed at a desk reads open then, unless
-reconcile keeps lid-close actions from a close in that session.
+restarts the redraw. A lid closed at a desk reads open then; reconcile
+undoes any frozen apps and muted audio from an earlier close, leaving any
+saved built-in brightness deferred until the lid physically opens.
 Freeze scope rules:
 
 - Two scopes. The explicit freeze list: apps the user picks by bundle id from

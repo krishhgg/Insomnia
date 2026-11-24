@@ -1682,6 +1682,9 @@ final class SessionManager {
         closedLidWatcher.onChange = { [weak self] closed in
             if !closed { self?.lidOpenedWhileClosedLidSleepOwed() }
         }
+        closedLidWatcher.onPhysicalOpen = { [weak self] in
+            self?.lidOpenedWhileClosedLidSleepOwed()
+        }
         closedLidWatcher.start(closed: true)
     }
 
@@ -1694,6 +1697,7 @@ final class SessionManager {
         stopWatchingDisplaysForClosedLidSleep()
         closedLidWatcher.stop()
         closedLidWatcher.onChange = nil
+        closedLidWatcher.onPhysicalOpen = nil
     }
 
     /// The person is at the Mac, so the owed sleep is dropped and stays
@@ -2159,11 +2163,16 @@ final class SessionManager {
     }
 
     /// Undo every lid-close action recorded on disk: resume frozen pids,
-    /// clear the Docker marker, restore volume and mute. Used by lid open.
+    /// clear the Docker marker, restore volume and mute. Built-in display
+    /// and keyboard brightness are restored only when the lid is not
+    /// physically shut (clamshell mode on an external display leaves them
+    /// in the journal until the lid physically opens). Used by lid open.
     /// Refused while an unfinished command runs, the lid event is replayed
     /// once it has exited.
     func undoLidActions() async {
-        _ = await exclusive("lid open", owes: .lidEvent) { self.undoLidActionsInJournal() }
+        _ = await exclusive("lid open", owes: .lidEvent) {
+            self.undoLidActionsInJournal(restoreBrightness: self.clamshell() != true)
+        }
     }
 
     // MARK: Restore
@@ -2451,7 +2460,7 @@ final class SessionManager {
     /// session.json is read here, under the transaction's lock. One that
     /// has not expired, or that cannot be read, counts as running.
     private func lidCloseMayBeInEffect() -> Bool {
-        guard clamshell() != false else { return false }
+        guard clamshell() != false, !lidAtDesk() else { return false }
         if session != nil { return true }
         do {
             guard let onDisk = try store.loadSession() else { return false }
@@ -2527,9 +2536,13 @@ final class SessionManager {
         }
     }
 
-    /// Shared body of lid open, reconcile (lid open) and `restoreAll()`;
-    /// each entry is journaled as soon as it is undone.
-    private func undoLidActionsInJournal() {
+    /// Shared body of lid open, reconcile (lid open or closed at a desk) and
+    /// `restoreAll()`; each entry is journaled as soon as it is undone.
+    /// `restoreBrightness` is false while the lid is physically shut in
+    /// closed-display mode at a desk: frozen processes and audio restore at
+    /// once, while saved built-in display and keyboard brightness wait in
+    /// the journal until the lid physically opens.
+    private func undoLidActionsInJournal(restoreBrightness: Bool = true) {
         // Every error of this undo goes into one report at the end, so a
         // refused brightness restore, which recurs at every lid open and
         // launch, does not hide a failed resume, audio or write beside it.
@@ -2575,51 +2588,56 @@ final class SessionManager {
         // Brightness entries are read with the owed edits applied: an entry
         // this process already settled is not restored again.
         let kept = effectiveState
-        if kept.brightnessJournaled {
-            display.wake()
-        }
-        // Read before the entries are cleared: the re-assert below needs them.
         var restoredDisplay: Float?
         var restoredKeyboard: Float?
-        // A value saved before an update (of macOS, or of Insomnia's
-        // measured tables) that the private-call guard now refuses is kept,
-        // not written and not dropped: see keepRefusedRestore. Both devices
-        // go into one message, so neither saved level hides the other. A
-        // kept value on a build that can make the call is written only if
-        // a reading macOS is not holding down shows nobody set the level
-        // since: see keptLevel.
-        var refused: [String] = []
         var waiting: [String] = []
-        if let saved = kept.savedDisplayBrightness, let why = display.refusal() {
-            refused.append(keepRefusedRestore("Display brightness", saved: saved, why: why, flag: \.displayRestoreRefused))
-        } else if let saved = kept.savedDisplayBrightness {
-            restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
-        }
-        if let saved = kept.savedKeyboardBrightness, saved != 0, let why = keyboard.refusal() {
-            refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
-        } else if let saved = kept.savedKeyboardBrightness {
-            restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
-        }
-        waiting += owedEdits.clearsWaiting
-        if !refused.isEmpty {
-            let one = refused.count == 1
-            errors.append("could not restore the brightness saved before the lid closed on this macOS build. \(refused.joined(separator: " ")) Set \(one ? "the level" : "the levels") with the brightness keys or Control Center; the saved \(one ? "value stays" : "values stay") in the journal for a version that can restore \(one ? "it" : "them")")
+        if restoreBrightness {
+            if kept.brightnessJournaled {
+                display.wake()
+            }
+            // A value saved before an update (of macOS, or of Insomnia's
+            // measured tables) that the private-call guard now refuses is kept,
+            // not written and not dropped: see keepRefusedRestore. Both devices
+            // go into one message, so neither saved level hides the other. A
+            // kept value on a build that can make the call is written only if
+            // a reading macOS is not holding down shows nobody set the level
+            // since: see keptLevel.
+            var refused: [String] = []
+            if let saved = kept.savedDisplayBrightness, let why = display.refusal() {
+                refused.append(keepRefusedRestore("Display brightness", saved: saved, why: why, flag: \.displayRestoreRefused))
+            } else if let saved = kept.savedDisplayBrightness {
+                restoredDisplay = restoreDisplay(saved: saved, waiting: &waiting, errors: &errors)
+            }
+            if let saved = kept.savedKeyboardBrightness, saved != 0, let why = keyboard.refusal() {
+                refused.append(keepRefusedRestore("Keyboard backlight", saved: saved, why: why, flag: \.keyboardRestoreRefused))
+            } else if let saved = kept.savedKeyboardBrightness {
+                restoredKeyboard = restoreKeyboard(saved: saved, waiting: &waiting, errors: &errors)
+            }
+            waiting += owedEdits.clearsWaiting
+            if !refused.isEmpty {
+                let one = refused.count == 1
+                errors.append("could not restore the brightness saved before the lid closed on this macOS build. \(refused.joined(separator: " ")) Set \(one ? "the level" : "the levels") with the brightness keys or Control Center; the saved \(one ? "value stays" : "values stay") in the journal for a version that can restore \(one ? "it" : "them")")
+            }
+        } else if kept.brightnessJournaled {
+            Log.info("display and keyboard brightness restore deferred: the lid is still shut")
         }
         if !errors.isEmpty {
             fail(([shownAbove].compactMap { $0 } + errors).joined(separator: ". "))
         }
-        if waiting.isEmpty {
-            keptRecheckTask?.cancel()
-        } else {
-            Log.info("\(waiting.joined(separator: "; ")); nothing written or cleared, tried again in \(keptRecheckDelay)")
-            keptRecheckAttempt = 0
-            keptRecheckSawLidClosed = false
-            scheduleKeptRecheck(after: keptRecheckDelay)
+        if restoreBrightness {
+            if waiting.isEmpty {
+                keptRecheckTask?.cancel()
+            } else {
+                Log.info("\(waiting.joined(separator: "; ")); nothing written or cleared, tried again in \(keptRecheckDelay)")
+                keptRecheckAttempt = 0
+                keptRecheckSawLidClosed = false
+                scheduleKeptRecheck(after: keptRecheckDelay)
+            }
+            // powerd applies its own remembered "pre-dim" brightness a moment
+            // after the wake and can override the write above, so the same
+            // values go out once more.
+            scheduleReassert(display: restoredDisplay, keyboard: restoredKeyboard)
         }
-        // powerd applies its own remembered "pre-dim" brightness a moment
-        // after the wake and can override the write above, so the same
-        // values go out once more.
-        scheduleReassert(display: restoredDisplay, keyboard: restoredKeyboard)
     }
 
     /// The display's saved brightness, on a build whose guard allows the
@@ -3149,18 +3167,23 @@ final class SessionManager {
             if !state.lowPowerSetByUs, state.displayRestoredUnderLowPower != nil {
                 dropDisplayWrite(reason: "the mode is not ours")
             }
-            // Lid-close actions still on disk are undone only if the lid is
-            // open now. Closed (or unknown): they are already journaled and
-            // will be undone on the next lid open or at session end.
+            // Lid-close actions still on disk are undone when the lid is
+            // open, or when closed at a desk (resuming frozen apps and
+            // audio while deferring built-in brightness until the lid
+            // physically opens). Closed with no external display (or
+            // unknown): they stay journaled until open or session end.
             let lidClosed = clamshell()
+            let atDesk = lidClosed == true && lidAtDesk()
             if lidClosed == false {
-                undoLidActionsInJournal()
+                undoLidActionsInJournal(restoreBrightness: true)
+            } else if atDesk {
+                undoLidActionsInJournal(restoreBrightness: false)
             } else if state.hasLidActions {
                 Log.info("reconcile: lid \(lidClosed == nil ? "unknown" : "closed"), keeping lid-close actions")
             }
-            // A lid closed at a desk counts as open, unless the lid-close
-            // actions kept above show the lid closed for this session.
-            countdownPaused = lidClosed == true && (!lidAtDesk() || state.hasLidActions)
+            // A lid closed at a desk counts as open: the countdown runs on
+            // the external display.
+            countdownPaused = lidClosed == true && !atDesk
             await armDeadline(s.endsAt)
             applyAppNapInJournal()
             syncScreenAwake()

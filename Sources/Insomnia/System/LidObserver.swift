@@ -20,15 +20,16 @@ enum LidReading: Equatable, Sendable {
 /// the list reads or the lid opens. A change is delivered only if the state
 /// is still the same 2 s later.
 ///
-/// A lid closed at a desk keeps the state delivered before it: closed with
-/// an external display connected, it stays open, and the countdown and the
-/// apps keep running; closed in a bag, it stays closed when a display is
-/// plugged in, until the lid opens and the built-in panel can be lit
-/// again. Unplugging the last external display of a lid closed at a desk
-/// delivers the close (`closedByDisplayLoss`), and plugging one in again
-/// the open. A closed lid whose display list cannot be read keeps the
-/// state delivered before it too, and drops a change waiting out the
-/// debounce, since it may be at a desk or in a bag.
+/// A lid closed at a desk counts as open: closed with an external display
+/// connected, the countdown and the apps keep running; closed in a bag and
+/// then plugged into a display, it opens for desk use (apps resume, audio
+/// restores, Low Power Mode turns off, countdown runs) while built-in
+/// display and keyboard brightness wait until the lid physically opens
+/// (`onPhysicalOpen`). Unplugging the last external display of a lid closed
+/// at a desk delivers the close, and plugging one in again the open. A
+/// closed lid whose display list cannot be read keeps the state delivered
+/// before it, and drops a change waiting out the debounce, since it may be
+/// at a desk or in a bag.
 @MainActor
 final class LidObserver {
     nonisolated static let debounce: TimeInterval = 2
@@ -38,10 +39,11 @@ final class LidObserver {
 
     /// Called on the main actor after the debounce, with `true` for closed.
     var onChange: ((Bool) -> Void)?
-    /// Whether the journal holds a saved display or keyboard brightness.
-    /// Only a lid open may restore one, so while it does, a display plugged
-    /// in again leaves a lid closed by its unplugging closed.
-    var brightnessJournaled: () -> Bool = { false }
+    /// Called on the main actor after the debounce when the lid physically
+    /// opens (`.open`) while already counted as open (e.g. after being
+    /// closed at a desk). Lets deferred built-in display and keyboard
+    /// brightness restore once the panel is uncovered.
+    var onPhysicalOpen: (() -> Void)?
 
     /// Last delivered state, refreshed from the registry when read. A
     /// closed lid whose display list cannot be read keeps it.
@@ -59,19 +61,14 @@ final class LidObserver {
     private let read: () -> LidReading?
     private let debounce: TimeInterval
     private var lastDelivered: Bool = false
-    /// The close delivered last came from the last external display going
-    /// away under a lid already shut: a display plugged in again opens it,
-    /// unless a saved brightness waits for the lid to open.
-    private(set) var closedByDisplayLoss = false
-    private var pendingByDisplayLoss = false
+    /// Whether the lid was physically shut (`!= .open`) as of the last
+    /// delivered state or seed. Used to detect `.closedAtDesk` -> `.open`.
+    private var lastDeliveredShut: Bool = false
     /// The last reading other than `closedDisplaysUnknown`: a display list
     /// that cannot be read tells nothing new about the lid.
     private var lastReading: LidReading?
-    /// The lid has read closed at a desk since it last read open, at an
-    /// event or when the debounce ended, so a close now comes from its last
-    /// external display going away. Kept through unreadable display lists.
-    private var atDeskSinceOpen = false
     private var pending: Bool?
+    private var pendingPhysicalOpen = false
     private var debounceTimer: Timer?
     private var settledWaiter: ((Bool) -> Void)?
     /// The lid reads closed and its display list cannot be read: logged
@@ -148,32 +145,36 @@ final class LidObserver {
         !builtIn && vendor != UInt32(kDisplayVendorIDUnknown)
     }
 
-    /// Whether `reading` counts as closed: a lid closed at a desk keeps the
-    /// state delivered last, unless the display going away closed it, and
-    /// so does a closed lid whose display list cannot be read.
+    /// Whether `reading` counts as closed: a lid closed at a desk always
+    /// counts as open, and a closed lid whose display list cannot be read
+    /// keeps the state delivered last.
     private func counts(_ reading: LidReading) -> Bool {
         switch reading {
-        case .open: false
+        case .open, .closedAtDesk: false
         case .closed: true
-        case .closedAtDesk: lastDelivered && (!closedByDisplayLoss || brightnessJournaled())
         case .closedDisplaysUnknown: lastDelivered
         }
     }
 
-    /// Takes the lid from the registry, and a lid closed at a desk as
-    /// `closed`: whether the session took the lid as closed when it became
-    /// active. It takes a closed lid whose display list cannot be read the
-    /// same way, and reads it again until the list reads.
+    /// Takes the lid from the registry: `.closedAtDesk` always counts as
+    /// open; a closed lid whose display list cannot be read takes `closed`,
+    /// and is read again until the list reads.
     func seed(closed: Bool) {
-        closedByDisplayLoss = false
         let reading = read()
         switch reading {
-        case .open?, nil: lastDelivered = false
-        case .closed?: lastDelivered = true
-        case .closedAtDesk?, .closedDisplaysUnknown?: lastDelivered = closed
+        case .open?, nil:
+            lastDelivered = false
+            lastDeliveredShut = false
+        case .closed?:
+            lastDelivered = true
+            lastDeliveredShut = true
+        case .closedAtDesk?:
+            lastDelivered = false
+            lastDeliveredShut = true
+        case .closedDisplaysUnknown?:
+            lastDelivered = closed
+            lastDeliveredShut = true
         }
-        // A session takes a closed lid as open only at a desk.
-        atDeskSinceOpen = reading == .closedAtDesk || (reading == .closedDisplaysUnknown && !closed)
         if reading == .closedDisplaysUnknown {
             lastReading = nil
             readDisplaysAgainLater()
@@ -212,7 +213,7 @@ final class LidObserver {
         screensObserver = NotificationCenter.default.addObserver(forName: Self.displaysChanged, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.handleInterest() }
         }
-        let lid = lastReading == .closedAtDesk ? Self.atDesk(counted: lastDelivered) : lastDelivered ? "closed" : "open"
+        let lid = lastReading == .closedAtDesk ? Self.atDeskLog : lastDelivered ? "closed" : "open"
         Log.info("lid observer started (lid \(lid))")
     }
 
@@ -224,6 +225,7 @@ final class LidObserver {
         debounceTimer?.invalidate()
         debounceTimer = nil
         pending = nil
+        pendingPhysicalOpen = false
         settledWaiter = nil
         displaysTimer?.invalidate()
         displaysTimer = nil
@@ -272,22 +274,27 @@ final class LidObserver {
             return
         }
         endDisplaysUnknown(reading)
-        let displayLoss = record(reading)
+        record(reading)
         let now = counts(reading)
-        guard now != lastDelivered else {
-            // Flapped back to the delivered state; drop the pending change.
-            dropPending()
+        if now != lastDelivered {
+            pendingPhysicalOpen = false
+            guard pending != now else { return }
+            pending = now
+            armDebounce()
             return
         }
-        guard pending != now else { return }
-        pending = now
-        pendingByDisplayLoss = displayLoss
-        debounceTimer?.invalidate()
-        let timer = Timer(timeInterval: debounce, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.settle() }
+        // Flapped back to the delivered state; drop any pending change.
+        dropPending()
+        if !lastDelivered {
+            if reading == .open, lastDeliveredShut {
+                guard !pendingPhysicalOpen else { return }
+                pendingPhysicalOpen = true
+                armDebounce()
+            } else {
+                if reading == .closedAtDesk { lastDeliveredShut = true }
+                dropPendingPhysicalOpen()
+            }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        debounceTimer = timer
     }
 
     // MARK: Private
@@ -298,47 +305,63 @@ final class LidObserver {
         MainActor.assumeIsolated { observer.handleInterest() }
     }
 
+    private func armDebounce() {
+        debounceTimer?.invalidate()
+        let timer = Timer(timeInterval: debounce, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.settle() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        debounceTimer = timer
+    }
+
     private func settle() {
         debounceTimer = nil
-        guard let candidate = pending else { return }
+        if let candidate = pending {
+            let reading = read()
+            guard reading != .closedDisplaysUnknown else {
+                readDisplaysAgainLater()
+                return
+            }
+            pending = nil
+            if let reading { record(reading) }
+            guard let reading, case let now = counts(reading), now == candidate, now != lastDelivered else {
+                Log.info("lid observer: change flapped within \(Int(debounce)) s, ignored")
+                if let reading, !lastDelivered, reading == .closedAtDesk {
+                    lastDeliveredShut = true
+                }
+                settled(delivered: false)
+                return
+            }
+            lastDelivered = now
+            lastDeliveredShut = reading != .open
+            Log.info("lid \(now ? "closed" : "open")")
+            onChange?(now)
+            settled(delivered: true)
+            return
+        }
+        guard pendingPhysicalOpen else { return }
+        pendingPhysicalOpen = false
         let reading = read()
-        guard reading != .closedDisplaysUnknown else {
-            readDisplaysAgainLater()
+        guard reading == .open else {
+            if reading == .closedDisplaysUnknown { readDisplaysAgainLater() }
             return
         }
-        pending = nil
-        if let reading { record(reading) }
-        guard let reading, case let now = counts(reading), now == candidate, now != lastDelivered else {
-            Log.info("lid observer: change flapped within \(Int(debounce)) s, ignored")
-            settled(delivered: false)
-            return
-        }
-        lastDelivered = now
-        closedByDisplayLoss = now && pendingByDisplayLoss
-        Log.info("lid \(now ? "closed" : "open")")
-        onChange?(now)
-        settled(delivered: true)
+        lastDeliveredShut = false
+        record(.open)
+        Log.info("lid physically open")
+        onPhysicalOpen?()
     }
 
     /// Takes a reading other than `closedDisplaysUnknown` into the lid's
     /// history, at an event or when the debounce ends, whether the reading
-    /// keeps a waiting change or drops it. Returns whether a close now
-    /// comes from the lid's last external display going away.
-    @discardableResult
-    private func record(_ reading: LidReading) -> Bool {
-        let displayLoss = reading == .closed && atDeskSinceOpen
+    /// keeps a waiting change or drops it.
+    private func record(_ reading: LidReading) {
         if reading == .closedAtDesk, lastReading != .closedAtDesk {
-            Log.info("lid \(Self.atDesk(counted: counts(.closedAtDesk)))")
-        } else if displayLoss, lastReading != .closed {
+            Log.info("lid \(Self.atDeskLog)")
+        } else if reading == .closed, lastReading == .closedAtDesk {
             Log.info("lid closed, and its last external display is gone")
         }
-        switch reading {
-        case .open: atDeskSinceOpen = false
-        case .closedAtDesk: atDeskSinceOpen = true
-        case .closed, .closedDisplaysUnknown: break
-        }
         lastReading = reading
-        return displayLoss
     }
 
     /// The lid reads closed and its display list cannot be read, so it may
@@ -352,6 +375,7 @@ final class LidObserver {
             Log.info("lid closed, display list unreadable; reading it again in \(Int(debounce)) s")
         }
         dropPending()
+        dropPendingPhysicalOpen()
         guard displaysTimer == nil else { return }
         displaysTicket += 1
         let ticket = displaysTicket
@@ -387,9 +411,14 @@ final class LidObserver {
         settled(delivered: false)
     }
 
-    private static func atDesk(counted closed: Bool) -> String {
-        "closed with an external display connected: \(closed ? "still counted as closed until it opens" : "counted as open")"
+    private func dropPendingPhysicalOpen() {
+        guard pendingPhysicalOpen else { return }
+        pendingPhysicalOpen = false
+        debounceTimer?.invalidate()
+        debounceTimer = nil
     }
+
+    private static let atDeskLog = "closed with an external display connected: counted as open"
 
     private func settled(delivered: Bool) {
         let waiter = settledWaiter
@@ -406,8 +435,10 @@ final class LidObserver {
 protocol LidWatching: AnyObject {
     /// Called with `true` for closed.
     var onChange: ((Bool) -> Void)? { get set }
-    /// `closed`: whether a lid closed at a desk counts as closed to start
-    /// with (`LidObserver.seed`).
+    /// Called when the lid physically opens while already counted as open.
+    var onPhysicalOpen: (() -> Void)? { get set }
+    /// `closed`: whether a closed lid whose display list cannot be read
+    /// counts as closed to start with (`LidObserver.seed`).
     func start(closed: Bool)
     func stop()
 }
@@ -418,6 +449,7 @@ extension LidObserver: LidWatching {}
 @MainActor
 final class NoopLidWatcher: LidWatching {
     var onChange: ((Bool) -> Void)?
+    var onPhysicalOpen: (() -> Void)?
     func start(closed: Bool) {}
     func stop() {}
 }
